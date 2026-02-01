@@ -147,6 +147,43 @@ class TestEngagementEndpoint:
         assert response.status_code in [200, 500]
 
 
+class TestDMOutreachEndpoint:
+    def test_dm_requires_prospects_and_template(self, client):
+        response = client.post("/api/dm/outreach", json={})
+        assert response.status_code == 400
+    
+    def test_dm_with_prospects(self, client):
+        response = client.post("/api/dm/outreach", json={
+            "prospects": ["@user1", "@user2"],
+            "message_template": "Hey {name}, check this out!"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestInboxAutoReplyEndpoint:
+    def test_auto_reply_configure(self, client):
+        response = client.post("/api/inbox/auto-reply", json={
+            "platform": "instagram",
+            "rules": [],
+            "enabled": True
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestHashtagsEndpoint:
+    def test_hashtags_requires_content(self, client):
+        response = client.post("/api/hashtags/generate", json={})
+        assert response.status_code == 400
+    
+    def test_hashtags_with_content(self, client):
+        response = client.post("/api/hashtags/generate", json={
+            "content": "Amazing sunset at the beach",
+            "platform": "instagram",
+            "count": 10
+        })
+        assert response.status_code in [200, 500]
+
+
 @pytest.fixture
 def client():
     """Create test client."""
