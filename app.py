@@ -60,6 +60,15 @@ except Exception as e:
     SENTIMENT_AVAILABLE = False
     SENTIMENT_ANALYZER = None
 
+try:
+    from services.analysis.vision_analyzer_standalone import get_vision_analyzer
+    VISION_ANALYZER = get_vision_analyzer()
+    VISION_AVAILABLE = VISION_ANALYZER.is_enabled()
+except Exception as e:
+    print(f"VisionAnalyzer not available: {e}")
+    VISION_AVAILABLE = False
+    VISION_ANALYZER = None
+
 SERVICE_NAME = "content-intelligence"
 SERVICE_VERSION = "1.0.0"
 SERVICE_PORT = int(os.getenv("PORT", 6006))
@@ -350,25 +359,47 @@ def analyze_sentiment():
 
 @app.route("/api/vision/analyze", methods=["POST"])
 def analyze_vision():
-    """Analyze image/frame content."""
+    """Analyze image/frame content using OpenAI Vision API."""
     data = request.get_json()
     
     image_path = data.get("image_path")
+    image_base64 = data.get("image_base64")
+    analysis_type = data.get("analysis_type", "comprehensive")
     
-    if not image_path:
-        return jsonify({"error": "image_path required"}), 400
+    if not image_path and not image_base64:
+        return jsonify({"error": "image_path or image_base64 required"}), 400
     
-    # TODO: Implement actual vision analysis
-    return jsonify({
-        "status": "success",
-        "image_path": image_path,
-        "analysis": {
-            "objects": [],
-            "text": [],
-            "faces": 0,
-            "scene": "unknown"
-        }
-    })
+    if VISION_AVAILABLE and VISION_ANALYZER:
+        try:
+            result = VISION_ANALYZER.analyze(
+                image_path=image_path,
+                image_base64=image_base64,
+                analysis_type=analysis_type
+            )
+            return jsonify({
+                "status": "success",
+                "image_path": image_path,
+                "analysis": result.to_dict(),
+                "implementation": "real"
+            })
+        except Exception as e:
+            return jsonify({"status": "error", "error": str(e)}), 500
+    else:
+        # Fallback placeholder
+        return jsonify({
+            "status": "success",
+            "image_path": image_path,
+            "analysis": {
+                "shot_type": "unknown",
+                "has_face": False,
+                "has_text": False,
+                "objects": [],
+                "is_hook_frame": False,
+                "hook_score": 0.0,
+                "suggestions": ["Set OPENAI_API_KEY for real vision analysis"]
+            },
+            "implementation": "placeholder"
+        })
 
 
 @app.route("/api/recommend", methods=["POST"])
