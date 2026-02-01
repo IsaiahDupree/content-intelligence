@@ -420,6 +420,196 @@ def get_recommendations():
     })
 
 
+# Import narrative scheduler
+try:
+    from services.narrative.scheduler import NarrativeScheduler
+    NARRATIVE_SCHEDULER_AVAILABLE = True
+except Exception as e:
+    print(f"NarrativeScheduler not available: {e}")
+    NARRATIVE_SCHEDULER_AVAILABLE = False
+
+# Import experiments scheduler
+try:
+    from services.experiments.hypothesis_engine import HypothesisEngine
+    HYPOTHESIS_ENGINE_AVAILABLE = True
+except Exception as e:
+    print(f"HypothesisEngine not available: {e}")
+    HYPOTHESIS_ENGINE_AVAILABLE = False
+
+
+@app.route("/api/narrative/plan", methods=["POST"])
+def create_narrative_plan():
+    """Create a narrative content plan."""
+    data = request.get_json()
+    goal = data.get("goal")
+    duration_days = data.get("duration_days", 30)
+    platforms = data.get("platforms", ["instagram", "tiktok"])
+    
+    if not goal:
+        return jsonify({"error": "goal required"}), 400
+    
+    try:
+        from services.narrative.scheduler import NarrativeScheduler
+        scheduler = NarrativeScheduler()
+        
+        plan = scheduler.create_plan(
+            goal=goal,
+            duration_days=duration_days,
+            platforms=platforms
+        )
+        
+        return jsonify({
+            "status": "success",
+            "plan": plan if isinstance(plan, dict) else {"id": str(plan)},
+            "implementation": "NarrativeScheduler"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/experiments/hypothesis", methods=["POST"])
+def generate_hypothesis():
+    """Generate a content experiment hypothesis."""
+    data = request.get_json()
+    content_type = data.get("content_type")
+    metric = data.get("metric", "engagement")
+    historical_data = data.get("historical_data", {})
+    
+    try:
+        from services.experiments.hypothesis_engine import HypothesisEngine
+        engine = HypothesisEngine()
+        
+        hypothesis = engine.generate(
+            content_type=content_type,
+            metric=metric,
+            historical_data=historical_data
+        )
+        
+        return jsonify({
+            "status": "success",
+            "hypothesis": hypothesis if isinstance(hypothesis, dict) else {"text": str(hypothesis)},
+            "implementation": "HypothesisEngine"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/competitor/analyze", methods=["POST"])
+def analyze_competitor():
+    """Analyze competitor content."""
+    data = request.get_json()
+    competitor_handle = data.get("handle")
+    platform = data.get("platform", "instagram")
+    
+    if not competitor_handle:
+        return jsonify({"error": "handle required"}), 400
+    
+    try:
+        from services.competitor_audit.competitor_analyzer import CompetitorAnalyzer
+        analyzer = CompetitorAnalyzer()
+        
+        analysis = analyzer.analyze(
+            handle=competitor_handle,
+            platform=platform
+        )
+        
+        return jsonify({
+            "status": "success",
+            "competitor": competitor_handle,
+            "platform": platform,
+            "analysis": analysis if isinstance(analysis, dict) else {},
+            "implementation": "CompetitorAnalyzer"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/trends/detect", methods=["POST"])
+def detect_trends():
+    """Detect current trends."""
+    data = request.get_json()
+    platform = data.get("platform", "tiktok")
+    category = data.get("category")
+    limit = data.get("limit", 10)
+    
+    try:
+        from services.trend_intelligence.trend_detector import TrendDetector
+        detector = TrendDetector()
+        
+        trends = detector.detect(
+            platform=platform,
+            category=category,
+            limit=limit
+        )
+        
+        return jsonify({
+            "status": "success",
+            "platform": platform,
+            "trends": trends if isinstance(trends, list) else [],
+            "count": len(trends) if isinstance(trends, list) else 0,
+            "implementation": "TrendDetector"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/brief/generate", methods=["POST"])
+def generate_brief():
+    """Generate a content brief."""
+    data = request.get_json()
+    topic = data.get("topic")
+    format_type = data.get("format", "short_video")
+    platform = data.get("platform", "instagram")
+    
+    if not topic:
+        return jsonify({"error": "topic required"}), 400
+    
+    try:
+        from services.content_brief.brief_generator import BriefGenerator
+        generator = BriefGenerator()
+        
+        brief = generator.generate(
+            topic=topic,
+            format=format_type,
+            platform=platform
+        )
+        
+        return jsonify({
+            "status": "success",
+            "brief": brief if isinstance(brief, dict) else {"topic": topic},
+            "implementation": "BriefGenerator"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/engagement/predict", methods=["POST"])
+def predict_engagement():
+    """Predict engagement for content."""
+    data = request.get_json()
+    title = data.get("title")
+    description = data.get("description")
+    platform = data.get("platform", "instagram")
+    
+    try:
+        from services.engagement.engagement_service import EngagementService
+        service = EngagementService()
+        
+        prediction = service.predict(
+            title=title,
+            description=description,
+            platform=platform
+        )
+        
+        return jsonify({
+            "status": "success",
+            "prediction": prediction if isinstance(prediction, dict) else {"score": 0.5},
+            "implementation": "EngagementService"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     print(f"🧠 {SERVICE_NAME} starting on port {SERVICE_PORT}")
     app.run(host="0.0.0.0", port=SERVICE_PORT, debug=True)
