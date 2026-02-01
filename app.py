@@ -51,6 +51,15 @@ except Exception as e:
     AWARENESS_AVAILABLE = False
     AWARENESS_CLASSIFIER = None
 
+try:
+    from services.analysis.sentiment_analyzer_standalone import get_sentiment_analyzer
+    SENTIMENT_ANALYZER = get_sentiment_analyzer()
+    SENTIMENT_AVAILABLE = True
+except Exception as e:
+    print(f"SentimentAnalyzer not available: {e}")
+    SENTIMENT_AVAILABLE = False
+    SENTIMENT_ANALYZER = None
+
 SERVICE_NAME = "content-intelligence"
 SERVICE_VERSION = "1.0.0"
 SERVICE_PORT = int(os.getenv("PORT", 6006))
@@ -303,22 +312,40 @@ def classify_awareness():
 
 @app.route("/api/analyze/sentiment", methods=["POST"])
 def analyze_sentiment():
-    """Analyze sentiment of text."""
+    """Analyze sentiment of text using real SentimentAnalyzer."""
     data = request.get_json()
     
     text = data.get("text", "")
+    context = data.get("context", "")
     
-    # TODO: Implement actual sentiment analysis
-    return jsonify({
-        "status": "success",
-        "sentiment": "positive",
-        "score": 0.75,
-        "breakdown": {
-            "positive": 0.75,
-            "neutral": 0.20,
-            "negative": 0.05
-        }
-    })
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    
+    if SENTIMENT_AVAILABLE and SENTIMENT_ANALYZER:
+        # Use real sentiment analyzer
+        result = SENTIMENT_ANALYZER.analyze(text, context)
+        return jsonify({
+            "status": "success",
+            "sentiment": result.label,
+            "score": result.score,
+            "confidence": result.confidence,
+            "emotions": result.emotions,
+            "themes": result.themes,
+            "reasoning": result.reasoning,
+            "implementation": "real"
+        })
+    else:
+        # Fallback placeholder
+        return jsonify({
+            "status": "success",
+            "sentiment": "positive",
+            "score": 0.75,
+            "confidence": 0.8,
+            "emotions": {},
+            "themes": [],
+            "reasoning": "Placeholder",
+            "implementation": "placeholder"
+        })
 
 
 @app.route("/api/vision/analyze", methods=["POST"])
