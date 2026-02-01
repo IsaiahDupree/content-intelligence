@@ -23,6 +23,9 @@ AI-powered content analysis and generation service for the MediaPoster ecosystem
 | `/api/trends/detect` | ✅ **TrendDetector** | `services/trend_intelligence/trend_detector.py` |
 | `/api/brief/generate` | ✅ **BriefGenerator** | `services/content_brief/brief_generator.py` |
 | `/api/engagement/predict` | ✅ **EngagementService** | `services/engagement/engagement_service.py` |
+| `/api/dm/outreach` | ✅ **OutreachSequencer** | `services/dm_outreach/outreach_sequencer.py` |
+| `/api/inbox/auto-reply` | ✅ **AutoReplyEngine** | `services/inbox/auto_reply_engine.py` |
+| `/api/hashtags/generate` | ✅ **HashtagGenerator** | `services/instagram/hashtag_generator.py` |
 
 ## Services Copied from MediaPoster
 
