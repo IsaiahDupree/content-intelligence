@@ -610,6 +610,97 @@ def predict_engagement():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
+@app.route("/api/dm/outreach", methods=["POST"])
+def dm_outreach():
+    """Send DM outreach campaign."""
+    data = request.get_json()
+    prospects = data.get("prospects", [])
+    message_template = data.get("message_template")
+    platform = data.get("platform", "instagram")
+    
+    if not prospects or not message_template:
+        return jsonify({"error": "prospects and message_template required"}), 400
+    
+    try:
+        from services.dm_outreach.outreach_sequencer import OutreachSequencer
+        sequencer = OutreachSequencer()
+        
+        result = sequencer.queue_outreach(
+            prospects=prospects,
+            message_template=message_template,
+            platform=platform
+        )
+        
+        return jsonify({
+            "status": "success",
+            "queued": len(prospects),
+            "result": result if isinstance(result, dict) else {},
+            "implementation": "OutreachSequencer"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/inbox/auto-reply", methods=["POST"])
+def configure_auto_reply():
+    """Configure auto-reply for inbox."""
+    data = request.get_json()
+    platform = data.get("platform", "instagram")
+    rules = data.get("rules", [])
+    enabled = data.get("enabled", True)
+    
+    try:
+        from services.inbox.auto_reply_engine import AutoReplyEngine
+        engine = AutoReplyEngine()
+        
+        result = engine.configure(
+            platform=platform,
+            rules=rules,
+            enabled=enabled
+        )
+        
+        return jsonify({
+            "status": "success",
+            "platform": platform,
+            "rules_count": len(rules),
+            "enabled": enabled,
+            "implementation": "AutoReplyEngine"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/hashtags/generate", methods=["POST"])
+def generate_hashtags():
+    """Generate relevant hashtags for content."""
+    data = request.get_json()
+    content = data.get("content")
+    platform = data.get("platform", "instagram")
+    count = data.get("count", 30)
+    
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    
+    try:
+        from services.instagram.hashtag_generator import HashtagGenerator
+        generator = HashtagGenerator()
+        
+        hashtags = generator.generate(
+            content=content,
+            platform=platform,
+            count=count
+        )
+        
+        return jsonify({
+            "status": "success",
+            "hashtags": hashtags if isinstance(hashtags, list) else [],
+            "count": len(hashtags) if isinstance(hashtags, list) else 0,
+            "implementation": "HashtagGenerator"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     print(f"🧠 {SERVICE_NAME} starting on port {SERVICE_PORT}")
     app.run(host="0.0.0.0", port=SERVICE_PORT, debug=True)
