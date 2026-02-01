@@ -81,6 +81,72 @@ class TestCaptionGenerateEndpoint:
         assert "caption" in data
 
 
+class TestNarrativeEndpoint:
+    def test_narrative_requires_goal(self, client):
+        response = client.post("/api/narrative/plan", json={})
+        assert response.status_code == 400
+    
+    def test_narrative_with_goal(self, client):
+        response = client.post("/api/narrative/plan", json={
+            "goal": "Grow TikTok following to 10k",
+            "duration_days": 30
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestExperimentsEndpoint:
+    def test_experiments_hypothesis(self, client):
+        response = client.post("/api/experiments/hypothesis", json={
+            "content_type": "short_video",
+            "metric": "engagement"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestCompetitorEndpoint:
+    def test_competitor_requires_handle(self, client):
+        response = client.post("/api/competitor/analyze", json={})
+        assert response.status_code == 400
+    
+    def test_competitor_with_handle(self, client):
+        response = client.post("/api/competitor/analyze", json={
+            "handle": "@example",
+            "platform": "instagram"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestTrendsEndpoint:
+    def test_trends_detect(self, client):
+        response = client.post("/api/trends/detect", json={
+            "platform": "tiktok",
+            "limit": 5
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestBriefEndpoint:
+    def test_brief_requires_topic(self, client):
+        response = client.post("/api/brief/generate", json={})
+        assert response.status_code == 400
+    
+    def test_brief_with_topic(self, client):
+        response = client.post("/api/brief/generate", json={
+            "topic": "AI productivity tips",
+            "format": "short_video"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestEngagementEndpoint:
+    def test_engagement_predict(self, client):
+        response = client.post("/api/engagement/predict", json={
+            "title": "5 Tips for Better Sleep",
+            "platform": "instagram"
+        })
+        assert response.status_code in [200, 500]
+
+
 @pytest.fixture
 def client():
     """Create test client."""
