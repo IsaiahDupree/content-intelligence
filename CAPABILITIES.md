@@ -17,6 +17,12 @@ AI-powered content analysis and generation service for the MediaPoster ecosystem
 | `/api/vision/analyze` | ✅ **VisionAnalyzer** | `services/analysis/vision_analyzer_standalone.py` |
 | `/api/generate/title` | ✅ **Groq/OpenAI** | AI with fallback |
 | `/api/generate/caption` | ✅ **Groq/OpenAI** | AI with fallback |
+| `/api/narrative/plan` | ✅ **NarrativeScheduler** | `services/narrative/scheduler.py` |
+| `/api/experiments/hypothesis` | ✅ **HypothesisEngine** | `services/experiments/hypothesis_engine.py` |
+| `/api/competitor/analyze` | ✅ **CompetitorAnalyzer** | `services/competitor_audit/competitor_analyzer.py` |
+| `/api/trends/detect` | ✅ **TrendDetector** | `services/trend_intelligence/trend_detector.py` |
+| `/api/brief/generate` | ✅ **BriefGenerator** | `services/content_brief/brief_generator.py` |
+| `/api/engagement/predict` | ✅ **EngagementService** | `services/engagement/engagement_service.py` |
 
 ## Services Copied from MediaPoster
 
