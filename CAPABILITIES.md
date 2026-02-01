@@ -4,17 +4,43 @@
 AI-powered content analysis and generation service for the MediaPoster ecosystem.
 
 **Port**: 6006  
-**Repository**: https://github.com/IsaiahDupree/content-intelligence
+**Repository**: https://github.com/IsaiahDupree/content-intelligence  
+**Total Code**: 7,959 lines (moved from MediaPoster)
 
 ## Real Implementations
 
 | Endpoint | Implementation | Source |
 |----------|---------------|--------|
-| `/api/score/fate` | **FATEScorer** | `services/analysis/fate_scorer.py` |
-| `/api/classify/awareness` | **AwarenessClassifier** | `services/analysis/awareness_classifier.py` |
-| `/api/analyze/sentiment` | **SentimentAnalyzer** | `services/analysis/sentiment_analyzer_standalone.py` |
-| `/api/generate/title` | **Groq/OpenAI** | AI with fallback |
-| `/api/generate/caption` | **Groq/OpenAI** | AI with fallback |
+| `/api/score/fate` | ✅ **FATEScorer** | `services/analysis/fate_scorer.py` |
+| `/api/classify/awareness` | ✅ **AwarenessClassifier** | `services/analysis/awareness_classifier.py` |
+| `/api/analyze/sentiment` | ✅ **SentimentAnalyzer** | `services/analysis/sentiment_analyzer_standalone.py` |
+| `/api/vision/analyze` | ✅ **VisionAnalyzer** | `services/analysis/vision_analyzer_standalone.py` |
+| `/api/generate/title` | ✅ **Groq/OpenAI** | AI with fallback |
+| `/api/generate/caption` | ✅ **Groq/OpenAI** | AI with fallback |
+
+## Services Copied from MediaPoster
+
+### Analysis Services (2,142 lines)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `fate_scorer.py` | 291 | FATE framework scoring |
+| `awareness_classifier.py` | 318 | Eugene Schwartz awareness levels |
+| `sentiment_analyzer.py` | 338 | AI sentiment analysis |
+| `sentiment_analyzer_standalone.py` | 168 | Rule-based sentiment |
+| `vision_analyzer_standalone.py` | 230 | OpenAI Vision API |
+| `ai_content_analyzer.py` | 492 | Content analysis orchestration |
+
+### Generation Services (1,114 lines)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `ai_title_generator.py` | 527 | Viral title generation |
+| `ai_content_generator.py` | 237 | Content generation |
+| `hook_generator.py` | 350 | Hook pattern generation |
+
+### Recommendation Services (105 lines)
+| File | Lines | Purpose |
+|------|-------|---------|
+| `ai_recommendation_service.py` | 105 | Content recommendations |
 
 ## API Endpoints
 
