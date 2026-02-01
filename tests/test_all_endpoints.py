@@ -184,6 +184,57 @@ class TestHashtagsEndpoint:
         assert response.status_code in [200, 500]
 
 
+class TestCRMLeadsEndpoint:
+    def test_crm_leads_requires_username(self, client):
+        response = client.post("/api/crm/leads", json={})
+        assert response.status_code == 400
+    
+    def test_crm_leads_with_username(self, client):
+        response = client.post("/api/crm/leads", json={
+            "username": "test_user",
+            "platform": "instagram"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestCRMRelationshipScoreEndpoint:
+    def test_score_requires_username(self, client):
+        response = client.post("/api/crm/relationship-score", json={})
+        assert response.status_code == 400
+    
+    def test_score_with_username(self, client):
+        response = client.post("/api/crm/relationship-score", json={
+            "username": "test_user"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestSafariPublishEndpoint:
+    def test_publish_requires_platform_and_content(self, client):
+        response = client.post("/api/safari/publish", json={})
+        assert response.status_code == 400
+    
+    def test_publish_with_platform_and_content(self, client):
+        response = client.post("/api/safari/publish", json={
+            "platform": "instagram",
+            "content": "Test post content"
+        })
+        assert response.status_code in [200, 500]
+
+
+class TestSafariDMEndpoint:
+    def test_dm_requires_recipient_and_message(self, client):
+        response = client.post("/api/safari/dm", json={})
+        assert response.status_code == 400
+    
+    def test_dm_with_recipient_and_message(self, client):
+        response = client.post("/api/safari/dm", json={
+            "recipient": "test_user",
+            "message": "Hello, this is a test DM"
+        })
+        assert response.status_code in [200, 500]
+
+
 @pytest.fixture
 def client():
     """Create test client."""
