@@ -5,8 +5,28 @@ Port: 6006
 import os
 from flask import Flask, jsonify, request
 from datetime import datetime
+from typing import List, Dict, Any
 
 app = Flask(__name__)
+
+# AI Provider configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# Try to import OpenAI client
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = bool(OPENAI_API_KEY)
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+# Try to import Groq client
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = bool(GROQ_API_KEY)
+except ImportError:
+    GROQ_AVAILABLE = False
 
 SERVICE_NAME = "content-intelligence"
 SERVICE_VERSION = "1.0.0"
@@ -47,7 +67,7 @@ def analyze_content():
 
 @app.route("/api/generate/title", methods=["POST"])
 def generate_title():
-    """Generate viral titles for content."""
+    """Generate viral titles for content using AI."""
     data = request.get_json()
     
     content = data.get("content", "")
@@ -55,33 +75,130 @@ def generate_title():
     style = data.get("style", "viral")
     count = data.get("count", 5)
     
-    # TODO: Implement actual AI title generation
-    return jsonify({
-        "status": "success",
-        "platform": platform,
-        "style": style,
-        "titles": [
-            f"Generated title {i+1} for {platform}" for i in range(count)
-        ]
-    })
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    
+    prompt = f"""Generate {count} {style} titles for {platform} content.
+
+Content: {content}
+
+Requirements:
+- Make titles attention-grabbing and clickable
+- Use power words and emotional triggers
+- Keep under 100 characters for {platform}
+- Include hooks that create curiosity
+
+Return ONLY the titles, one per line, numbered 1-{count}."""
+
+    try:
+        titles = []
+        
+        # Try Groq first (fast and free)
+        if GROQ_AVAILABLE:
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.8
+            )
+            raw_titles = response.choices[0].message.content.strip()
+            titles = [line.lstrip("0123456789.) ").strip() for line in raw_titles.split("\n") if line.strip()]
+        
+        # Fallback to OpenAI
+        elif OPENAI_AVAILABLE:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.8
+            )
+            raw_titles = response.choices[0].message.content.strip()
+            titles = [line.lstrip("0123456789.) ").strip() for line in raw_titles.split("\n") if line.strip()]
+        
+        # No AI available - return placeholder
+        else:
+            titles = [f"{style.title()} title {i+1} for {platform}: {content[:30]}..." for i in range(count)]
+        
+        return jsonify({
+            "status": "success",
+            "platform": platform,
+            "style": style,
+            "titles": titles[:count],
+            "ai_provider": "groq" if GROQ_AVAILABLE else ("openai" if OPENAI_AVAILABLE else "placeholder")
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/api/generate/caption", methods=["POST"])
 def generate_caption():
-    """Generate captions for content."""
+    """Generate captions for content using AI."""
     data = request.get_json()
     
     content = data.get("content", "")
     platform = data.get("platform", "instagram")
     include_hashtags = data.get("include_hashtags", True)
     
-    # TODO: Implement actual AI caption generation
-    return jsonify({
-        "status": "success",
-        "platform": platform,
-        "caption": "Generated caption placeholder",
-        "hashtags": ["#placeholder"] if include_hashtags else []
-    })
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    
+    hashtag_instruction = "Include 5-10 relevant hashtags at the end." if include_hashtags else "Do NOT include hashtags."
+    
+    prompt = f"""Write an engaging {platform} caption for this content:
+
+{content}
+
+Requirements:
+- Hook in the first line
+- Conversational tone
+- Include a call-to-action
+- {hashtag_instruction}
+
+Return ONLY the caption, nothing else."""
+
+    try:
+        caption = ""
+        hashtags = []
+        
+        if GROQ_AVAILABLE:
+            client = Groq(api_key=GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.7
+            )
+            caption = response.choices[0].message.content.strip()
+        elif OPENAI_AVAILABLE:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.7
+            )
+            caption = response.choices[0].message.content.strip()
+        else:
+            caption = f"Check out this amazing content! 🔥\n\n{content[:100]}...\n\nWhat do you think? 👇"
+            if include_hashtags:
+                hashtags = ["#content", "#viral", "#fyp", "#trending", "#socialmedia"]
+        
+        # Extract hashtags from caption if present
+        if include_hashtags and "#" in caption:
+            words = caption.split()
+            hashtags = [w for w in words if w.startswith("#")]
+        
+        return jsonify({
+            "status": "success",
+            "platform": platform,
+            "caption": caption,
+            "hashtags": hashtags,
+            "ai_provider": "groq" if GROQ_AVAILABLE else ("openai" if OPENAI_AVAILABLE else "placeholder")
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route("/api/score/fate", methods=["POST"])
