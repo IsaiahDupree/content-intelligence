@@ -26,6 +26,10 @@ AI-powered content analysis and generation service for the MediaPoster ecosystem
 | `/api/dm/outreach` | ✅ **OutreachSequencer** | `services/dm_outreach/outreach_sequencer.py` |
 | `/api/inbox/auto-reply` | ✅ **AutoReplyEngine** | `services/inbox/auto_reply_engine.py` |
 | `/api/hashtags/generate` | ✅ **HashtagGenerator** | `services/instagram/hashtag_generator.py` |
+| `/api/crm/leads` | ✅ **CRM** | External: `/Local EverReach CRM/` |
+| `/api/crm/relationship-score` | ✅ **CRM** | External: `/Local EverReach CRM/` |
+| `/api/safari/publish` | ✅ **Safari** | External: `/Safari Automation/` |
+| `/api/safari/dm` | ✅ **Safari** | External: `/Safari Automation/` |
 
 ## Services Copied from MediaPoster
 
