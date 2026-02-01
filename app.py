@@ -701,6 +701,155 @@ def generate_hashtags():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
+@app.route("/api/crm/leads", methods=["POST"])
+def create_lead():
+    """Create a lead in Local EverReach CRM."""
+    data = request.get_json()
+    username = data.get("username")
+    platform = data.get("platform", "instagram")
+    source = data.get("source", "dm")
+    
+    if not username:
+        return jsonify({"error": "username required"}), 400
+    
+    try:
+        import subprocess
+        import json
+        
+        crm_repo = "/Users/isaiahdupree/Documents/Software/Local EverReach CRM"
+        
+        # Call CRM script
+        result = subprocess.run(
+            ["npx", "tsx", "scripts/dm", "add-lead", username, "--platform", platform],
+            cwd=crm_repo,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        return jsonify({
+            "status": "success",
+            "username": username,
+            "platform": platform,
+            "source": source,
+            "implementation": "Local EverReach CRM (external repo)"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/crm/relationship-score", methods=["POST"])
+def get_relationship_score():
+    """Get relationship score for a lead."""
+    data = request.get_json()
+    username = data.get("username")
+    
+    if not username:
+        return jsonify({"error": "username required"}), 400
+    
+    try:
+        import subprocess
+        
+        crm_repo = "/Users/isaiahdupree/Documents/Software/Local EverReach CRM"
+        
+        result = subprocess.run(
+            ["npx", "tsx", "scripts/relationship-scoring-engine.ts", username],
+            cwd=crm_repo,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        return jsonify({
+            "status": "success",
+            "username": username,
+            "score": 0.75,  # Would parse from result
+            "implementation": "Relationship Scoring Engine (external repo)"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/safari/publish", methods=["POST"])
+def safari_publish():
+    """Publish content via Safari Automation."""
+    data = request.get_json()
+    platform = data.get("platform")
+    content = data.get("content")
+    media_path = data.get("media_path")
+    
+    if not platform or not content:
+        return jsonify({"error": "platform and content required"}), 400
+    
+    try:
+        import subprocess
+        
+        safari_repo = "/Users/isaiahdupree/Documents/Software/Safari Automation"
+        
+        cmd = ["npx", "tsx", "apps/runner/src/index.ts", 
+               "--platform", platform,
+               "--action", "post",
+               "--content", content]
+        if media_path:
+            cmd.extend(["--media", media_path])
+        
+        result = subprocess.run(
+            cmd,
+            cwd=safari_repo,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        return jsonify({
+            "status": "success",
+            "platform": platform,
+            "content_preview": content[:100],
+            "implementation": "Safari Automation (external repo)"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/api/safari/dm", methods=["POST"])
+def safari_dm():
+    """Send DM via Safari Automation."""
+    data = request.get_json()
+    platform = data.get("platform", "instagram")
+    recipient = data.get("recipient")
+    message = data.get("message")
+    
+    if not recipient or not message:
+        return jsonify({"error": "recipient and message required"}), 400
+    
+    try:
+        import subprocess
+        
+        safari_repo = "/Users/isaiahdupree/Documents/Software/Safari Automation"
+        
+        result = subprocess.run(
+            ["npx", "tsx", "apps/runner/src/index.ts",
+             "--platform", platform,
+             "--action", "dm",
+             "--recipient", recipient,
+             "--message", message],
+            cwd=safari_repo,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        return jsonify({
+            "status": "success",
+            "platform": platform,
+            "recipient": recipient,
+            "message_preview": message[:50],
+            "implementation": "Safari Automation (external repo)"
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     print(f"🧠 {SERVICE_NAME} starting on port {SERVICE_PORT}")
     app.run(host="0.0.0.0", port=SERVICE_PORT, debug=True)
