@@ -9,6 +9,10 @@ from typing import List, Dict, Any
 
 app = Flask(__name__)
 
+# Add services to path
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 # AI Provider configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -27,6 +31,25 @@ try:
     GROQ_AVAILABLE = bool(GROQ_API_KEY)
 except ImportError:
     GROQ_AVAILABLE = False
+
+# Import real service implementations
+try:
+    from services.analysis.fate_scorer import FATEScorer
+    FATE_SCORER = FATEScorer()
+    FATE_SCORER_AVAILABLE = True
+except ImportError as e:
+    print(f"FATEScorer not available: {e}")
+    FATE_SCORER_AVAILABLE = False
+    FATE_SCORER = None
+
+try:
+    from services.analysis.awareness_classifier import AwarenessClassifier
+    AWARENESS_CLASSIFIER = AwarenessClassifier.get_instance()
+    AWARENESS_AVAILABLE = True
+except Exception as e:
+    print(f"AwarenessClassifier not available: {e}")
+    AWARENESS_AVAILABLE = False
+    AWARENESS_CLASSIFIER = None
 
 SERVICE_NAME = "content-intelligence"
 SERVICE_VERSION = "1.0.0"
@@ -203,41 +226,79 @@ Return ONLY the caption, nothing else."""
 
 @app.route("/api/score/fate", methods=["POST"])
 def score_fate():
-    """Calculate FATE score for content."""
+    """Calculate FATE score for content using real FATEScorer."""
     data = request.get_json()
     
     content_id = data.get("content_id")
+    content = data.get("content", "")
     metrics = data.get("metrics", {})
     
-    # TODO: Implement actual FATE scoring
-    return jsonify({
-        "status": "success",
-        "content_id": content_id,
-        "fate_score": {
-            "frequency": 0.8,
-            "authority": 0.7,
-            "trust": 0.9,
-            "engagement": 0.85,
-            "overall": 0.81
-        }
-    })
+    if FATE_SCORER_AVAILABLE and content:
+        # Use real FATE scorer
+        f_score = FATE_SCORER.score_focus(content)
+        a_score = FATE_SCORER.score_authority(content)
+        t_score = FATE_SCORER.score_tribe(content)
+        e_score = FATE_SCORER.score_emotion(content)
+        overall = (f_score + a_score + t_score + e_score) / 4
+        
+        return jsonify({
+            "status": "success",
+            "content_id": content_id,
+            "fate_score": {
+                "focus": round(f_score, 2),
+                "authority": round(a_score, 2),
+                "tribe": round(t_score, 2),
+                "emotion": round(e_score, 2),
+                "overall": round(overall, 2)
+            },
+            "implementation": "real"
+        })
+    else:
+        # Fallback placeholder
+        return jsonify({
+            "status": "success",
+            "content_id": content_id,
+            "fate_score": {
+                "focus": 0.8,
+                "authority": 0.7,
+                "tribe": 0.9,
+                "emotion": 0.85,
+                "overall": 0.81
+            },
+            "implementation": "placeholder"
+        })
 
 
 @app.route("/api/classify/awareness", methods=["POST"])
 def classify_awareness():
-    """Classify content awareness level."""
+    """Classify content awareness level using real AwarenessClassifier."""
     data = request.get_json()
     
     content = data.get("content", "")
     
-    # TODO: Implement actual awareness classification
-    levels = ["unaware", "problem_aware", "solution_aware", "product_aware", "most_aware"]
-    return jsonify({
-        "status": "success",
-        "awareness_level": "solution_aware",
-        "confidence": 0.85,
-        "all_levels": {level: 0.2 for level in levels}
-    })
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    
+    if AWARENESS_AVAILABLE and AWARENESS_CLASSIFIER:
+        # Use real awareness classifier
+        result = AWARENESS_CLASSIFIER.classify(content)
+        return jsonify({
+            "status": "success",
+            "awareness_level": result.level.value,
+            "confidence": round(result.confidence, 2),
+            "all_levels": {k: round(v, 2) for k, v in result.scores.items()},
+            "implementation": "real"
+        })
+    else:
+        # Fallback placeholder
+        levels = ["unaware", "problem_aware", "solution_aware", "product_aware", "most_aware"]
+        return jsonify({
+            "status": "success",
+            "awareness_level": "solution_aware",
+            "confidence": 0.85,
+            "all_levels": {level: 0.2 for level in levels},
+            "implementation": "placeholder"
+        })
 
 
 @app.route("/api/analyze/sentiment", methods=["POST"])
