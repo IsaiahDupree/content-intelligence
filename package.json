@@ -1,0 +1,24 @@
+{
+  "name": "content-intelligence-system",
+  "version": "1.0.0",
+  "description": "Content Intelligence System — audits MPLite DB, pulls Blotato social account data, indexes local video files, deduplicates, runs cross-platform analysis, uploads to Supabase",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "audit": "node index.js audit",
+    "sync": "node index.js sync",
+    "scan": "node index.js scan",
+    "analyze": "node index.js analyze",
+    "status": "node index.js status",
+    "delete": "node index.js delete",
+    "migrate": "node index.js migrate",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

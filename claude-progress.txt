@@ -1,0 +1,95 @@
+=== Content Intelligence System — Session Log ===
+
+Session: Initializer Agent
+Date: 2026-03-03
+
+## Completed
+
+### FEAT-001: Project Scaffold
+- Created package.json with all scripts (audit, sync, scan, analyze, status, delete, migrate, test)
+- Created index.js CLI entry point with 8 commands
+- Created lib/ directory with 8 modules
+- Updated .env.example with Supabase, Blotato, MPLite, LOCAL_VIDEO_DIRS config
+- Installed @supabase/supabase-js and dotenv dependencies
+
+### FEAT-002: MPLite DB Audit (lib/mplite.js)
+- Fetches publish_queue, daily_counters, activity_log from Supabase
+- Normalizes queue posts into ci_posts schema
+- Upserts with source='mplite', source_id='mplite_{id}'
+- Extracts filename/filename_stem from media URLs
+
+### FEAT-003: Blotato Account Sync (lib/blotato.js)
+- Enumerates accounts via Blotato /v2/accounts API
+- Falls back to known account IDs (youtube:228, tiktok:710, instagram:807, twitter:571, facebook:786)
+- Paginates last 90 days of posts per account
+- Normalizes with engagement_rate calculation
+- Upserts with source='blotato', source_id='blotato_{accountId}_{postId}'
+
+### FEAT-004: Local File Scanner (lib/scanner.js)
+- Recursively scans LOCAL_VIDEO_DIRS (comma-separated env var)
+- Supports 17 media extensions (video + image)
+- SHA256 hashes every file
+- Matches against ci_posts by filename_stem (ilike)
+- Sets is_uploaded/safe_to_delete when matched
+
+### FEAT-005: Safe-Delete Engine (lib/deleter.js)
+- dryRun(): lists all files marked safe_to_delete with sizes
+- confirmDelete(): actually unlinks files, updates Supabase records
+- formatBytes() utility for human-readable sizes
+
+### FEAT-006: Cross-Platform Analyzer (lib/analyzer.js)
+- platformBreakdown(): groups by platform, calculates averages
+- topPerformers(): sorts by weighted engagement score (likes + comments*2 + shares*3)
+- contentGaps(): identifies missing platforms, low-frequency, stale platforms
+- recommendations(): actionable suggestions based on analysis
+- Saves snapshot to ci_analysis_snapshots
+
+### FEAT-007: Content Association Graph (lib/graph.js)
+- Groups all ci_posts by filename_stem (case-insensitive)
+- Identifies cross-posted vs single-platform content
+- Calculates aggregate likes/views per content group
+- Saves as 'content_association_graph' snapshot
+
+### FEAT-008: Supabase Schema Migration (lib/migrate.js)
+- Defines CREATE TABLE IF NOT EXISTS for ci_posts, ci_local_files, ci_analysis_snapshots
+- Attempts exec_sql RPC, falls back to table existence check
+- checkTables() verifies table status
+
+### FEAT-009: CLI Status Dashboard (lib/dashboard.js)
+- Fetches post counts by platform, local file stats, latest analysis
+- printStatus() renders formatted CLI output
+- Shows top 5 performers, recommendations, content gaps, deletable bytes
+
+### FEAT-010: Unit + Integration Tests (tests/test_content_intelligence.js)
+- 19 tests across 7 suites
+- Tests: extractFilename, extractStem, normalizeQueuePost, calcEngagement
+- Tests: normalizeBlotatoPost, KNOWN_ACCOUNTS
+- Tests: scanDir, hashFile, getMimeType, MEDIA_EXTENSIONS
+- Tests: formatBytes
+- Tests: platformBreakdown, topPerformers, contentGaps, recommendations
+- Tests: CLI help output
+- Tests: migration table definitions and SQL columns
+- All 19 tests pass
+
+## Architecture
+
+```
+content-intelligence/
+├── package.json          # Node.js project config
+├── index.js              # CLI entry point (8 commands)
+├── lib/
+│   ├── supabase.js       # Supabase client singleton
+│   ├── migrate.js        # Schema migration
+│   ├── mplite.js         # MPLite DB audit
+│   ├── blotato.js        # Blotato account sync
+│   ├── scanner.js        # Local file scanner + SHA256
+│   ├── deleter.js        # Safe-delete engine
+│   ├── analyzer.js       # Cross-platform analyzer
+│   ├── graph.js          # Content association graph
+│   └── dashboard.js      # CLI status dashboard
+├── tests/
+│   └── test_content_intelligence.js  # 19 tests
+├── app.py                # Existing Python Flask AI service (port 6006)
+├── services/             # Existing Python AI/ML modules
+└── .env.example          # All env vars documented
+```

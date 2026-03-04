@@ -10,7 +10,6 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
 lib64/
 parts/
 sdist/
@@ -47,6 +46,10 @@ logs/
 htmlcov/
 .tox/
 .nox/
+
+# Node
+node_modules/
+package-lock.json
 
 # OS
 .DS_Store
