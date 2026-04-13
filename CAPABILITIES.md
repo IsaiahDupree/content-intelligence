@@ -162,3 +162,208 @@ OPENAI_API_KEY=sk-...      # For AI title/caption generation
 GROQ_API_KEY=gsk-...       # Preferred AI provider (faster)
 ANTHROPIC_API_KEY=sk-ant-... # Optional fallback
 ```
+
+---
+
+## CIOS (Content Intelligence Operating System)
+
+**Port**: 5570
+**Repository**: Media Vault (`/media-vault/backend/`)
+**Status**: 🟡 In Development (0/25 features)
+**Launch Script**: `harness/launch-cios.sh`
+
+CIOS is the orchestration and command-center layer built on top of content-intelligence. It coordinates multiple pipelines to generate content briefs, track performance, generate insights, and enable autonomous content cycles.
+
+### Core Features (Being Implemented)
+
+| Tier | Features | Status |
+|------|----------|--------|
+| **Tier 1 (Critical)** | CIOS-01: Schema, CIOS-02: API, CIOS-03: Brief Steps 1-3, CIOS-04: Brief Gen, CIOS-18: Launch | 🟡 Pending |
+| **Tier 2 (High)** | CIOS-05 through CIOS-22 (11 features: Pipelines, Dashboard, Event Bus) | 🟡 Pending |
+| **Tier 3 (Medium)** | CIOS-12 through CIOS-24 (7 features: UI, Analytics, Autonomous Cycles) | 🟡 Pending |
+| **Tier 4 (Low)** | CIOS-25: ACD MCP Integration | 🟡 Pending |
+
+### CIOS Endpoints (Will Be Implemented)
+
+#### Health & Status
+```bash
+GET /api/cios/health
+```
+Returns aggregate health of all 6 subsystems + pipeline queue depth
+
+#### Content Brief Pipeline
+```bash
+POST /api/cios/pipeline/content-brief
+{
+  "topic": "string",
+  "platform": "tiktok|instagram|twitter|linkedin",
+  "geo_optimize": boolean,  # Optional TikTok GEO optimization
+  "geo_location": "string"  # Optional location for GEO
+}
+```
+Response: Full ContentBrief JSON with topic, platform, format, hook, script_outline, hashtags, B-roll suggestions
+
+#### Performance Sync Pipeline
+```bash
+POST /api/cios/pipeline/performance-sync
+```
+Updates all performance data, detects tier changes, generates insights
+
+#### Weekly Digest Pipeline
+```bash
+POST /api/cios/pipeline/weekly-digest
+{
+  "send_email": boolean
+}
+```
+Synthesizes goals, performance, emerging formats, unreviewed insights
+
+#### Goal Alignment Scan
+```bash
+POST /api/cios/pipeline/goal-align
+```
+Queries AIL for goal gaps, creates actionable insights
+
+#### Prospect Brief Generation
+```bash
+POST /api/cios/pipeline/prospect-brief
+{
+  "contact_name": "string",
+  "platform": "string"
+}
+```
+Generates prospect-specific outreach brief, enriched from CRMLite
+
+#### Cross-System Search
+```bash
+GET /api/cios/search?q={query}
+```
+Unified search across AIL, TikTok, Media Vault, and Content Briefs
+
+#### Pipeline Management
+```bash
+GET /api/cios/pipelines
+GET /api/cios/pipelines/{run_id}
+POST /api/cios/pipelines/{run_id}/replay
+PATCH /api/cios/briefs/{id}/status
+```
+
+### CIOS Database Schema (4 Tables)
+
+#### cios_pipeline_runs
+Track all pipeline executions:
+- `run_id` (UUID, PK)
+- `run_type` (content-brief, performance-sync, etc.)
+- `status` (running, completed, failed)
+- `input` (JSONB)
+- `output` (JSONB)
+- `steps` (JSONB array with timing)
+- `started_at`, `completed_at`
+
+#### cios_content_briefs
+Store generated briefs:
+- `id` (UUID, PK)
+- `topic`, `platform`, `format`
+- `brief` (JSONB - full ContentBrief)
+- `production_status` (draft, in_production, published, cancelled)
+- `geo_optimized`, `geo_brief`
+- `created_at`, `updated_at`
+
+#### cios_insight_log
+Actionable insights:
+- `id` (UUID, PK)
+- `type` (viral_pattern, format_emerging, goal_gap, etc.)
+- `priority` (high, medium, low)
+- `content` (JSONB)
+- `source_service` (tiktok, ail, vault, etc.)
+- `reviewed_at`, `action_taken`
+
+#### cios_distribution_queue
+Publishing schedule:
+- `id` (UUID, PK)
+- `brief_id` (FK to cios_content_briefs)
+- `scheduled_for` (timestamp)
+- `priority_score` (0-100)
+- `status` (queued, published, failed)
+- `blotato_post_id` (after publishing)
+
+### CIOS Real-Time Event Bus
+
+**Channel**: `cios-events` (Supabase Realtime)
+
+**Events Broadcast**:
+- `PIPELINE_STARTED` — pipeline execution began
+- `PIPELINE_STEP_COMPLETED` — individual step finished
+- `PIPELINE_COMPLETED` — pipeline execution finished (success or failure)
+- `PERFORMANCE_UPDATED` — performance tiers changed
+- `INSIGHT_GENERATED` — new insight_log entry created
+- `BRIEF_CREATED` — new content brief generated
+- `VIRAL_DETECTED` — post reached viral tier
+
+Dashboard subscribes to these events for live updates without polling.
+
+### CIOS Autonomous Cycles
+
+#### Morning Cycle (8am)
+1. Run goal-alignment pipeline
+2. Generate 3 content briefs (one per priority platform)
+3. Auto-fill distribution queue for next 24h
+4. Log results to insight_log
+
+#### Evening Cycle (6pm)
+1. Run performance-sync pipeline
+2. Creator scan via tiktok-creator-watch
+3. Generate viral_pattern and format_emerging insights
+4. Update AIL with new high-performing content
+
+### CIOS Dashboard
+
+**Frontend**: Next.js at port 5571
+
+**Pages**:
+- `/` — Command center: pipeline launchers, live run stream, system health
+- `/briefs` — Content brief library with filters and production workflow
+- `/intelligence` — Insight feed with priority and action tracking
+- `/performance` — Cross-platform analytics and trend charts
+- `/queue` — Distribution queue with scheduling and manual publish
+- `/memory` — AIL memory browser and document ingestion
+- `/settings` — Autonomous cycle configuration
+
+### Integration Points
+
+CIOS orchestrates these 6 external systems:
+
+1. **AIL** (Semantic search & knowledge ingestion)
+   - POST /api/query — topic context retrieval
+   - POST /api/ingest/social — re-embed updated performance data
+   - POST /api/ingest/obsidian — optional vault sync
+
+2. **TikTok Analytics** (Performance data)
+   - GET /api/posts/check-batch — performance updates
+   - POST /api/creators/scan-all — trending creator detection
+   - POST /api/geo/generate-brief — TikTok GEO optimization
+
+3. **Media Vault** (Video library)
+   - POST /api/performance/check-all — vault item performance
+   - GET /api/search/broll — B-roll suggestion for topic
+
+4. **Content Intelligence** (Analysis & generation)
+   - POST /api/score/fate — content scoring
+   - POST /api/generate/title — title generation
+   - POST /api/classify/awareness — awareness level detection
+
+5. **CRMLite** (Contact enrichment)
+   - GET /api/contacts/search — contact lookup by name
+   - Returns: last_dm_date, platform_handle, crm_status
+
+6. **Blotato** (Social publishing)
+   - POST /v2/posts — publish content to platforms
+   - GET /v2/accounts — list connected accounts
+
+### Development Status
+
+- ✅ feature_list.json created with 25 features
+- ✅ CIOS architecture documented
+- ✅ Launch script template created
+- ✅ Developer guide with patterns and examples
+- 🟡 Awaiting autonomous agent implementation (CIOS-01 onwards)

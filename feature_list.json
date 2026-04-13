@@ -1,0 +1,308 @@
+{
+  "project": "content-intelligence-os",
+  "version": "1.0.0",
+  "prd": "harness/prompts/content-intelligence-os.md",
+  "target_path": "/Users/isaiahdupree/Documents/Software/media-vault",
+  "features": [
+    {
+      "id": "CIOS-01",
+      "title": "Supabase Schema: cios_pipeline_runs, cios_content_briefs, cios_insight_log, cios_distribution_queue",
+      "description": "Apply migrations to create all 4 CIOS tables with correct indexes. Especially: composite index on pipeline_runs(run_type, started_at DESC), partial index on insight_log for unreviewed items, content_briefs filtered by platform and production_status.",
+      "priority": "critical",
+      "acceptance_criteria": [
+        "All 4 tables created in Supabase ivhfuhxorppptyuofbgq",
+        "Partial index on cios_insight_log(reviewed_at) WHERE reviewed_at IS NULL",
+        "cios_content_briefs.production_status enum: draft, in_production, published, cancelled",
+        "cios_pipeline_runs.steps JSONB column stores step-by-step execution trace"
+      ]
+    },
+    {
+      "id": "CIOS-02",
+      "title": "CIOS Orchestration API — FastAPI Scaffold (port 5570)",
+      "description": "Scaffold cios_api.py in media-vault/backend. FastAPI app on port 5570 with CORS enabled for dashboard. Startup health check pings all 6 subsystems. /api/cios/health endpoint aggregates all subsystem statuses with individual latency measurements.",
+      "priority": "critical",
+      "acceptance_criteria": [
+        "FastAPI starts with: uvicorn cios_api:app --port 5570",
+        "GET /api/cios/health returns status, subsystems dict, pipeline_queue_depth",
+        "Individual subsystem status is 'ok', 'degraded', or 'down'",
+        "Health check completes within 3 seconds total"
+      ]
+    },
+    {
+      "id": "CIOS-03",
+      "title": "Content Brief Pipeline — Parallel Context Retrieval (Steps 1-3)",
+      "description": "POST /api/cios/pipeline/content-brief — Steps 1, 2, 3 run in parallel via asyncio.gather(): AIL semantic query for topic context, TikTok analytics performance context for platform+niche, media-vault B-roll search. Results combined into context object for Step 4.",
+      "priority": "critical",
+      "acceptance_criteria": [
+        "Steps 1-3 run concurrently (not sequentially) — verified via timing logs",
+        "Each step has independent timeout (600ms, 300ms, 500ms) with graceful fallback to empty result",
+        "Combined context passed to Step 4 regardless of individual step failures",
+        "cios_pipeline_runs.steps records start_time and latency_ms for each step"
+      ]
+    },
+    {
+      "id": "CIOS-04",
+      "title": "Content Brief Pipeline — GPT-4o Brief Generation (Step 4)",
+      "description": "Using all retrieved context from Steps 1-3, call GPT-4o with structured prompt to generate ContentBrief JSON: topic, platform, format, hook, hook_alternatives(2), script_outline, caption, hashtags, cta, visual_notes, broll_file_ids, estimated_duration, content_pillars, ail_insights(3).",
+      "priority": "critical",
+      "acceptance_criteria": [
+        "All ContentBrief fields populated for any valid topic + platform input",
+        "hook_alternatives contains exactly 2 alternatives",
+        "ail_insights contains up to 3 summarized retrieval results",
+        "broll_file_ids references actual media vault item IDs from Step 3"
+      ]
+    },
+    {
+      "id": "CIOS-05",
+      "title": "Content Brief Pipeline — GEO Optimization Step (Step 5)",
+      "description": "When geo_optimize=true and platform=tiktok: call tiktok-geo /api/geo/generate-brief with the brief topic, merge geo_brief and geo_score into the cios_content_briefs row. Step 5 runs after Step 4 (sequential, not parallel).",
+      "priority": "high",
+      "acceptance_criteria": [
+        "GEO step only runs when geo_optimize=true",
+        "geo_score stored in cios_content_briefs.geo_optimized and geo_brief fields",
+        "Step 5 failure does not fail the entire pipeline (brief returned without GEO data)",
+        "Total pipeline < 20 seconds even with GEO step"
+      ]
+    },
+    {
+      "id": "CIOS-06",
+      "title": "Performance Sync Pipeline",
+      "description": "POST /api/cios/pipeline/performance-sync — calls media-vault /api/performance/check-all and tiktok-analytics /api/posts/check-batch in parallel. For each item with tier change: calls AIL /api/ingest/social to re-embed updated performance data. Generates cios_insight_log entries for tier changes.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "Vault and TikTok checkbacks run in parallel",
+        "Every performance tier change triggers AIL re-ingest",
+        "Tier upgrades to 'viral' generate insight_log entry with priority='high'",
+        "Returns { items_synced, tier_changes, insights_generated } count"
+      ]
+    },
+    {
+      "id": "CIOS-07",
+      "title": "Weekly Digest Pipeline",
+      "description": "POST /api/cios/pipeline/weekly-digest — runs 5 data gathering steps, synthesizes via GPT-4o into structured digest (goals gaps, emerging formats, viral roundup, performance summary, unreviewed insights), sends via Resend if send_email=true.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "All 5 data gathering steps complete (with graceful fallback if any subsystem down)",
+        "GPT-4o synthesis generates coherent weekly narrative under 800 words",
+        "Email sent via Resend with HTML + plain text fallback",
+        "Digest JSON stored in cios_pipeline_runs.output for review"
+      ]
+    },
+    {
+      "id": "CIOS-08",
+      "title": "Goal Alignment Scan Pipeline",
+      "description": "POST /api/cios/pipeline/goal-align — delegates to AIL /api/query/goals-align, writes each action item as a cios_insight_log entry of type 'goal_gap' with correct priority mapping (high/medium/low). Returns same action list.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "AIL goal-align response correctly converted to insight_log entries",
+        "Duplicate insights (same action within 7 days) not re-created",
+        "Priority mapped: AIL 'high' → CIOS 'high', etc.",
+        "Returns insights_created count alongside action list"
+      ]
+    },
+    {
+      "id": "CIOS-09",
+      "title": "Supabase Realtime Event Bus — cios-events Channel",
+      "description": "Implement CIOS Event Bus using Supabase Realtime broadcast channel 'cios-events'. CIOS Orchestration API publishes typed events after key state changes. Dashboard subscribes to show live updates. Performance sync publishes PERFORMANCE_UPDATED events for viral tier changes.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "PIPELINE_COMPLETED event broadcast after every pipeline run finishes",
+        "PERFORMANCE_UPDATED event broadcast when performance_tier changes",
+        "INSIGHT_GENERATED event broadcast when new insight_log entry created",
+        "Dashboard receives events within 500ms of publish"
+      ]
+    },
+    {
+      "id": "CIOS-10",
+      "title": "CIOS Dashboard — Command Center Page (/)",
+      "description": "Next.js page at / showing: 5 pipeline launcher cards with Run Now buttons, live pipeline run stream via Supabase Realtime, last 5 content briefs with status badges, unreviewed insight log entries (critical+high), system health dots for all 6 subsystems.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "Pipeline run stream updates in real time without page refresh",
+        "Running pipeline shows step-by-step progress via cios_pipeline_runs.steps",
+        "System health dots turn red/yellow/green based on /api/cios/health response",
+        "Dashboard loads in < 2 seconds"
+      ]
+    },
+    {
+      "id": "CIOS-11",
+      "title": "CIOS Dashboard — Content Brief Library (/briefs)",
+      "description": "Page showing all cios_content_briefs with filters (platform, format, geo_optimized, production_status). Expandable rows show full brief, B-roll thumbnails, and AIL context snippets. Actions: Start Production, Approve for Queue, Archive.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "Paginated at 20 per page with URL-synced filters",
+        "Expanded row shows broll_suggestions as thumbnail images",
+        "Approve for Queue button creates cios_distribution_queue entry",
+        "Archive sets production_status='cancelled'"
+      ]
+    },
+    {
+      "id": "CIOS-12",
+      "title": "CIOS Dashboard — Intelligence Insight Log (/intelligence)",
+      "description": "Feed of cios_insight_log entries sorted by priority then created_at. Filter by type (viral_pattern, format_emerging, geo_citation, goal_gap, etc.), priority, and source_service. Mark as reviewed + action_taken note inline.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Unreviewed insights shown at top with highlight border",
+        "Mark reviewed button sets reviewed_at to NOW() without page reload",
+        "Action taken text field saves to insight_log.action_taken",
+        "Count badge shows unreviewed critical + high priority items"
+      ]
+    },
+    {
+      "id": "CIOS-13",
+      "title": "CIOS Dashboard — Cross-Platform Performance Analytics (/performance)",
+      "description": "Unified analytics view combining tiktok_posts and media_items.performance_data. Shows aggregate by platform (avg views, engagement_rate), by content format, and by niche tag. Top 10 performers table. Viral rate funnel chart.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Aggregates data from both tiktok_posts and media_items.performance_data",
+        "Platform breakdown shows all 4 platforms (TikTok, Instagram, Twitter, LinkedIn)",
+        "Viral rate funnel: published count → strong+ count → viral count",
+        "Date range filter: last 7d / 30d / 90d / all time"
+      ]
+    },
+    {
+      "id": "CIOS-14",
+      "title": "CIOS Dashboard — Distribution Queue (/queue)",
+      "description": "Page showing cios_distribution_queue contents with scheduling status, priority scores, and planned publish times. Manual Publish Now button calls Blotato directly. Calendar view toggle shows posts on scheduled dates.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Queue items sortable by priority_score and scheduled_for",
+        "Publish Now button calls Blotato /v2/posts API and updates status='published'",
+        "Calendar view shows scheduled items on correct date cells",
+        "Drag-to-reorder adjusts priority_score of affected items"
+      ]
+    },
+    {
+      "id": "CIOS-15",
+      "title": "CIOS Dashboard — AIL Memory Browser (/memory)",
+      "description": "Page to browse and manage the AIL. Namespace selector dropdown. Document list with source_type icons and chunk counts. Search bar calls AIL /api/query and shows ranked results. Ingest forms for YouTube URL and file upload. Obsidian sync trigger button.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Namespace selector shows all namespaces from ail_documents",
+        "Search results render with source_type, title, similarity score, and content excerpt",
+        "YouTube ingest form: paste URL → shows video_title + chunks_created on success",
+        "Obsidian sync trigger POSTs to AIL /api/ingest/obsidian with default vault path"
+      ]
+    },
+    {
+      "id": "CIOS-16",
+      "title": "Autonomous Morning Cycle",
+      "description": "When autonomous-cycle mode is active, run at 8am: goal-align pipeline, then 3 × content-brief pipeline (one per target platform from business-goals.json), then check distribution queue and auto-fill empty slots. Log cycle results to cios_insight_log.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Cycle triggers at 8am local time (cron or pg_cron)",
+        "Platform selection reads from business-goals.json priority_platforms array",
+        "Auto-fill adds to queue only if < 3 items scheduled for next 24h",
+        "Cycle run logged as cios_pipeline_run with run_type='morning_cycle'"
+      ]
+    },
+    {
+      "id": "CIOS-17",
+      "title": "Autonomous Evening Cycle",
+      "description": "When autonomous-cycle mode active, run at 6pm: performance-sync pipeline (updates all analytics), then creator-scan via tiktok-creator-watch, then generate insight_log entries from any viral_pattern or format_emerging events detected.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Cycle triggers at 6pm local time",
+        "Creator scan calls tiktok-creator-watch /api/creators/scan-all",
+        "viral_pattern insights created for any creator posts with views > 100K",
+        "format_emerging insights created if emerging-formats returns any 'rising' formats"
+      ]
+    },
+    {
+      "id": "CIOS-18",
+      "title": "CIOS Launch Script (harness/launch-cios.sh)",
+      "description": "Bash script that starts all CIOS subsystems in dependency order: media-vault backend → TikTok intelligence services → CIOS orchestration API → CIOS dashboard. Waits for each service health check before starting next. Logs PIDs to /tmp/cios-pids.txt.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "Script completes without error when all services are available",
+        "Each service health-checked before proceeding to next start",
+        "All PIDs written to /tmp/cios-pids.txt for tracking",
+        "Final output: 'All services started. Health: http://localhost:5570/api/cios/health'"
+      ]
+    },
+    {
+      "id": "CIOS-19",
+      "title": "Auto-Insight Generation for Viral Events",
+      "description": "When tiktok-analytics classifies a post as 'viral' (performance_tier = 'viral'), automatically broadcast CREATOR_WENT_VIRAL event via Supabase Realtime, create cios_insight_log entry (type='viral_pattern', priority='high'), and trigger AIL ingest of the post content + hook.",
+      "priority": "high",
+      "acceptance_criteria": [
+        "Viral classification in tiktok-analytics triggers event bus broadcast within 1 second",
+        "cios_insight_log entry created with post hook, views, and link to tiktok_posts record",
+        "AIL ingest called with platform='tiktok', including performance metrics",
+        "Insight appears on dashboard Command Center without page refresh"
+      ]
+    },
+    {
+      "id": "CIOS-20",
+      "title": "CIOS Pipeline Run History and Replay",
+      "description": "GET /api/cios/pipelines returns all cios_pipeline_runs sorted by started_at DESC, paginated. POST /api/cios/pipelines/:run_id/replay re-runs the same pipeline with identical input. Failed runs show error and which step failed.",
+      "priority": "low",
+      "acceptance_criteria": [
+        "GET /api/cios/pipelines returns paginated runs with status and total_latency_ms",
+        "Replay creates a NEW cios_pipeline_runs row (not overwrites the original)",
+        "Failed run detail shows step name and error message for the failed step",
+        "Replay endpoint returns 404 for non-existent run_id"
+      ]
+    },
+    {
+      "id": "CIOS-21",
+      "title": "Content Brief → Production Status Workflow",
+      "description": "State machine for cios_content_briefs.production_status: draft → in_production → published (or cancelled). PATCH /api/cios/briefs/:id/status endpoint with allowed transitions. 'in_production' triggers optional voiceover generation via video-studio MCP.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Invalid state transitions return 400 with explanation",
+        "draft → in_production: optionally calls remotion_generate_voiceover with brief.full_script",
+        "in_production → published: requires blotato_post_id to be set",
+        "Status change triggers BRIEF_CREATED event on event bus"
+      ]
+    },
+    {
+      "id": "CIOS-22",
+      "title": "Cross-Subsystem Search Endpoint",
+      "description": "GET /api/cios/search?q={query} — fans out search to AIL (/api/query), tiktok_posts (text search on caption), media_items (text search on ai_analysis), and cios_content_briefs (text search on topic+caption). Returns unified ranked results with source labels.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "All 4 sources queried in parallel",
+        "Results merged and re-ranked by relevance (similarity or text rank)",
+        "Each result labeled with source: 'ail' | 'tiktok' | 'vault' | 'brief'",
+        "Returns top 20 results total across all sources"
+      ]
+    },
+    {
+      "id": "CIOS-23",
+      "title": "Prospect Brief Integration with CRMLite",
+      "description": "POST /api/cios/pipeline/prospect-brief — after AIL generates prospect brief, also fetch contact record from CRMLite API (if contact_name exists in crm_contacts), merge CRM data (last DM date, platform handle, status) into brief. Return enriched brief.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "CRMLite lookup by contact name returns matching contact or null",
+        "CRM data merged: last_dm_date, platform_handle, crm_status, notes",
+        "Brief includes crm_enriched: true/false field",
+        "CRM lookup failure is non-blocking (returns brief without CRM data)"
+      ]
+    },
+    {
+      "id": "CIOS-24",
+      "title": "Distribution Queue Auto-Scheduler with Thompson Sampling",
+      "description": "When items are approved for the distribution queue, auto-assign scheduled_for times using Thompson Sampling over historical best-performing publish times (from tiktok_posts + media_items performance_data). Avoid scheduling 2 posts within 3 hours on same platform.",
+      "priority": "medium",
+      "acceptance_criteria": [
+        "Thompson Sampling reads historical performance by hour from tiktok_posts + media_items",
+        "Probability sampling produces times skewed toward historically high-performing hours",
+        "3-hour minimum gap enforced per platform",
+        "Scheduled times store Thompson Sampling confidence in cios_distribution_queue.metadata"
+      ]
+    },
+    {
+      "id": "CIOS-25",
+      "title": "CIOS ACD MCP Tool: acd_dispatch Integration",
+      "description": "Expose a CIOS pipeline trigger as an ACD MCP-compatible tool so the ACD harness can dispatch content intelligence tasks. POST /api/cios/mcp/dispatch accepts { pipeline_type, input } and returns { run_id }. Registers with ACD memory layer on completion.",
+      "priority": "low",
+      "acceptance_criteria": [
+        "POST /api/cios/mcp/dispatch with valid pipeline_type starts correct pipeline",
+        "run_id returned immediately (pipeline runs async)",
+        "On pipeline completion, writes summary to AIL /api/ingest/conversation as agent_id='cios'",
+        "Supported pipeline_types: content-brief, performance-sync, goal-align, weekly-digest"
+      ]
+    }
+  ]
+}
