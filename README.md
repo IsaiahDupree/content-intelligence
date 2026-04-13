@@ -72,8 +72,48 @@ python app.py  # starts on port 6006
 
 See `.env.example` for all configuration options.
 
+## CIOS (Content Intelligence Operating System)
+
+CIOS is the orchestration layer being built on top of this content-intelligence service. See **CAPABILITIES.md** for full details.
+
+### Quick Start for CIOS Development
+
+```bash
+# 1. Start content-intelligence AI services (this repo)
+python app.py  # port 6006
+
+# 2. Set up CIOS backend in media-vault
+cd /Users/isaiahdupree/Documents/Software/media-vault/backend
+source venv/bin/activate
+# Agents will implement features CIOS-01 onwards
+
+# 3. CIOS dashboard will run on port 5571
+# Agents will build this as a Next.js app
+```
+
+### CIOS Implementation Order
+
+**Phase 1 (Critical)** — Required for basic operation:
+1. CIOS-01: Supabase schema (4 tables)
+2. CIOS-02: FastAPI scaffold on port 5570
+3. CIOS-03: Parallel context retrieval
+4. CIOS-04: GPT-4o brief generation
+
+**Phase 2 (High Priority)** — Completes core pipelines:
+- CIOS-05 to CIOS-18: Additional pipelines, event bus, launch script
+
+**Phase 3 (Medium)** — Dashboard and autonomous cycles:
+- CIOS-12 to CIOS-17, CIOS-21-24: UI, analytics, autonomous operations
+
+**Phase 4 (Polish)** — Integration and extras:
+- CIOS-20, CIOS-25: History/replay, ACD integration
+
+See `feature_list.json` for full feature specifications with acceptance criteria.
+
 ## Related Repos
 
 - MediaPoster — Scheduling, publishing
 - Safari Automation — Browser-based social automation
 - MPLite — Organic publish queue (Vercel)
+- Media Vault — CIOS target path
+- CRMLite — Contact management and enrichment
