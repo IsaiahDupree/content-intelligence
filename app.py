@@ -4,7 +4,7 @@ Port: 6006
 """
 import os
 from flask import Flask, jsonify, request
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 app = Flask(__name__)
@@ -113,7 +113,7 @@ def health():
         "status": "healthy",
         "service": SERVICE_NAME,
         "version": SERVICE_VERSION,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 
