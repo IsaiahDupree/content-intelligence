@@ -74,9 +74,26 @@ SERVICE_VERSION = "1.0.0"
 SERVICE_PORT = int(os.getenv("PORT", 6006))
 
 
+# Import UGC Format services
+try:
+    from services.ugc_format.classifier import UGCFormatClassifier
+    from services.ugc_format.scorer import PerformanceScorer
+    from services.ugc_format.recommender import RepurposingRecommender
+    from services.supabase_client import get_supabase_client
+    UGC_CLASSIFIER = UGCFormatClassifier()
+    UGC_SCORER = PerformanceScorer()
+    UGC_RECOMMENDER = RepurposingRecommender()
+    SUPABASE = get_supabase_client()
+    UGC_SERVICES_AVAILABLE = True
+except Exception as e:
+    print(f"UGC services not available: {e}")
+    UGC_SERVICES_AVAILABLE = False
+    SUPABASE = None
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
+    """Health check endpoint - API-001."""
     return jsonify({
         "status": "healthy",
         "service": SERVICE_NAME,
@@ -85,15 +102,218 @@ def health():
     })
 
 
+@app.route("/api/classify", methods=["POST"])
+def classify_format():
+    """Classify UGC format - API-002."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "content required"}), 400
+
+    content = data.get("content", "")
+    content_id = data.get("content_id")
+    content_metadata = data.get("metadata", {})
+
+    if not content:
+        return jsonify({"error": "content required"}), 400
+
+    if UGC_SERVICES_AVAILABLE:
+        result = UGC_CLASSIFIER.classify(content, content_metadata)
+
+        # Store in Supabase if content_id provided
+        if content_id and SUPABASE:
+            SUPABASE.store_format_classification(content_id, {
+                "format": result.format,
+                "confidence": result.confidence,
+                "all_scores": result.all_scores,
+                "reasoning": result.reasoning
+            })
+
+        return jsonify({
+            "status": "success",
+            "format": result.format,
+            "confidence": round(result.confidence, 2),
+            "all_scores": {k: round(v, 2) for k, v in result.all_scores.items()},
+            "reasoning": result.reasoning
+        })
+    else:
+        return jsonify({"error": "Classification service not available"}), 500
+
+
+@app.route("/api/score", methods=["POST"])
+def score_performance():
+    """Calculate performance score - API-003."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "metrics required"}), 400
+
+    metrics = data.get("metrics", {})
+    content_id = data.get("content_id")
+
+    if UGC_SERVICES_AVAILABLE:
+        result = UGC_SCORER.score(metrics)
+
+        # Store in Supabase if content_id provided
+        if content_id and SUPABASE:
+            SUPABASE.store_performance_score(content_id, {
+                "overall_score": result.overall_score,
+                "engagement_score": result.engagement_score,
+                "retention_score": result.retention_score,
+                "conversion_score": result.conversion_score,
+                "metrics_breakdown": result.metrics_breakdown,
+                "timestamp": result.timestamp
+            })
+
+        return jsonify({
+            "status": "success",
+            "content_id": content_id,
+            "overall_score": round(result.overall_score, 2),
+            "engagement_score": round(result.engagement_score, 2),
+            "retention_score": round(result.retention_score, 2),
+            "conversion_score": round(result.conversion_score, 2),
+            "metrics_breakdown": {k: round(v, 2) for k, v in result.metrics_breakdown.items()},
+            "timestamp": result.timestamp
+        })
+    else:
+        return jsonify({"error": "Scoring service not available"}), 500
+
+
+@app.route("/api/repurpose/<content_id>", methods=["GET"])
+def get_repurposing_recommendations(content_id):
+    """Get repurposing recommendations - API-004."""
+    data = request.get_json() or {}
+
+    current_format = data.get("format", "testimonial")
+    performance_data = data.get("performance", {"overall_score": 50})
+
+    if UGC_SERVICES_AVAILABLE:
+        recommendations = UGC_RECOMMENDER.recommend(current_format, performance_data)
+        return jsonify({
+            "status": "success",
+            "content_id": content_id,
+            "current_format": current_format,
+            "recommendations": [
+                {
+                    "format": r.format,
+                    "viability_score": round(r.viability_score, 2),
+                    "rationale": r.rationale
+                }
+                for r in recommendations
+            ]
+        })
+    else:
+        return jsonify({"error": "Recommendation service not available"}), 500
+
+
+@app.route("/api/analyze", methods=["POST"])
+def analyze_and_store_full():
+    """Full end-to-end analysis: classify → score → recommend → store (Core E2E)."""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "content required"}), 400
+
+    content = data.get("content", "")
+    content_id = data.get("content_id")
+    metrics = data.get("metrics", {})
+
+    if not content:
+        return jsonify({"error": "content required"}), 400
+
+    if not UGC_SERVICES_AVAILABLE:
+        return jsonify({"error": "Analysis services not available"}), 500
+
+    try:
+        # Step 1: Classify format
+        format_result = UGC_CLASSIFIER.classify(content)
+
+        # Step 2: Score performance
+        score_result = UGC_SCORER.score(metrics)
+
+        # Step 3: Generate recommendations
+        recommendations = UGC_RECOMMENDER.recommend(
+            format_result.format,
+            {"overall_score": score_result.overall_score}
+        )
+
+        response_data = {
+            "status": "success",
+            "content_id": content_id,
+            "format_classification": {
+                "format": format_result.format,
+                "confidence": round(format_result.confidence, 2),
+                "all_scores": {k: round(v, 2) for k, v in format_result.all_scores.items()}
+            },
+            "performance_score": {
+                "overall": round(score_result.overall_score, 2),
+                "engagement": round(score_result.engagement_score, 2),
+                "retention": round(score_result.retention_score, 2),
+                "conversion": round(score_result.conversion_score, 2)
+            },
+            "recommendations": [
+                {
+                    "format": r.format,
+                    "viability_score": round(r.viability_score, 2),
+                    "rationale": r.rationale
+                }
+                for r in recommendations
+            ]
+        }
+
+        # Step 4: Store all in Supabase
+        if content_id and SUPABASE:
+            SUPABASE.store_format_classification(content_id, {
+                "format": format_result.format,
+                "confidence": format_result.confidence,
+                "all_scores": format_result.all_scores,
+                "reasoning": format_result.reasoning
+            })
+            SUPABASE.store_performance_score(content_id, {
+                "overall_score": score_result.overall_score,
+                "engagement_score": score_result.engagement_score,
+                "retention_score": score_result.retention_score,
+                "conversion_score": score_result.conversion_score,
+                "metrics_breakdown": score_result.metrics_breakdown,
+                "timestamp": score_result.timestamp
+            })
+            SUPABASE.store_repurposing_recommendations(content_id, [
+                {
+                    "format": r.format,
+                    "viability_score": r.viability_score,
+                    "rationale": r.rationale
+                }
+                for r in recommendations
+            ])
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/checkback/<content_id>", methods=["POST"])
+def trigger_checkback(content_id):
+    """Trigger performance re-evaluation - API-005."""
+    # This is a placeholder for async re-evaluation
+    # In a full implementation, this would queue a job
+    return jsonify({
+        "status": "success",
+        "content_id": content_id,
+        "job_id": f"checkback_{content_id}",
+        "message": "Checkback evaluation queued"
+    })
+
+
 @app.route("/api/analyze/content", methods=["POST"])
 def analyze_content():
     """Analyze content for insights."""
     data = request.get_json()
-    
+
     title = data.get("title", "")
     description = data.get("description", "")
     transcript = data.get("transcript", "")
-    
+
     # TODO: Implement actual AI analysis
     return jsonify({
         "status": "success",
