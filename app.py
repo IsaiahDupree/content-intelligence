@@ -9,6 +9,21 @@ from typing import List, Dict, Any
 
 app = Flask(__name__)
 
+# Register middleware
+from services.middleware.security import configure_security_headers
+from services.middleware.logging import setup_request_logging, setup_structured_logging
+from services.middleware.errors import register_error_handlers
+
+# Setup security
+configure_security_headers(app)
+
+# Setup logging
+setup_request_logging(app)
+setup_structured_logging()
+
+# Setup error handlers
+register_error_handlers(app)
+
 # Add services to path
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

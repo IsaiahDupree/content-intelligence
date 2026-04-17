@@ -1,7 +1,8 @@
 """Core UGC Format Detector - identifies format type with confidence scoring."""
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
+from .cache import ClassificationCache
 
 
 @dataclass
@@ -57,9 +58,23 @@ class UGCFormatClassifier:
             "story": self.STORY_KEYWORDS,
             "trend": self.TREND_KEYWORDS
         }
+        self.cache = ClassificationCache(ttl_hours=24)
 
-    def classify(self, content: str, content_metadata: Dict[str, Any] = None) -> FormatDetectionResult:
+    def classify(self, content: str, content_metadata: Dict[str, Any] = None,
+                use_cache: bool = True) -> FormatDetectionResult:
         """Detect UGC format from content."""
+
+        # Check cache first
+        if use_cache:
+            cached = self.cache.get(content)
+            if cached:
+                return FormatDetectionResult(
+                    format=cached["format"],
+                    confidence=cached["confidence"],
+                    all_scores=cached["all_scores"],
+                    reasoning=cached["reasoning"] + " (cached)"
+                )
+
         content_lower = content.lower()
 
         scores = {}
@@ -89,9 +104,20 @@ class UGCFormatClassifier:
         top_matches = ", ".join([f"{fmt} ({score:.0%})" for fmt, score in top_formats])
         reasoning = f"Detected based on keyword analysis. Top matches: {top_matches}"
 
-        return FormatDetectionResult(
+        result = FormatDetectionResult(
             format=best_format,
             confidence=min(confidence, 1.0),
             all_scores=scores,
             reasoning=reasoning
         )
+
+        # Cache the result
+        if use_cache:
+            self.cache.set(content, {
+                "format": result.format,
+                "confidence": result.confidence,
+                "all_scores": result.all_scores,
+                "reasoning": result.reasoning
+            })
+
+        return result
