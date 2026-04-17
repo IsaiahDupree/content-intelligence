@@ -99,7 +99,11 @@ class TestAPIEndpoints(unittest.TestCase):
 
     def test_checkback_endpoint(self):
         """Test checkback endpoint."""
-        response = self.client.post('/api/checkback/test_123')
+        response = self.client.post(
+            '/api/checkback/test_123',
+            data=json.dumps({"interval_days": 7, "job_type": "full"}),
+            content_type='application/json'
+        )
 
         self.assertEqual(response.status_code, 200)
         data = json.loads(response.data)
@@ -107,6 +111,8 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertEqual(data['status'], 'success')
         self.assertEqual(data['content_id'], 'test_123')
         self.assertIn('job_id', data)
+        self.assertIn('interval_days', data)
+        self.assertIn('job_type', data)
 
     def test_analyze_full_endpoint(self):
         """Test full end-to-end analysis endpoint."""

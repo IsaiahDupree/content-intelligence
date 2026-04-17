@@ -105,6 +105,16 @@ except Exception as e:
     UGC_SERVICES_AVAILABLE = False
     SUPABASE = None
 
+# Import checkback scheduler
+try:
+    from services.checkback.scheduler import get_checkback_scheduler
+    CHECKBACK_SCHEDULER = get_checkback_scheduler()
+    CHECKBACK_AVAILABLE = True
+except Exception as e:
+    print(f"Checkback scheduler not available: {e}")
+    CHECKBACK_SCHEDULER = None
+    CHECKBACK_AVAILABLE = False
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -310,14 +320,116 @@ def analyze_and_store_full():
 @app.route("/api/checkback/<content_id>", methods=["POST"])
 def trigger_checkback(content_id):
     """Trigger performance re-evaluation - API-005."""
-    # This is a placeholder for async re-evaluation
-    # In a full implementation, this would queue a job
-    return jsonify({
-        "status": "success",
-        "content_id": content_id,
-        "job_id": f"checkback_{content_id}",
-        "message": "Checkback evaluation queued"
-    })
+    data = request.get_json() or {}
+    interval_days = data.get("interval_days", 7)
+    job_type = data.get("job_type", "full")
+
+    if not CHECKBACK_AVAILABLE:
+        return jsonify({"error": "Checkback service not available"}), 500
+
+    try:
+        job_id = CHECKBACK_SCHEDULER.schedule_checkback(
+            content_id=content_id,
+            interval_days=interval_days,
+            job_type=job_type
+        )
+
+        job_info = CHECKBACK_SCHEDULER.get_job_status(job_id)
+
+        return jsonify({
+            "status": "success",
+            "content_id": content_id,
+            "job_id": job_id,
+            "job_type": job_type,
+            "interval_days": interval_days,
+            "next_run": job_info["next_run"],
+            "message": "Checkback evaluation scheduled"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/checkback/jobs/status", methods=["GET"])
+def get_checkback_jobs():
+    """List all checkback jobs - CHECK-001."""
+    if not CHECKBACK_AVAILABLE:
+        return jsonify({"error": "Checkback service not available"}), 500
+
+    try:
+        status_filter = request.args.get("status")
+        jobs = CHECKBACK_SCHEDULER.list_jobs(status=status_filter)
+        stats = CHECKBACK_SCHEDULER.stats()
+
+        return jsonify({
+            "status": "success",
+            "jobs": jobs,
+            "stats": stats
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/checkback/<job_id>/status", methods=["GET"])
+def get_checkback_job_status(job_id):
+    """Get status of a checkback job - CHECK-002."""
+    if not CHECKBACK_AVAILABLE:
+        return jsonify({"error": "Checkback service not available"}), 500
+
+    try:
+        job_info = CHECKBACK_SCHEDULER.get_job_status(job_id)
+
+        if not job_info:
+            return jsonify({"error": f"Job {job_id} not found"}), 404
+
+        return jsonify({
+            "status": "success",
+            "job_id": job_id,
+            "job": job_info
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/checkback/<job_id>/execute", methods=["POST"])
+def execute_checkback_job(job_id):
+    """Execute a checkback job immediately - CHECK-003."""
+    if not CHECKBACK_AVAILABLE:
+        return jsonify({"error": "Checkback service not available"}), 500
+
+    try:
+        result = CHECKBACK_SCHEDULER.execute_job(job_id)
+
+        if "error" in result:
+            return jsonify(result), 404
+
+        return jsonify({
+            "status": "success",
+            "job_id": job_id,
+            "execution_result": result
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/checkback/<job_id>/cancel", methods=["POST"])
+def cancel_checkback_job(job_id):
+    """Cancel a scheduled checkback job - CHECK-004."""
+    if not CHECKBACK_AVAILABLE:
+        return jsonify({"error": "Checkback service not available"}), 500
+
+    try:
+        cancelled = CHECKBACK_SCHEDULER.cancel_job(job_id)
+
+        if not cancelled:
+            return jsonify({"error": f"Job {job_id} not found"}), 404
+
+        return jsonify({
+            "status": "success",
+            "job_id": job_id,
+            "message": "Checkback job cancelled"
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/analyze/content", methods=["POST"])
