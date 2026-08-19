@@ -7,14 +7,14 @@
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/python3</string>
-    <string>/Users/isaiahdupree/Documents/Software/content-intelligence/scripts/backfill_transcript_bank.py</string>
+    <string>/Users/isaiahdupree/Library/Application Support/ContentQuality/runtime/scripts/backfill_transcript_bank.py</string>
     <string>--limit</string>
     <string>20</string>
     <string>--model</string>
     <string>base</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/isaiahdupree/Documents/Software/content-intelligence</string>
+  <string>/Users/isaiahdupree/Library/Application Support/ContentQuality/runtime</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
