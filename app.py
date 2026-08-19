@@ -3,6 +3,10 @@ Content Intelligence Service - AI/ML for content analysis and generation.
 Port: 6006
 """
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from flask import Flask, jsonify, request
 from datetime import datetime, timezone
 from typing import List, Dict, Any
@@ -23,10 +27,6 @@ setup_structured_logging()
 
 # Setup error handlers
 register_error_handlers(app)
-
-# Add services to path
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # AI Provider configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -85,8 +85,17 @@ except Exception as e:
     VISION_ANALYZER = None
 
 SERVICE_NAME = "content-intelligence"
-SERVICE_VERSION = "1.0.0"
+SERVICE_VERSION = "1.1.0"
 SERVICE_PORT = int(os.getenv("PORT", 6006))
+
+# Market Tape V1 is isolated behind its own typed storage and route module.
+try:
+    from services.market_tape.api import register_market_tape_routes
+    register_market_tape_routes(app)
+    MARKET_TAPE_AVAILABLE = True
+except Exception as e:
+    print(f"Market Tape service not available: {e}")
+    MARKET_TAPE_AVAILABLE = False
 
 
 # Import UGC Format services
@@ -123,7 +132,8 @@ def health():
         "status": "healthy",
         "service": SERVICE_NAME,
         "version": SERVICE_VERSION,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "market_tape_available": MARKET_TAPE_AVAILABLE,
     })
 
 
@@ -1199,4 +1209,9 @@ def safari_dm():
 
 if __name__ == "__main__":
     print(f"🧠 {SERVICE_NAME} starting on port {SERVICE_PORT}")
-    app.run(host="0.0.0.0", port=SERVICE_PORT, debug=True)
+    app.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=SERVICE_PORT,
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+        use_reloader=False,
+    )

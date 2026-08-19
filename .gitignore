@@ -40,6 +40,13 @@ env/
 *.log
 logs/
 
+# Market Tape runtime state and immutable provider payloads
+data/market-tape.sqlite3*
+data/market-tape-objects/
+data/market-tape-heartbeat.json
+data/market-tape.lock
+.env.market-tape
+
 # Testing
 .pytest_cache/
 .coverage

@@ -1,6 +1,30 @@
-# Content Intelligence — UGC Format Classifier
+# Content Intelligence
 
-A comprehensive AI-powered service for analyzing User-Generated Content (UGC), detecting format types, calculating performance scores, and recommending content repurposing strategies.
+Content Intelligence now contains two production surfaces: the original UGC format analysis API and the autonomous cross-platform Social Market Tape.
+
+## Social Market Tape
+
+Market Tape appends real metric observations across YouTube, TikTok, Instagram, X, Facebook, and Threads; archives raw provider payloads; computes velocity, acceleration, relative strength, trends, social candles, and predictions; and records quota, cost, source health, and central-sync receipts.
+
+The lock-safe local runtime is installed under `~/Library/Application Support/ContentIntelligence`, supervised by launchd, and available at `http://127.0.0.1:6006/api/market-tape/status`.
+
+Full architecture, commands, source states, APIs, safety controls, and current production evidence: [docs/MARKET-TAPE-V1.md](docs/MARKET-TAPE-V1.md).
+
+Install or update unattended operation:
+
+```bash
+./scripts/install_market_tape_launchd.sh
+```
+
+Verify the Market Tape software:
+
+```bash
+python3 -m pytest tests/test_market_tape.py -q
+```
+
+## UGC Format Classifier
+
+A service for analyzing user-generated content, detecting format types, calculating performance scores, and recommending content repurposing strategies.
 
 ## Features
 
