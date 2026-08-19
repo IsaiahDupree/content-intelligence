@@ -28,37 +28,69 @@ class ContentQualityIntegrationTests(unittest.TestCase):
                 );
                 CREATE TABLE mt_market_observations (
                     video_id TEXT, views INTEGER, likes INTEGER, comments INTEGER, shares INTEGER,
-                    view_velocity REAL, view_acceleration REAL, relative_strength REAL, observed_at TEXT
+                    view_velocity REAL, view_acceleration REAL, relative_strength REAL,
+                    observation_key TEXT, observed_at TEXT
                 );
-                INSERT INTO mt_videos VALUES (
-                    'youtube:real-source', 'youtube', 'real-source', 'creator-1',
-                    'AI automation without losing the human story',
-                    'When you feel stuck building automation, start with the human moment.',
-                    'Observed research source.', 'https://www.youtube.com/watch?v=real-source', 45, '2026-08-18T00:00:00Z'
-                );
-                INSERT INTO mt_content_genomes VALUES (
-                    'youtube:real-source',
-                    'You know when you are stuck trying to automate everything and the work still feels hard. The mistake is starting with the system. Here is the proof because we tested the opening and watched the result. First show the human problem, then explain the method, and finally ask the viewer to try it.',
-                    'You know when you are stuck', 'human_problem'
-                );
-                INSERT INTO mt_market_observations VALUES (
-                    'youtube:real-source', 12000, 800, 75, 44, 120, 9, 2.4, '2026-08-18T00:00:00Z'
-                );
-                INSERT INTO mt_videos VALUES (
-                    'youtube:irrelevant', 'youtube', 'irrelevant', 'creator-2',
-                    'Relaxing music for focus', '', 'A soundtrack for software work.',
-                    'https://www.youtube.com/watch?v=irrelevant', 45, '2026-08-18T00:00:00Z'
-                );
-                INSERT INTO mt_content_genomes VALUES (
-                    'youtube:irrelevant',
-                    'This relaxing music is a soundtrack for focused work and calm evenings. Listen to the melody and enjoy the sound. This description continues so that it is long enough to resemble a transcript but contains no automation evidence or founder problem at all.',
-                    'This relaxing music', 'direct_claim'
-                );
-                INSERT INTO mt_market_observations VALUES (
-                    'youtube:irrelevant', 900000, 50000, 2000, 1000, 9000, 500, 99, '2026-08-18T00:00:00Z'
+                CREATE TABLE mt_transcript_artifacts (
+                    transcript_id TEXT PRIMARY KEY, video_id TEXT, platform TEXT, external_id TEXT,
+                    source_url TEXT, observation_key TEXT, source_metrics_json TEXT, audio_path TEXT,
+                    audio_sha256 TEXT, transcript_path TEXT, transcript_sha256 TEXT, whisper_model TEXT,
+                    whisper_language TEXT, duration_seconds REAL, word_count INTEGER,
+                    segment_count INTEGER, acquisition_json TEXT, audit_json TEXT, created_at TEXT
                 );
                 """
             )
+            transcript = (
+                "You feel burned out and stuck after trying to automate every part of the work. "
+                "The pressure makes creative work feel harder, and creators worry the next video "
+                "will fail. The evidence shows the human struggle must come before the automation "
+                "explanation. Name the problem, show what changed, and give one concrete next step. "
+                "That is how content can help a tired founder feel understood before teaching them."
+            )
+            artifact_audit = json.dumps({
+                "contract": "performance_bound_whisper_transcript_v3",
+                "decision": "PASS",
+                "checks": {"performance_views_floor": True, "performance_engagement_floor": True},
+            })
+            for index in range(5):
+                video_id = f"youtube:video:real-source-{index}"
+                external_id = f"real-source-{index}"
+                observation_key = f"observation-{index}"
+                connection.execute(
+                    "INSERT INTO mt_videos VALUES (?, 'youtube', ?, ?, ?, ?, ?, ?, 45, ?)",
+                    (
+                        video_id, external_id, f"creator-{index}",
+                        "AI automation content for burned out creators",
+                        "When you feel stuck, name the creator struggle first.",
+                        "Observed creator burnout research source.",
+                        f"https://www.youtube.com/watch?v={external_id}",
+                        "2026-08-18T00:00:00Z",
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO mt_content_genomes VALUES (?, ?, ?, 'human_problem')",
+                    (video_id, transcript, "You feel burned out and stuck"),
+                )
+                connection.execute(
+                    "INSERT INTO mt_market_observations VALUES (?, 30000, 1800, 120, 60, 120, 9, 2.4, ?, ?)",
+                    (video_id, observation_key, "2026-08-18T00:00:00Z"),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO mt_transcript_artifacts VALUES (
+                        ?, ?, 'youtube', ?, ?, ?, ?, ?, ?, ?, ?, 'base', 'en', 45, 72, 8, ?, ?, ?
+                    )
+                    """,
+                    (
+                        f"whisper-{index}", video_id, external_id,
+                        f"https://www.youtube.com/watch?v={external_id}", observation_key,
+                        json.dumps({"views": 30000, "likes": 1800, "comments": 120, "shares": 60}),
+                        f"/tmp/source-{index}.m4a", "a" * 64,
+                        f"/tmp/transcript-{index}.json", "b" * 64,
+                        json.dumps({"tool": "whisper"}), artifact_audit,
+                        "2026-08-18T00:00:00Z",
+                    ),
+                )
             connection.commit()
         app = create_content_quality_app({"TESTING": True, "MARKET_TAPE_DB": tape, "CONTENT_QUALITY_DB": quality})
         self.client = app.test_client()
@@ -67,11 +99,11 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def test_evidence_first_script_passes_both_gates(self):
-        discovery = self.client.post("/api/viral-transcripts/discover", json={"topic": "AI automation", "limit": 1})
+        discovery = self.client.post("/api/viral-transcripts/discover", json={"topic": "AI automation", "limit": 5})
         self.assertEqual(discovery.status_code, 200)
-        discovered_receipt = discovery.get_json()["receipts"][0]
-        self.assertEqual(discovered_receipt["source_id"], "real-source")
-        receipt_id = discovered_receipt["receipt_id"]
+        discovered_receipts = discovery.get_json()["receipts"]
+        self.assertEqual(len(discovered_receipts), 5)
+        receipt_ids = [item["receipt_id"] for item in discovered_receipts]
         generated = self.client.post(
             "/api/scripts/generate",
             json={
@@ -80,10 +112,10 @@ class ContentQualityIntegrationTests(unittest.TestCase):
                 "objective": "qualified_attention",
                 "claim": "The best automation content begins with a recognizable human problem",
                 "human_moment": {
-                    "situation": "you open the dashboard and nothing feels simpler",
+                    "situation": "you feel burned out after another video fails",
                     "stakes": "another tool has cost time without reducing the work",
                 },
-                "receipt_ids": [receipt_id],
+                "receipt_ids": receipt_ids,
             },
         )
         self.assertEqual(generated.status_code, 200)

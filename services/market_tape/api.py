@@ -50,6 +50,17 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
         limit = _limit(request.args.get("limit"), 100)
         return jsonify({"trends": store.list_trends(limit, request.args.get("state"))})
 
+    @app.get("/api/market-tape/keywords")
+    def market_tape_keywords():
+        limit = _limit(request.args.get("limit"), 100)
+        window = _limit(request.args.get("window_hours"), 168, maximum=24 * 90)
+        minimum = _limit(request.args.get("min_videos"), 1, maximum=1000)
+        return jsonify({
+            "keywords": store.keyword_signals(limit, window, minimum),
+            "window_hours": window,
+            "min_videos": minimum,
+        })
+
     @app.get("/api/market-tape/runs")
     def market_tape_runs():
         return jsonify({"runs": store.list_runs(_limit(request.args.get("limit"), 50))})

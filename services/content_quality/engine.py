@@ -37,6 +37,12 @@ CHANGE_WORDS = {
     "but", "except", "here's", "instead", "look", "now", "proof", "so", "then",
     "watch", "yet",
 }
+HUMAN_EXPERIENCE_WORDS = {
+    "alone", "anxious", "anxiety", "burned", "burnout", "burnt", "care",
+    "exhausted", "fear", "feel", "feeling", "frustrated", "hard", "hate",
+    "hopeless", "overwhelmed", "pressure", "quit", "struggle", "struggling",
+    "stuck", "tired", "trying", "worry", "worse",
+}
 
 
 def utc_now() -> str:
@@ -348,12 +354,13 @@ class MarketTapeReader:
                    COALESCE(o.view_velocity, 0) AS velocity,
                    COALESCE(o.view_acceleration, 0) AS acceleration,
                    COALESCE(o.relative_strength, 0) AS relative_strength,
-                   o.observed_at
+                   o.observation_key, o.observed_at
             FROM mt_videos v
             LEFT JOIN mt_content_genomes g ON g.video_id=v.video_id
             LEFT JOIN latest o ON o.video_id=v.video_id
             {where}
-            ORDER BY COALESCE(o.relative_strength, 0) DESC,
+            ORDER BY CASE WHEN length(trim(COALESCE(g.transcript, ''))) > 0 THEN 0 ELSE 1 END,
+                     COALESCE(o.relative_strength, 0) DESC,
                      COALESCE(o.view_velocity, 0) DESC,
                      COALESCE(o.views, 0) DESC
             LIMIT ?
@@ -377,6 +384,31 @@ class MarketTapeReader:
                     qualified.append(row)
             result = qualified
         return result[:limit]
+
+    def transcript_artifact(self, video_id: str) -> dict[str, Any] | None:
+        """Return the latest local Whisper artifact for a video, if one exists."""
+
+        try:
+            with closing(self.connect()) as connection:
+                row = connection.execute(
+                    """
+                    SELECT * FROM mt_transcript_artifacts
+                    WHERE video_id=? ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (video_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        result = dict(row)
+        for source, target in (
+            ("source_metrics_json", "source_metrics"),
+            ("acquisition_json", "acquisition"),
+            ("audit_json", "audit"),
+        ):
+            result[target] = json.loads(result.pop(source))
+        return result
 
 
 @dataclass
@@ -454,33 +486,65 @@ class ViralTranscriptService:
     def discover(self, topic: str, limit: int = 5) -> dict[str, Any]:
         if not topic.strip():
             raise ValueError("topic is required")
-        rows = self.tape.candidates(topic, limit=max(limit * 5, 20))
+        # Artifact coverage is intentionally sparse during backfill. Search a wide
+        # metadata window, then accept only exact local Whisper/audit bindings.
+        rows = self.tape.candidates(topic, limit=max(limit * 50, 200))
         receipts: list[dict[str, Any]] = []
         failures: list[dict[str, str]] = []
         for row in rows:
             if len(receipts) >= limit:
                 break
-            text = str(row.get("transcript") or "").strip()
-            if text:
-                document = TranscriptDocument(text=text, segments=[], source="market_tape")
-            elif row.get("platform") == "youtube" and row.get("external_id"):
-                try:
-                    document = self._fetch_youtube(str(row["external_id"]))
-                except Exception as exc:  # upstream transcript errors vary by release
-                    failures.append({"source_id": str(row["external_id"]), "error": type(exc).__name__})
-                    continue
-            else:
+            artifact = self.tape.transcript_artifact(str(row["video_id"]))
+            if not artifact:
+                failures.append({
+                    "source_id": str(row.get("external_id") or row["video_id"]),
+                    "error": "local_whisper_artifact_missing",
+                })
                 continue
+            artifact_audit = dict(artifact.get("audit") or {})
+            if (
+                artifact_audit.get("decision") != "PASS"
+                or artifact_audit.get("contract") != "performance_bound_whisper_transcript_v3"
+                or artifact.get("observation_key") != row.get("observation_key")
+            ):
+                failures.append({
+                    "source_id": str(row.get("external_id") or row["video_id"]),
+                    "error": "whisper_artifact_audit_or_observation_mismatch",
+                })
+                continue
+            text = str(row.get("transcript") or "").strip()
+            if not text:
+                failures.append({
+                    "source_id": str(row.get("external_id") or row["video_id"]),
+                    "error": "associated_transcript_missing",
+                })
+                continue
+            document = TranscriptDocument(text=text, segments=[], source="local_whisper")
             if len(words(document.text)) < 40:
                 failures.append({"source_id": str(row.get("external_id") or row["video_id"]), "error": "transcript_too_short"})
                 continue
+            pattern = self._pattern(document, row)
+            transcript_keywords = sorted({
+                token.lower() for token in words(document.text)
+                if len(token) >= 4 and token.lower() not in STOP_WORDS
+            })[:300]
             payload = {
                 "topic": topic,
                 "platform": row.get("platform"),
                 "title": row.get("title"),
                 "creator_id": row.get("creator_id"),
                 "transcript_source": document.source,
-                "pattern": self._pattern(document, row),
+                "transcript_id": artifact.get("transcript_id"),
+                "observation_key": artifact.get("observation_key"),
+                "audio_sha256": artifact.get("audio_sha256"),
+                "transcript_sha256": artifact.get("transcript_sha256"),
+                "performance_qualification": {
+                    "audit_contract": artifact_audit.get("contract"),
+                    "audit_decision": artifact_audit.get("decision"),
+                    "checks": artifact_audit.get("checks"),
+                },
+                "transcript_keywords": transcript_keywords,
+                "pattern": pattern,
             }
             receipts.append(
                 self.store.put_receipt(
@@ -539,12 +603,27 @@ class AudienceIntelligenceService:
         if not topic.strip() or not audience.strip():
             raise ValueError("topic and audience are required")
         candidates = self.tape.candidates(topic, limit=60)
-        cues = ("when you", "you know", "struggle", "stuck", "tired", "trying", "can't", "worry", "feel")
+        cues = (
+            "anxious", "anxiety", "burned", "burnout", "burnt", "can't", "exhausted",
+            "feel", "feeling", "hopeless", "overwhelmed", "pressure", "struggle",
+            "struggling", "stuck", "tired", "worry",
+        )
         moments: list[dict[str, Any]] = []
         for row in candidates:
-            source = " ".join(
-                str(row.get(field) or "") for field in ("title", "caption", "description", "transcript")
-            )
+            artifact = self.tape.transcript_artifact(str(row["video_id"]))
+            if not artifact:
+                continue
+            audit = artifact.get("audit") or {}
+            if (
+                audit.get("decision") != "PASS"
+                or audit.get("contract") != "performance_bound_whisper_transcript_v3"
+                or artifact.get("observation_key") != row.get("observation_key")
+                or not str(artifact.get("whisper_language") or "").lower().startswith("en")
+            ):
+                continue
+            source = str(row.get("transcript") or "")
+            if not source.strip():
+                continue
             sentences = SENTENCE_RE.split(source)
             for sentence in sentences:
                 clean = " ".join(words(sentence))
@@ -556,8 +635,9 @@ class AudienceIntelligenceService:
                             "situation": clean,
                             "audience": audience,
                             "source_video_id": row.get("video_id"),
+                            "source_transcript_id": artifact.get("transcript_id"),
                             "source_url": row.get("url"),
-                            "basis": "observed_source_language",
+                            "basis": "performance_qualified_local_whisper_transcript",
                         }
                     )
                     break
@@ -626,27 +706,86 @@ class ScriptService:
             }
 
         pattern_receipts = [item for item in receipts if item["receipt_type"] == "viral_transcript_pattern"]
-        if not pattern_receipts:
+        verified_patterns = [
+            item for item in pattern_receipts
+            if item["payload"].get("transcript_source") == "local_whisper"
+            and item["payload"].get("performance_qualification", {}).get("audit_decision") == "PASS"
+            and item["payload"].get("performance_qualification", {}).get("audit_contract")
+            == "performance_bound_whisper_transcript_v3"
+            and item["payload"].get("observation_key")
+            and len(str(item["payload"].get("audio_sha256") or "")) == 64
+            and len(str(item["payload"].get("transcript_sha256") or "")) == 64
+        ]
+        if len(verified_patterns) < 5:
             return {
                 "status": "rejected",
-                "code": "REJECT_NO_TRANSCRIPT_PATTERN",
-                "reason": "At least one viral transcript pattern receipt is required.",
+                "code": "REJECT_INSUFFICIENT_TRANSCRIPT_COHORT",
+                "reason": "At least five performance-qualified local Whisper transcript receipts are required.",
+                "verified_transcript_count": len(verified_patterns),
             }
-        metrics = [item["payload"].get("pattern", {}).get("source_metrics", {}) for item in pattern_receipts]
+        creators = {
+            str(item["payload"].get("creator_id") or "")
+            for item in verified_patterns
+            if item["payload"].get("creator_id")
+        }
+        metrics = [item["payload"].get("pattern", {}).get("source_metrics", {}) for item in verified_patterns]
         observed_views = sum(int(item.get("views") or 0) for item in metrics)
-        source_count = len(pattern_receipts)
-        proof_line = proof[0] if proof else (
-            f"I reviewed {source_count} source transcript pattern{'s' if source_count != 1 else ''} "
-            f"with {observed_views:,} observed views in the current Market Tape snapshot."
+        source_count = len(verified_patterns)
+        if len(creators) < 3 or observed_views < 100_000:
+            return {
+                "status": "rejected",
+                "code": "REJECT_INSUFFICIENT_TRANSCRIPT_COHORT",
+                "reason": "The cohort requires at least three creators and 100,000 observed views.",
+                "verified_transcript_count": source_count,
+                "creator_count": len(creators),
+                "observed_views_snapshot": observed_views,
+            }
+        human_term_groups = {
+            "feel": "feeling stuck",
+            "feeling": "feeling stuck",
+            "hard": "the work getting harder",
+            "tired": "exhaustion",
+            "trying": "trying harder",
+            "worse": "things getting worse",
+        }
+        human_term_sources: dict[str, set[str]] = {}
+        for item in verified_patterns:
+            source_terms = {
+                str(token).lower()
+                for token in item["payload"].get("transcript_keywords") or []
+            }
+            for term in HUMAN_EXPERIENCE_WORDS & source_terms:
+                display = human_term_groups.get(term, term)
+                human_term_sources.setdefault(display, set()).add(item["receipt_id"])
+        recurring_human_terms = sorted(
+            (term for term, sources in human_term_sources.items() if len(sources) >= 2),
+            key=lambda term: (-len(human_term_sources[term]), term),
         )
+        if not recurring_human_terms:
+            return {
+                "status": "rejected",
+                "code": "REJECT_NO_RECURRING_HUMAN_LANGUAGE",
+                "reason": "At least one human-experience term must recur across two transcripts.",
+            }
+        named_terms = recurring_human_terms[:4]
+        if len(named_terms) == 1:
+            term_phrase = named_terms[0]
+        else:
+            term_phrase = ", ".join(named_terms[:-1]) + f", and {named_terms[-1]}"
+        proof_line = proof[0] if proof else (
+            f"Across these stories, the same signs keep showing up: {term_phrase}."
+        )
+        hook_text = situation.strip()
+        if hook_text[-1] not in ".?!":
+            hook_text += "."
         timeline = [
-            {"start": 0.0, "end": 3.0, "beat": "human_hook", "text": f"You know that moment when {situation.rstrip('.')}?"},
+            {"start": 0.0, "end": 3.0, "beat": "human_hook", "text": hook_text},
             {"start": 3.0, "end": 8.0, "beat": "stakes", "text": f"It matters because {stakes.rstrip('.')}."},
             {"start": 8.0, "end": 15.0, "beat": "claim", "text": claim.rstrip(".") + "."},
             {"start": 15.0, "end": 23.0, "beat": "proof", "text": proof_line.rstrip(".") + "."},
-            {"start": 23.0, "end": 31.0, "beat": "method", "text": "Start with the human situation, show the receipt, then reveal the mechanism."},
-            {"start": 31.0, "end": 38.0, "beat": "payoff", "text": f"That gives {audience} a reason to keep watching before asking them to act."},
-            {"start": 38.0, "end": 43.0, "beat": "cta", "text": "Save this and test the structure against your next real result."},
+            {"start": 23.0, "end": 31.0, "beat": "method", "text": "Choose the smallest pressure you can remove today, then make the next step easier to begin."},
+            {"start": 31.0, "end": 38.0, "beat": "payoff", "text": "The point is not to force momentum; it is to make the work feel possible again."},
+            {"start": 38.0, "end": 43.0, "beat": "cta", "text": "Which part feels heaviest right now?"},
         ]
         full_text = " ".join(beat["text"] for beat in timeline)
         script_id = stable_id("script", topic, objective, receipt_ids, full_text)
@@ -659,7 +798,9 @@ class ScriptService:
             "source_receipt_ids": receipt_ids,
             "evidence_summary": {
                 "viral_transcript_patterns": source_count,
+                "creator_count": len(creators),
                 "observed_views_snapshot": observed_views,
+                "recurring_human_terms": recurring_human_terms,
                 "owned_proof_count": len(proof),
             },
             "timeline": timeline,
@@ -681,26 +822,121 @@ class RelatabilityService:
         if not text:
             raise ValueError("text is required")
         token_list = [item.lower() for item in words(text)]
-        opening = " ".join(token_list[:35])
+        significant_tokens = {
+            token for token in token_list if len(token) >= 3 and token not in STOP_WORDS
+        }
+        opening_tokens = token_list[:45]
+        opening = " ".join(opening_tokens)
         first_sentence = SENTENCE_RE.split(text)[0].lower()
+        receipt_ids = [str(item) for item in payload.get("source_receipt_ids") or []]
+        receipts = self.store.receipts(receipt_ids) if receipt_ids else []
+        patterns = [
+            item for item in receipts
+            if item["receipt_type"] == "viral_transcript_pattern"
+        ]
+        verified_patterns = [
+            item for item in patterns
+            if item["payload"].get("transcript_source") == "local_whisper"
+            and item["payload"].get("performance_qualification", {}).get("audit_decision") == "PASS"
+            and item["payload"].get("performance_qualification", {}).get("audit_contract")
+            == "performance_bound_whisper_transcript_v3"
+            and item["payload"].get("observation_key")
+        ]
+        creators = {
+            str(item["payload"].get("creator_id") or "")
+            for item in verified_patterns if item["payload"].get("creator_id")
+        }
+        observed_views = sum(
+            int(item["payload"].get("pattern", {}).get("source_metrics", {}).get("views") or 0)
+            for item in verified_patterns
+        )
+        keyword_sets = [
+            {str(token).lower() for token in item["payload"].get("transcript_keywords") or []}
+            for item in verified_patterns
+        ]
+        union_keywords = set().union(*keyword_sets) if keyword_sets else set()
+        vocabulary_overlap = (
+            len(significant_tokens & union_keywords) / len(significant_tokens)
+            if significant_tokens else 0.0
+        )
+        supported_sources = sum(
+            len(significant_tokens & source_keywords) >= 3 for source_keywords in keyword_sets
+        )
+        opening_human_terms = sorted(
+            set(opening_tokens) & HUMAN_EXPERIENCE_WORDS & union_keywords
+        )
+        pipeline_meta_phrases = (
+            "attention gate", "content factory", "human-relatability", "source receipt",
+            "transcript pattern", "passes human", "passes attention", "reveal the mechanism",
+            "spoken pattern", "test the structure", "recognize themselves",
+        )
+        pipeline_meta_matches = sorted(
+            phrase for phrase in pipeline_meta_phrases if phrase in text.lower()
+        )
+        source_claim = re.search(
+            r"reviewed\s+([\d,]+)\s+source transcript patterns?\s+with\s+([\d,]+)\s+observed views",
+            text,
+            re.IGNORECASE,
+        )
+        source_claim_matches = not source_claim or (
+            int(source_claim.group(1).replace(",", "")) == len(verified_patterns)
+            and int(source_claim.group(2).replace(",", "")) == observed_views
+        )
         checks = {
-            "human_situation_in_opening": any(token in opening for token in ("you know", "when you", "moment when", "i was", "i tried")),
+            "performance_transcript_cohort": (
+                len(verified_patterns) >= 5 and len(creators) >= 3 and observed_views >= 100_000
+            ),
+            "all_receipts_artifact_verified": len(verified_patterns) == len(patterns) and bool(patterns),
+            "source_claim_matches_evidence": source_claim_matches,
+            "human_experience_in_opening": bool(opening_human_terms),
+            "audience_facing_not_pipeline_meta": not pipeline_meta_matches,
+            "script_vocabulary_supported": vocabulary_overlap >= 0.18,
+            "supported_by_three_transcripts": supported_sources >= 3,
             "concrete_stakes_present": any(token in text.lower() for token in ("because", "cost", "lose", "matters", "stuck", "waste", "without")),
             "audience_language_present": any(token in token_list for token in ("you", "your", "we", "i")),
             "not_product_first": not any(token in first_sentence for token in ("app", "platform", "product", "service", "software", "tool")),
             "not_jargon_dense_opening": sum(token in JARGON for token in words(opening)) <= 2,
-            "evidence_linked": bool(payload.get("source_receipt_ids")),
             "timeline_has_human_hook": bool(timeline and timeline[0].get("beat") == "human_hook"),
         }
-        score = 100.0 * sum(checks.values()) / len(checks)
         failures = [name for name, passed in checks.items() if not passed]
-        decision = "PASS" if score >= 80 and checks["human_situation_in_opening"] and checks["not_product_first"] else "REJECT_NOT_RELATABLE"
+        hard_requirements = (
+            "performance_transcript_cohort",
+            "all_receipts_artifact_verified",
+            "source_claim_matches_evidence",
+            "human_experience_in_opening",
+            "audience_facing_not_pipeline_meta",
+            "supported_by_three_transcripts",
+        )
+        score = min(85.0, 100.0 * sum(checks.values()) / len(checks))
+        hard_requirements_pass = all(checks[name] for name in hard_requirements)
+        if not hard_requirements_pass:
+            score = min(score, 69.0)
+        decision = (
+            "PASS" if score >= 70 and hard_requirements_pass
+            else "REJECT_NOT_RELATABLE"
+        )
         return self.store.put_audit(
             "relatability_script",
             subject_id,
             decision,
             score,
-            {"checks": checks, "failures": failures, "threshold": 80},
+            {
+                "contract": "performance_transcript_script_gate_v1",
+                "measurement_kind": "prediction_from_source_transcripts",
+                "actual_audience_relatability_measured": False,
+                "score_cap_without_post_publication_outcomes": 85,
+                "checks": checks,
+                "failures": failures,
+                "hard_requirements": list(hard_requirements),
+                "threshold": 70,
+                "verified_transcript_count": len(verified_patterns),
+                "creator_count": len(creators),
+                "observed_views_snapshot": observed_views,
+                "script_vocabulary_overlap": round(vocabulary_overlap, 6),
+                "supported_source_count": supported_sources,
+                "opening_human_terms": opening_human_terms,
+                "pipeline_meta_phrases_in_script": pipeline_meta_matches,
+            },
         )
 
 

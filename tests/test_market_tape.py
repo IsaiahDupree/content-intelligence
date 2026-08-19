@@ -87,6 +87,9 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
             })
             return
         if parsed.path in {"/videos", "/videos:batchGetStats"}:
+            if query.get("chart") == ["mostPopular"] and query.get("videoCategoryId") == ["404"]:
+                self._json({"error": "category is unavailable in this region"}, status=404)
+                return
             ids = query.get("id", ["video-chart"])[0].split(",")
             self._json({"items": [self._video(video_id) for video_id in ids if video_id]})
             return
@@ -194,7 +197,9 @@ def market_config(tmp_path):
         lock_path=tmp_path / "market.lock",
         platforms=["youtube"],
         topics=["ai automation"],
+        adaptive_topics_enabled=False,
         regions=["US"],
+        youtube_chart_categories=["all"],
         daily_unique_target=5000,
         platform_daily_targets={"youtube": 10},
         provider_daily_request_limits={"youtube": 20},
@@ -275,6 +280,107 @@ def test_youtube_http_adapter_and_collector_receipts(provider_server, market_con
     assert result["central_sync"]["state"] == "disabled"
     assert result["status"]["central_sync"]["pending"] > 0
     assert result["status"]["daemon"]["state"] in {"starting", "healthy"}
+
+
+def test_youtube_broad_charts_span_categories_and_regions_without_search(
+    provider_server, market_config, monkeypatch
+):
+    monkeypatch.setenv("YOUTUBE_API_KEY", "integration-test-key")
+    config = replace(
+        market_config,
+        regions=["US", "GB"],
+        youtube_chart_categories=["all", "10", "20", "404"],
+        youtube_search_daily_limit=0,
+    )
+
+    source = YouTubeSource(config, "chart-run", 20, base_url=provider_server)
+    source.known_external_ids = lambda _: set()
+    try:
+        batch = source.discover(10)
+    finally:
+        source.close()
+
+    chart_gets = [
+        request for request in ProviderTestHandler.received_gets
+        if request["path"] == "/videos" and request["query"].get("chart") == ["mostPopular"]
+    ]
+    assert batch.receipt.metadata["chart_requests"] == 6
+    assert batch.receipt.metadata["search_requests"] == 0
+    assert len(chart_gets) == 8
+    assert batch.receipt.state == SourceState.READY
+    assert len(batch.receipt.metadata["chart_category_errors"]) == 2
+    assert {request["query"].get("regionCode", [""])[0] for request in chart_gets} == {"US", "GB"}
+    assert {
+        request["query"].get("videoCategoryId", ["all"])[0] for request in chart_gets
+    } == {"all", "10", "20", "404"}
+
+
+def test_keyword_frontier_finds_fresh_market_terms_and_drives_discovery(
+    provider_server, market_config, monkeypatch
+):
+    monkeypatch.setenv("YOUTUBE_API_KEY", "integration-test-key")
+    config = replace(
+        market_config,
+        adaptive_topics_enabled=True,
+        adaptive_topic_limit=6,
+        adaptive_topic_min_videos=2,
+        adaptive_topic_exploration_fraction=0.2,
+        youtube_search_daily_limit=1,
+    )
+    store = MarketTapeStore(config)
+    now = datetime.now(timezone.utc)
+    store.start_run("keyword-seed", "archive_bootstrap")
+    for index, views in enumerate((2_000_000, 1_000_000, 500_000), start=1):
+        store.ingest(
+            _content_for_keyword(
+                f"avengers-{index}",
+                f"Avengers Doomsday trailer breakdown {index}",
+                now - timedelta(hours=index),
+                views,
+            ),
+            "keyword-seed",
+        )
+    store.finish_run("keyword-seed")
+
+    signals = store.keyword_signals(limit=50, window_hours=168, min_videos=2)
+    avengers = next(signal for signal in signals if signal["keyword"] == "avengers doomsday")
+    assert avengers["videos_total"] == 3
+    assert avengers["creators_total"] == 3
+    assert avengers["views_total"] == 3_500_000
+    assert avengers["query_ready"] is True
+
+    observed_topics = []
+
+    def source_builder(runtime_config, run_id, budget_for):
+        observed_topics.extend(runtime_config.topics)
+        return [YouTubeSource(
+            runtime_config,
+            run_id,
+            budget_for(YouTubeSource.source_id, runtime_config.request_limit_for("youtube")),
+            base_url=provider_server,
+        )]
+
+    result = MarketTapeCollector(config, store, source_builder=source_builder).run_cycle("discovery")
+    assert result["discovery_topics"]["mode"] == "adaptive"
+    assert any({"avengers", "doomsday"}.issubset(topic.split()) for topic in observed_topics)
+    assert result["discovery_topics"]["adaptive_count"] >= 1
+    assert result["receipts"][0]["metadata"]["queries_considered"] == observed_topics
+
+
+def test_adaptive_frontier_suppresses_spelling_and_evidence_duplicates():
+    candidates = [
+        _keyword_signal("roblox", 90, 0.8, ["video-1", "video-2", "video-3"]),
+        _keyword_signal("rblx", 100, 0.2, ["video-1", "video-2"]),
+        _keyword_signal("trailers", 88, 0.7, ["video-4", "video-5"]),
+        _keyword_signal("trailer", 87, 0.9, ["video-4", "video-5", "video-6"]),
+        _keyword_signal("Kanye West", 86, 0.5, ["video-7", "video-8"]),
+        _keyword_signal("Kanye", 85, 0.5, ["video-7", "video-8"]),
+    ]
+
+    ranked = sorted(candidates, key=MarketTapeCollector._discovery_priority, reverse=True)
+    selected = MarketTapeCollector._diverse_keyword_signals(ranked, 10)
+
+    assert [signal["keyword"] for signal in selected] == ["trailer", "roblox", "Kanye West"]
 
 
 def test_transactional_outbox_flushes_to_supabase_rest(provider_server, market_config, monkeypatch):
@@ -589,11 +695,13 @@ def test_youtube_preserves_partial_batch_when_search_quota_stops(provider_server
     ).run_cycle("discovery")
 
     receipt = result["receipts"][0]
-    assert receipt["state"] == "blocked_quota"
-    assert receipt["error_code"] == "provider_rate_limited"
+    assert receipt["state"] == "ready"
+    assert receipt["error_code"] == ""
     assert receipt["accepted_count"] == 2
     assert receipt["metadata"]["search_requests"] == 2
     assert receipt["metadata"]["terminated_by"] == "provider_rate_limited"
+    assert receipt["metadata"]["search_lane_state"] == "blocked_quota"
+    assert receipt["metadata"]["search_lane_error_code"] == "provider_rate_limited"
     assert result["status"]["totals"]["videos"] == 2
 
 
@@ -675,6 +783,13 @@ def test_local_research_archive_source_normalizes_and_schedules(provider_server,
                 "retweets": 12,
                 "hasMedia": True,
                 "collectedAt": "2026-08-18T12:00:00Z",
+            }, {
+                "id": "1900000000000000002",
+                "url": "https://x.com/sports/status/1900000000000000002",
+                "author": "sports",
+                "text": "Unrelated basketball result carried over from an older browser page",
+                "views": 9000,
+                "collectedAt": "2026-08-18T12:00:00Z",
             }],
         }],
     }
@@ -707,6 +822,14 @@ def test_local_research_archive_source_normalizes_and_schedules(provider_server,
     assert batch.items[0].metrics.views == 1200
     assert batch.items[0].metrics.shares == 12
     assert batch.items[0].media_type == "video"
+    assert batch.receipt.metadata["archive_qc"] == {
+        "evaluated": 2,
+        "accepted_relevant": 1,
+        "rejected_irrelevant": 1,
+        "unscoped": 0,
+        "precision": 0.5,
+        "policy": "niche-token-overlap-v1",
+    }
     assert batch.receipt.metadata["scheduler"]["state"] == "triggered"
     assert any(post["path"] == "/api/research/twitter/full" for post in ProviderTestHandler.received_posts)
 
@@ -796,6 +919,7 @@ def test_market_tape_api_is_readable_and_write_control_is_local(market_config):
     assert client.get("/api/market-tape/status").status_code == 200
     assert client.get("/api/market-tape/videos").status_code == 200
     assert client.get("/api/market-tape/trends").status_code == 200
+    assert client.get("/api/market-tape/keywords").status_code == 200
     assert client.get("/api/market-tape/predictions").status_code == 200
     assert client.get("/api/market-tape/candles?window_minutes=15").status_code == 200
     denied = client.post(
@@ -859,3 +983,33 @@ def _content_for_id(external_id, observed_at):
         title="Known content used to verify discovery pagination",
         raw_payload={"id": external_id, "views": 100},
     )
+
+
+def _content_for_keyword(external_id, title, observed_at, views):
+    return MarketContent(
+        platform="youtube",
+        external_id=external_id,
+        creator_external_id=f"creator-{external_id}",
+        published_at=observed_at - timedelta(hours=2),
+        observed_at=observed_at,
+        source_id="integration-provider",
+        metrics=MetricCounters(
+            views=views,
+            likes=max(1, views // 20),
+            comments=max(1, views // 1000),
+        ),
+        title=title,
+        duration_seconds=45,
+        raw_payload={"id": external_id, "views": views, "title": title},
+    )
+
+
+def _keyword_signal(keyword, score, confidence, video_ids):
+    return {
+        "keyword": keyword,
+        "score": score,
+        "confidence": confidence,
+        "videos_total": len(video_ids),
+        "creators_total": len(video_ids),
+        "examples": [{"video_id": video_id} for video_id in video_ids],
+    }

@@ -22,6 +22,11 @@ ID_PATTERNS = {
     "facebook": re.compile(r"/(?:videos|reel|posts)/([A-Za-z0-9._-]+)", re.IGNORECASE),
 }
 
+RELEVANCE_STOP_WORDS = {
+    "a", "an", "and", "at", "best", "for", "from", "funny", "highlights", "in",
+    "of", "on", "or", "the", "tips", "to", "with",
+}
+
 
 class LocalResearchSource(MarketSource):
     """Consume structured browser-research receipts and schedule their refresh."""
@@ -43,6 +48,7 @@ class LocalResearchSource(MarketSource):
         self.source_id = f"safari-local-research-{platform}"
         self.base_url = (base_url or os.getenv("MARKET_RESEARCH_URL", "http://127.0.0.1:3106")).rstrip("/")
         self.archive_root = archive_root or self.config.local_research_dir
+        self._archive_qc: Dict[str, int] = {}
 
     @property
     def platform_archive_dir(self) -> Path:
@@ -58,6 +64,7 @@ class LocalResearchSource(MarketSource):
         started = utc_now()
         try:
             self.preflight()
+            self._reset_archive_qc()
             items = self._load_archive(max_items)
             scheduler = self._schedule_if_due(max_items)
             batch = self.success_batch(
@@ -66,6 +73,7 @@ class LocalResearchSource(MarketSource):
                 operation="discover",
                 metadata={
                     "archive_dir": str(self.platform_archive_dir),
+                    "archive_qc": self._archive_qc_receipt(),
                     "scheduler": scheduler,
                     "provider_cost_usd": 0.0,
                 },
@@ -82,13 +90,18 @@ class LocalResearchSource(MarketSource):
         started = utc_now()
         try:
             self.preflight()
+            self._reset_archive_qc()
             wanted = {str(row["external_id"]) for row in tracked}
             items = self._load_archive(max(len(wanted) * 4, len(wanted)), wanted=wanted)
             return self.success_batch(
                 started,
                 items,
                 operation="refresh",
-                metadata={"archive_dir": str(self.platform_archive_dir), "provider_cost_usd": 0.0},
+                metadata={
+                    "archive_dir": str(self.platform_archive_dir),
+                    "archive_qc": self._archive_qc_receipt(),
+                    "provider_cost_usd": 0.0,
+                },
             )
         except Exception as error:
             return self.blocked_batch(started, error)
@@ -141,6 +154,15 @@ class LocalResearchSource(MarketSource):
         text = str(
             raw.get("description") or raw.get("caption") or raw.get("text") or raw.get("title") or ""
         )
+        niche = str(raw.get("niche") or context.get("niche") or "").strip()
+        if niche:
+            self._archive_qc["evaluated"] += 1
+            if not _topic_relevant(text, author, niche):
+                self._archive_qc["rejected_irrelevant"] += 1
+                return None
+            self._archive_qc["accepted_relevant"] += 1
+        else:
+            self._archive_qc["unscoped"] += 1
         observed = parse_datetime(
             raw.get("collectedAt") or raw.get("collected_at") or context.get("collectionFinished")
         ) or fallback_observed
@@ -177,11 +199,28 @@ class LocalResearchSource(MarketSource):
             audio_title=str(raw.get("sound") or raw.get("sound_name") or ""),
             raw_payload={**raw, "_market_tape_source_file": path.name},
             discovery_context={
-                "niche": raw.get("niche") or context.get("niche"),
+                "niche": niche,
                 "query": context.get("query"),
                 "source_file": path.name,
             },
         )
+
+    def _reset_archive_qc(self) -> None:
+        self._archive_qc = {
+            "evaluated": 0,
+            "accepted_relevant": 0,
+            "rejected_irrelevant": 0,
+            "unscoped": 0,
+        }
+
+    def _archive_qc_receipt(self) -> Dict[str, Any]:
+        evaluated = self._archive_qc.get("evaluated", 0)
+        accepted = self._archive_qc.get("accepted_relevant", 0)
+        return {
+            **self._archive_qc,
+            "precision": round(accepted / evaluated, 6) if evaluated else None,
+            "policy": "niche-token-overlap-v1",
+        }
 
     def _schedule_if_due(self, max_items: int) -> Dict[str, Any]:
         if not self.config.local_research_trigger_enabled:
@@ -209,6 +248,7 @@ class LocalResearchSource(MarketSource):
                 "config": {
                     "postsPerNiche": posts_per_niche,
                     "creatorsPerNiche": min(100, posts_per_niche),
+                    "queryMode": "trend",
                 },
             }
             if cross_platform:
@@ -268,3 +308,31 @@ def _count(value: Any) -> int:
         return max(0, int(float(text) * multiplier))
     except (TypeError, ValueError):
         return 0
+
+
+def _topic_relevant(text: str, author: str, niche: str) -> bool:
+    def tokens(value: str) -> List[str]:
+        output = []
+        for token in re.findall(r"[a-z0-9]+", value.casefold()):
+            normalized = token[:-1] if len(token) > 4 and token.endswith("s") else token
+            if len(normalized) >= 3:
+                output.append(normalized)
+        return output
+
+    niche_tokens = {
+        token for token in tokens(niche)
+        if token not in RELEVANCE_STOP_WORDS
+    }
+    if not niche_tokens:
+        return False
+    document_tokens = set(tokens(f"{text} {author}"))
+    required = 1 if len(niche_tokens) == 1 else max(2, math.ceil(len(niche_tokens) * 0.5))
+    matched = {
+        niche_token for niche_token in niche_tokens
+        if any(
+            document_token == niche_token
+            or (len(niche_token) >= 4 and niche_token in document_token)
+            for document_token in document_tokens
+        )
+    }
+    return len(matched) >= required

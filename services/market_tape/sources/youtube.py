@@ -39,6 +39,86 @@ class YouTubeSource(MarketSource):
     def missing_credentials(self) -> List[str]:
         return [] if self.api_key else ["YOUTUBE_API_KEY"]
 
+    def discover_performance(
+        self,
+        query: str,
+        *,
+        max_items: int = 25,
+        relevance_language: str = "en",
+        region: str = "US",
+    ) -> ProviderBatch:
+        """Discover an auditable, high-view short-video cohort for one query.
+
+        The normal discovery lane prioritizes recency.  Transcript cohorts need a
+        separate explicit lane ordered by observed view count so a recent 14-view
+        upload can never masquerade as a proven pattern.
+        """
+
+        started = utc_now()
+        try:
+            self.preflight()
+            observed = utc_now()
+            item_limit = max(1, min(int(max_items), 50))
+            search = self.request_json(
+                "GET",
+                f"{self.base_url}/search",
+                params={
+                    "part": "snippet",
+                    "q": query,
+                    "type": "video",
+                    "order": "viewCount",
+                    "videoDuration": "short",
+                    "relevanceLanguage": relevance_language,
+                    "regionCode": region,
+                    "safeSearch": "moderate",
+                    "maxResults": item_limit,
+                    "key": self.api_key,
+                },
+            )
+            ids = [
+                str(item.get("id", {}).get("videoId") or "")
+                for item in search.get("items", [])
+                if isinstance(item, dict)
+            ]
+            ids = [value for value in ids if value]
+            details = self.request_json(
+                "GET",
+                f"{self.base_url}/videos",
+                params={
+                    "part": "snippet,statistics,contentDetails,topicDetails",
+                    "id": ",".join(ids),
+                    "key": self.api_key,
+                },
+            ) if ids else {"items": []}
+            items = [
+                self._normalize(
+                    item,
+                    observed,
+                    {
+                        "lane": "performance_search",
+                        "topic": query,
+                        "region": region,
+                    },
+                )
+                for item in details.get("items", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+            return self.success_batch(
+                started,
+                items,
+                operation="discover_performance",
+                metadata={
+                    "query": query,
+                    "order": "viewCount",
+                    "video_duration": "short",
+                    "relevance_language": relevance_language,
+                    "region": region,
+                    "search_result_count": len(ids),
+                },
+            )
+        except Exception as error:
+            return self.blocked_batch(started, error)
+
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
         try:
@@ -47,6 +127,8 @@ class YouTubeSource(MarketSource):
             details: Dict[str, Dict[str, Any]] = {}
             contexts: Dict[str, Dict[str, Any]] = {}
             search_requests = 0
+            chart_requests = 0
+            chart_category_errors: List[Dict[str, Any]] = []
             known_skipped = 0
             search_requests_used = self.recent_metadata_total("search_requests")
             search_request_limit = max(
@@ -55,29 +137,51 @@ class YouTubeSource(MarketSource):
             )
             termination_error: SourceHTTPError | None = None
 
-            for region in self.config.regions[:2]:
-                if len(details) >= max_items or self.request_count >= self.request_budget:
-                    break
-                data = self.request_json("GET", f"{self.base_url}/videos", params={
-                    "part": "snippet,statistics,contentDetails,topicDetails",
-                    "chart": "mostPopular",
-                    "regionCode": region,
-                    "maxResults": min(50, max_items - len(details)),
-                    "key": self.api_key,
-                })
-                chart_items = [
-                    item for item in data.get("items", [])
-                    if isinstance(item, dict) and item.get("id")
-                ]
-                known = self.known_external_ids([str(item["id"]) for item in chart_items])
-                known_skipped += len(known)
-                for item in chart_items:
-                    if isinstance(item, dict) and item.get("id"):
+            chart_categories = self.config.youtube_chart_categories or ["all"]
+            for region in self.config.regions[:4]:
+                for category in chart_categories:
+                    if len(details) >= max_items or self.request_count >= self.request_budget:
+                        break
+                    params: Dict[str, Any] = {
+                        "part": "snippet,statistics,contentDetails,topicDetails",
+                        "chart": "mostPopular",
+                        "regionCode": region,
+                        "maxResults": min(50, max_items - len(details)),
+                        "key": self.api_key,
+                    }
+                    if category.lower() != "all":
+                        params["videoCategoryId"] = category
+                    try:
+                        data = self.request_json("GET", f"{self.base_url}/videos", params=params)
+                    except SourceHTTPError as error:
+                        if error.status_code not in {400, 404}:
+                            raise
+                        chart_category_errors.append({
+                            "region": region,
+                            "category": category,
+                            "status_code": error.status_code,
+                            "error_code": error.code,
+                        })
+                        continue
+                    chart_requests += 1
+                    chart_items = [
+                        item for item in data.get("items", [])
+                        if isinstance(item, dict) and item.get("id")
+                    ]
+                    known = self.known_external_ids([str(item["id"]) for item in chart_items])
+                    known_skipped += len(known)
+                    for item in chart_items:
                         video_id = str(item["id"])
                         if video_id in known:
                             continue
                         details[video_id] = item
-                        contexts[video_id] = {"lane": "most_popular", "region": region}
+                        contexts[video_id] = {
+                            "lane": "most_popular",
+                            "region": region,
+                            "category": category,
+                        }
+                if len(details) >= max_items or self.request_count >= self.request_budget:
+                    break
 
             page_tokens = {topic: "" for topic in self.config.topics}
             while (
@@ -146,6 +250,10 @@ class YouTubeSource(MarketSource):
             batch = self.success_batch(
                 started, items[:max_items], operation="discover",
                 metadata={
+                    "chart_requests": chart_requests,
+                    "chart_categories": chart_categories,
+                    "chart_regions": self.config.regions[:4],
+                    "chart_category_errors": chart_category_errors,
                     "search_requests": search_requests,
                     "search_requests_used_before_run": search_requests_used,
                     "search_quota_remaining": max(
@@ -155,6 +263,7 @@ class YouTubeSource(MarketSource):
                         - search_requests,
                     ),
                     "known_ids_skipped": known_skipped,
+                    "queries_considered": self.config.topics,
                     "batch_stats_supported": True,
                     "terminated_by": (
                         termination_error.code
@@ -168,9 +277,9 @@ class YouTubeSource(MarketSource):
                 },
             )
             if termination_error:
-                batch.receipt.state = SourceState.BLOCKED_QUOTA
-                batch.receipt.error_code = termination_error.code
-                batch.receipt.error_detail = str(termination_error)
+                batch.receipt.metadata["search_lane_state"] = SourceState.BLOCKED_QUOTA.value
+                batch.receipt.metadata["search_lane_error_code"] = termination_error.code
+                batch.receipt.metadata["search_lane_error_detail"] = str(termination_error)
             return batch
         except Exception as error:
             return self.blocked_batch(started, error)
@@ -252,5 +361,8 @@ class YouTubeSource(MarketSource):
             duration_seconds=seconds,
             hashtags=tags,
             raw_payload=raw,
-            discovery_context={key: value for key, value in prior.items() if key in {"lane", "topic", "region"}},
+            discovery_context={
+                key: value for key, value in prior.items()
+                if key in {"lane", "topic", "region", "category"}
+            },
         )

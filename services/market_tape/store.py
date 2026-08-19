@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import MarketTapeConfig
+from .keywords import rank_keywords
 from .math import age_bucket, concentration, counter_motion, poll_interval_seconds, trend_state, trend_strength, zscore
 from .models import MarketContent, SourceReceipt, isoformat, stable_hash, utc_now
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+-]*", re.IGNORECASE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how",
@@ -169,6 +170,73 @@ class MarketTapeStore:
                     extraction_status TEXT NOT NULL DEFAULT 'metadata_complete',
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_artifacts (
+                    transcript_id TEXT PRIMARY KEY,
+                    video_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    observation_key TEXT NOT NULL,
+                    source_metrics_json TEXT NOT NULL,
+                    audio_path TEXT NOT NULL,
+                    audio_sha256 TEXT NOT NULL,
+                    transcript_path TEXT NOT NULL,
+                    transcript_sha256 TEXT NOT NULL,
+                    whisper_model TEXT NOT NULL,
+                    whisper_language TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    word_count INTEGER NOT NULL,
+                    segment_count INTEGER NOT NULL,
+                    acquisition_json TEXT NOT NULL,
+                    audit_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
+                );
+                CREATE INDEX IF NOT EXISTS mt_transcript_artifacts_video_idx
+                    ON mt_transcript_artifacts(video_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_transcript_artifacts_platform_idx
+                    ON mt_transcript_artifacts(platform, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_cohorts (
+                    cohort_id TEXT PRIMARY KEY,
+                    topic TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    member_ids_json TEXT NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    aggregate_metrics_json TEXT NOT NULL,
+                    audit_json TEXT NOT NULL,
+                    manifest_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS mt_script_relatability_audits (
+                    audit_id TEXT PRIMARY KEY,
+                    script_id TEXT NOT NULL,
+                    cohort_id TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    script_sha256 TEXT NOT NULL,
+                    cohort_manifest_sha256 TEXT NOT NULL,
+                    findings_json TEXT NOT NULL,
+                    receipt_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(cohort_id) REFERENCES mt_transcript_cohorts(cohort_id)
+                );
+                CREATE INDEX IF NOT EXISTS mt_script_relatability_script_idx
+                    ON mt_script_relatability_audits(script_id, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_backfill_runs (
+                    run_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    candidate_ids_json TEXT NOT NULL,
+                    artifact_ids_json TEXT NOT NULL,
+                    failures_json TEXT NOT NULL,
+                    manifest_path TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS mt_trends (
@@ -1305,6 +1373,46 @@ class MarketTapeStore:
         params.append(min(max(1, limit), 1000))
         with self.connect() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+    def keyword_signals(
+        self,
+        limit: int = 100,
+        window_hours: int = 168,
+        min_videos: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Mine fresh query candidates without relying on the configured seed vocabulary."""
+
+        with self.connect() as connection:
+            rows = [dict(row) for row in connection.execute(
+                """WITH latest AS (
+                       SELECT observation.*,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY observation.video_id
+                                  ORDER BY observation.observed_at DESC, observation.observation_id DESC
+                              ) AS row_number
+                       FROM mt_market_observations observation
+                   ), observation_counts AS (
+                       SELECT video_id, COUNT(*) AS observation_count
+                       FROM mt_market_observations GROUP BY video_id
+                   )
+                   SELECT video.video_id, video.creator_id, video.platform, video.published_at,
+                          video.title, video.caption, video.description, video.url,
+                          latest.observed_at, latest.views, latest.likes, latest.comments,
+                          latest.shares, latest.view_velocity,
+                          genome.hashtags_json, observation_counts.observation_count
+                   FROM latest
+                   JOIN mt_videos video ON video.video_id = latest.video_id
+                   JOIN observation_counts ON observation_counts.video_id = latest.video_id
+                   LEFT JOIN mt_content_genomes genome ON genome.video_id = video.video_id
+                   WHERE latest.row_number = 1 AND video.published_at IS NOT NULL
+                   ORDER BY latest.observed_at DESC LIMIT 50000"""
+            ).fetchall()]
+        return rank_keywords(
+            rows,
+            limit=limit,
+            window_hours=window_hours,
+            min_videos=min_videos,
+        )
 
     def list_runs(self, limit: int = 50) -> List[Dict[str, Any]]:
         with self.connect() as connection:

@@ -93,11 +93,30 @@ class MarketTapeConfig:
             "founder systems,creator tools,social media growth,short form video,content strategy"
         ),
     ))
+    adaptive_topics_enabled: bool = field(default_factory=lambda: _bool(
+        "MARKET_TAPE_ADAPTIVE_TOPICS_ENABLED", True
+    ))
+    adaptive_topic_limit: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_LIMIT", 30
+    ))
+    adaptive_topic_window_hours: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_WINDOW_HOURS", 168
+    ))
+    adaptive_topic_min_videos: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_MIN_VIDEOS", 2
+    ))
+    adaptive_topic_exploration_fraction: float = field(default_factory=lambda: _float(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_EXPLORATION_FRACTION", 0.2
+    ))
     overflow_platforms: List[str] = field(default_factory=lambda: _csv(
         "MARKET_TAPE_OVERFLOW_PLATFORMS", "youtube"
     ))
     regions: List[str] = field(default_factory=lambda: _csv("MARKET_TAPE_REGIONS", "US"))
     languages: List[str] = field(default_factory=lambda: _csv("MARKET_TAPE_LANGUAGES", "en"))
+    youtube_chart_categories: List[str] = field(default_factory=lambda: _csv(
+        "MARKET_TAPE_YOUTUBE_CHART_CATEGORIES",
+        "all,1,2,10,15,17,19,20,22,23,24,25,26,27,28",
+    ))
     cycle_seconds: int = field(default_factory=lambda: _int("MARKET_TAPE_CYCLE_SECONDS", 900))
     discovery_interval_seconds: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_DISCOVERY_INTERVAL_SECONDS", 14400

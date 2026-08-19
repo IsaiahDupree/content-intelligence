@@ -27,6 +27,44 @@ provider response
 
 No AI assistant is required for configuration or execution. Environment configuration, source adapters, scheduler policy, storage, status, and receipts are deterministic software contracts.
 
+Discovery begins with provider charts that do not depend on configured keywords. The tape then mines titles and hashtags from recently published high-performing content and creates an adaptive query frontier. Ranking favors fresh view throughput, p75 and median implied views/hour, creator and platform breadth, engagement, repeated observations, and low single-video concentration. Each signal includes example content and its source URL, making query selection auditable without an LLM.
+
+## Performance-bound local transcript bank
+
+The transcript bank reads Market Tape directly; it does not depend on the ACTP worker or ACD. Every accepted artifact contains:
+
+- the canonical video ID and exact append-only `observation_key`;
+- the observed views, likes, comments, shares, saves, and engagement rate;
+- the local source-audio path and SHA-256;
+- timestamped Whisper segments, language, model, word count, and transcript-payload SHA-256;
+- an explicit audit decision and every failed check.
+
+The default artifact floors are 10,000 views and 0.5% engagement for YouTube, 100,000 and 2% for TikTok, 50,000 and 1.5% for Instagram, and 25,000 and 1% for Facebook. A topic cohort also requires at least two topic terms in the spoken transcript, 40 transcript words, five English members, three creators, and 100,000 combined observed views. Language mismatches, misleading metadata, download errors, empty transcripts, insufficient evidence, and hash mismatches are recorded rather than silently accepted.
+
+```bash
+# Ingest signed-in YouTube search JSONL with file/query provenance.
+python3 scripts/ingest_yt_dlp_search.py \
+  --input 'creator burnout=/absolute/path/creator-burnout.jsonl'
+
+# Curate and transcribe an exact related-content cohort.
+python3 scripts/transcribe_performance_cohort.py \
+  --topic 'creator burnout creative struggle content views work' \
+  --platform youtube --video-id VIDEO_ID --model base \
+  --cookies-from-browser chrome
+
+# Resume the next performance-ranked backfill batch; existing artifacts are skipped.
+python3 scripts/backfill_transcript_bank.py \
+  --platform youtube --limit 20 --model base \
+  --cookies-from-browser chrome \
+  --topic 'creator burnout creative struggle content views work'
+
+# Supersede a script gate with a cohort/hash-backed audit.
+python3 scripts/audit_script_relatability.py \
+  --script-id SCRIPT_ID --cohort-manifest /absolute/path/cohort.json
+```
+
+`PASS_PREDICTED_RELATABILITY` means the script is supported by the performance-qualified transcript cohort. It is not a claim about actual human response. Scores are capped at 85 until retention, engagement, and audience-response evidence exists for that exact published script.
+
 ## Proven Production State
 
 The initial production tape contains:
@@ -214,7 +252,27 @@ Defaults are explicit in `MarketTapeConfig` and overridable by environment:
 
 The total configured provider-cost ceiling is `$5.00` per UTC day. A source receives zero request budget after the cost ceiling is reached. Metered reads default to off in source configuration and require `MARKET_TAPE_ALLOW_METERED_READS=true`. Every request and estimated cost is written to the daily usage ledger and source receipt.
 
-YouTube discovery uses quota-bounded round-robin pagination across configured topics and regions. It excludes canonical IDs already on tape before those IDs consume the requested item count, so later cycles advance through known pages to find new content. The adapter separately persists a conservative rolling 24-hour count for the `search.list` bucket, whose official default is 100 calls per day, and keeps the configured ceiling at 80. If YouTube terminates a run for quota, every valid partial result is still normalized and receipted before the source enters cooldown. See [YouTube's official quota calculator](https://developers.google.com/youtube/v3/determine_quota_cost) and [`search.list` reference](https://developers.google.com/youtube/v3/docs/search/list).
+YouTube discovery first enumerates `mostPopular` across configured regions and categories. This chart lane is independent of seed keywords and remains available when keyword-search quota is exhausted. The adapter then uses quota-bounded round-robin pagination across the adaptive frontier. It excludes canonical IDs already on tape before those IDs consume the requested item count, so later cycles advance through known pages to find new content. The adapter separately persists a conservative rolling 24-hour count for the `search.list` bucket, whose official default is 100 calls per day, and keeps the configured ceiling at 80. If search quota terminates a run, every valid chart and partial search result is still normalized and receipted; only the search lane is marked blocked, so chart collection and statistics refreshes continue. See [YouTube's official quota calculator](https://developers.google.com/youtube/v3/determine_quota_cost) and [`search.list` reference](https://developers.google.com/youtube/v3/docs/search/list).
+
+### Adaptive Keyword Frontier
+
+The frontier is recomputed from immutable observations before each discovery cycle. It does not start from the business niche list.
+
+```text
+broad category charts
+  -> fresh content cohort
+  -> title and hashtag candidates
+  -> views/hour and freshness scoring
+  -> breadth and concentration checks
+  -> duplicate-topic suppression
+  -> adaptive provider queries
+  -> new observations
+  -> next frontier iteration
+```
+
+Defaults use a seven-day window, require at least two independent videos and two independent creators for automatic querying, select at most 30 terms, and reserve 20% of slots for rotating configured exploration topics. Query priority combines performance with evidence confidence so a repeatable multi-creator signal outranks a one-off spike. Canonical spelling overlap and shared top-video evidence suppress variants from consuming multiple frontier slots. Single-video and single-creator terms remain visible in the read API with lower confidence but do not control autonomous queries under the default gate.
+
+Browser expansion uses the research service's explicit `trend` query mode. That mode searches the measured term, exact phrase, and platform-native hashtag or current-event variants; it does not append business-niche suffixes such as `tips`, `strategy`, or `community`. On archive ingest, `niche-token-overlap-v1` independently rejects carryover from a prior browser query. Each source receipt reports evaluated, accepted, rejected, unscoped, and precision counts under `metadata.archive_qc`, so raw browser output cannot silently become validated trend evidence.
 
 Healthy-provider overflow is explicit. All normal platform lanes run first; platforms listed in `MARKET_TAPE_OVERFLOW_PLATFORMS` may then exceed their lane target to close the remaining global target. Platform receipts and target progress remain separate, so overflow never disguises a blocked TikTok, Instagram, X, Facebook, or Threads integration as successful coverage.
 
@@ -248,8 +306,15 @@ Inspect output:
 python3 -m services.market_tape.cli videos --limit 100
 python3 -m services.market_tape.cli videos --platform youtube --limit 100
 python3 -m services.market_tape.cli trends --limit 100
+python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli predictions --subject-type trend --limit 100
 python3 -m services.market_tape.cli candles --window-minutes 15 --limit 96
+```
+
+Equivalent read API:
+
+```text
+GET /api/market-tape/keywords?limit=100&window_hours=168&min_videos=2
 ```
 
 Retry or drain central sync after the target schema is authorized:

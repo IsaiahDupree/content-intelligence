@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -24,6 +25,11 @@ class MarketTapeCollector:
         self.config = config or MarketTapeConfig.from_environment()
         self.store = store or MarketTapeStore(self.config)
         self.source_builder = source_builder
+        self._last_discovery_topics: Dict[str, Any] = {
+            "mode": "configured",
+            "topics": list(self.config.topics),
+            "signals": [],
+        }
 
     def run_cycle(self, mode: str = "full") -> Dict[str, Any]:
         if mode not in {"full", "discovery", "recheck"}:
@@ -66,6 +72,7 @@ class MarketTapeCollector:
             "receipts": receipts,
             "outbox_records": outbox_records,
             "central_sync": sync_result,
+            "discovery_topics": self._last_discovery_topics,
             "status": status,
         }
         self._write_heartbeat(result)
@@ -129,7 +136,7 @@ class MarketTapeCollector:
 
     def _run_discovery(self, run_id: str) -> List[Dict[str, Any]]:
         sources = sorted(
-            self._build_sources(run_id),
+            self._build_sources(run_id, adaptive_topics=True),
             key=lambda source: source.platform in self.config.overflow_platforms,
         )
         receipts: List[Dict[str, Any]] = []
@@ -248,13 +255,14 @@ class MarketTapeCollector:
                 source.close()
         return receipts
 
-    def _build_sources(self, run_id: str):
+    def _build_sources(self, run_id: str, adaptive_topics: bool = False):
         def guarded_budget(source_id: str, daily_limit: int) -> int:
             if self.store.daily_provider_cost() >= self.config.max_daily_provider_cost_usd:
                 return 0
             return self.store.remaining_request_budget(source_id, daily_limit)
 
-        sources = self.source_builder(self.config, run_id, guarded_budget)
+        source_config = self._adaptive_discovery_config() if adaptive_topics else self.config
+        sources = self.source_builder(source_config, run_id, guarded_budget)
         for source in sources:
             source.known_external_ids = (
                 lambda external_ids, platform=source.platform:
@@ -266,6 +274,131 @@ class MarketTapeCollector:
             )
         return sources
 
+    def _adaptive_discovery_config(self) -> MarketTapeConfig:
+        if not self.config.adaptive_topics_enabled:
+            self._last_discovery_topics = {
+                "mode": "configured",
+                "topics": list(self.config.topics),
+                "signals": [],
+            }
+            return self.config
+
+        limit = max(1, min(100, int(self.config.adaptive_topic_limit)))
+        signals = self.store.keyword_signals(
+            limit=limit * 5,
+            window_hours=self.config.adaptive_topic_window_hours,
+            min_videos=self.config.adaptive_topic_min_videos,
+        )
+        candidates = [
+            signal for signal in signals
+            if signal.get("query_ready")
+            and int(signal.get("videos_total") or 0) >= 2
+            and int(signal.get("creators_total") or 0) >= 2
+        ]
+        candidates.sort(key=self._discovery_priority, reverse=True)
+        if not candidates:
+            self._last_discovery_topics = {
+                "mode": "configured_fallback",
+                "topics": list(self.config.topics),
+                "signals": [],
+            }
+            return self.config
+
+        exploration_fraction = max(
+            0.0, min(0.5, float(self.config.adaptive_topic_exploration_fraction))
+        )
+        exploration_count = min(len(self.config.topics), round(limit * exploration_fraction))
+        adaptive_count = max(1, limit - exploration_count)
+        selected_signals = self._diverse_keyword_signals(candidates, adaptive_count)
+        selected = [str(signal["keyword"]) for signal in selected_signals]
+
+        configured = list(self.config.topics)
+        if configured and exploration_count:
+            offset = utc_now().date().toordinal() % len(configured)
+            rotated = configured[offset:] + configured[:offset]
+            selected.extend(
+                topic for topic in rotated
+                if topic.casefold() not in {value.casefold() for value in selected}
+            )
+        topics = list(dict.fromkeys(selected))[:limit]
+        self._last_discovery_topics = {
+            "mode": "adaptive",
+            "topics": topics,
+            "adaptive_count": len(selected_signals),
+            "exploration_count": max(0, len(topics) - len(selected_signals)),
+            "window_hours": self.config.adaptive_topic_window_hours,
+            "signals": [
+                {
+                    key: signal[key]
+                    for key in (
+                        "keyword", "rank", "score", "confidence", "videos_total",
+                        "creators_total", "platforms_total", "views_total",
+                    )
+                }
+                for signal in selected_signals
+            ],
+        }
+        return replace(self.config, topics=topics)
+
+    @staticmethod
+    def _diverse_keyword_signals(
+        candidates: Sequence[Dict[str, Any]], limit: int
+    ) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        token_sets: List[set[str]] = []
+        compact_keys: set[str] = set()
+        evidence_sets: List[set[str]] = []
+        for signal in candidates:
+            tokens = MarketTapeCollector._canonical_topic_tokens(
+                str(signal.get("keyword", ""))
+            )
+            if not tokens:
+                continue
+            compact = "".join(sorted(tokens))
+            evidence = {
+                str(example.get("video_id"))
+                for example in signal.get("examples", [])
+                if isinstance(example, dict) and example.get("video_id")
+            }
+            token_duplicate = any(
+                len(tokens & prior) / max(1, min(len(tokens), len(prior))) >= 0.5
+                for prior in token_sets
+            )
+            evidence_duplicate = any(
+                evidence
+                and prior
+                and len(evidence & prior) / max(1, min(len(evidence), len(prior))) >= 0.5
+                for prior in evidence_sets
+            )
+            if compact in compact_keys or token_duplicate or evidence_duplicate:
+                continue
+            selected.append(signal)
+            token_sets.append(tokens)
+            compact_keys.add(compact)
+            evidence_sets.append(evidence)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    @staticmethod
+    def _discovery_priority(signal: Dict[str, Any]) -> tuple[float, float, int]:
+        confidence = max(0.0, min(1.0, float(signal.get("confidence") or 0.0)))
+        score = max(0.0, float(signal.get("score") or 0.0))
+        breadth = min(20, int(signal.get("videos_total") or 0))
+        return score * (0.65 + 0.35 * confidence), confidence, breadth
+
+    @staticmethod
+    def _canonical_topic_tokens(value: str) -> set[str]:
+        tokens = re.findall(r"[a-z0-9]+", value.casefold())
+        normalized = {
+            token[:-1] if len(token) > 4 and token.endswith("s") else token
+            for token in tokens
+        }
+        compact = "".join(tokens)
+        if compact:
+            normalized.add(compact[:-1] if len(compact) > 4 and compact.endswith("s") else compact)
+        return normalized
+
     def _circuit_open_batch(self, source: Any) -> ProviderBatch | None:
         # A browser scheduler outage must never block cost-free archive ingestion.
         # LocalResearchSource reports trigger health inside its own receipt after reading files.
@@ -273,6 +406,10 @@ class MarketTapeCollector:
             return None
         retry = self.store.source_retry_status(source.source_id)
         if not retry.get("blocked"):
+            return None
+        if source.source_id == "youtube-data-api-v3" and retry.get("error_code") in {
+            "provider_rate_limited", "provider_auth_or_quota",
+        }:
             return None
         state = str(retry.get("state", "degraded"))
         if state == SourceState.BLOCKED_CREDENTIAL.value and source.credentials_available():

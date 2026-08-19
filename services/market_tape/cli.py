@@ -36,6 +36,10 @@ def main() -> int:
     trends = subparsers.add_parser("trends")
     trends.add_argument("--state")
     trends.add_argument("--limit", type=int, default=100)
+    keywords = subparsers.add_parser("keywords")
+    keywords.add_argument("--limit", type=int, default=100)
+    keywords.add_argument("--window-hours", type=int, default=168)
+    keywords.add_argument("--min-videos", type=int, default=1)
     predictions = subparsers.add_parser("predictions")
     predictions.add_argument("--subject-type", choices=["video", "trend"])
     predictions.add_argument("--limit", type=int, default=100)
@@ -70,6 +74,14 @@ def main() -> int:
         return _print({"videos": store.list_videos(args.limit, args.platform)})
     if args.command == "trends":
         return _print({"trends": store.list_trends(args.limit, args.state)})
+    if args.command == "keywords":
+        return _print({
+            "keywords": store.keyword_signals(
+                args.limit,
+                args.window_hours,
+                args.min_videos,
+            )
+        })
     if args.command == "predictions":
         return _print({"predictions": store.list_predictions(args.limit, args.subject_type)})
     if args.command == "candles":
