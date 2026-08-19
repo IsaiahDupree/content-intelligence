@@ -114,6 +114,8 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
                 trigger_names = []
                 if table == "actp_market_observations":
                     trigger_names.append("actp_market_observations_no_update")
+                if table == "actp_market_discovery_attributions":
+                    trigger_names.append("actp_market_discovery_attributions_no_update")
                 if table == "actp_trend_observations":
                     trigger_names.append("actp_trend_observations_no_update")
                 rows.append({
@@ -234,6 +236,16 @@ def test_append_only_observations_motion_and_raw_archive(market_config):
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         with store.connect() as connection:
             connection.execute("UPDATE mt_market_observations SET views = 0")
+
+
+def test_store_context_releases_sqlite_connection(market_config):
+    store = MarketTapeStore(market_config)
+    connection = store.connect()
+    with connection:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
 
 
 def test_derivative_and_adaptive_polling_math():
@@ -383,6 +395,65 @@ def test_adaptive_frontier_suppresses_spelling_and_evidence_duplicates():
     assert [signal["keyword"] for signal in selected] == ["trailer", "roblox", "Kanye West"]
 
 
+def test_discovery_queries_become_ranked_frontier_signals(market_config):
+    store = MarketTapeStore(market_config)
+    now = datetime.now(timezone.utc)
+    store.start_run("query-attribution-run", "discovery")
+    for index, views in enumerate((800_000, 500_000, 300_000), start=1):
+        item = _content_for_keyword(
+            f"query-video-{index}",
+            f"Game recap number {index}",
+            now - timedelta(minutes=index),
+            views,
+        )
+        item.discovery_context = {
+            "surface": "google_trends_to_youtube",
+            "queries": ["Mariners vs Brewers"],
+        }
+        store.ingest(item, "query-attribution-run")
+    store.finish_run("query-attribution-run")
+
+    signals = store.keyword_signals(limit=100, window_hours=168, min_videos=2)
+    signal = next(value for value in signals if value["keyword"] == "mariners vs brewers")
+
+    assert signal["keyword_type"] == "query"
+    assert signal["videos_total"] == 3
+    assert signal["creators_total"] == 3
+    assert signal["query_ready"] is True
+    query_frontier = store.discovery_query_signals(limit=20, window_hours=168, min_videos=2)
+    assert query_frontier[0]["keyword"] == "mariners vs brewers"
+    collector = MarketTapeCollector(replace(
+        market_config,
+        adaptive_topics_enabled=True,
+        adaptive_topic_limit=4,
+        adaptive_topic_exploration_fraction=0,
+    ), store, source_builder=lambda *_: [])
+    collector._adaptive_discovery_config()
+    assert "mariners vs brewers" in collector._last_discovery_topics["topics"]
+    with store.connect() as connection:
+        attributions = connection.execute(
+            "SELECT query, surface FROM mt_discovery_attributions ORDER BY video_id"
+        ).fetchall()
+    assert len(attributions) == 3
+    assert {row["query"] for row in attributions} == {"Mariners vs Brewers"}
+
+
+def test_single_video_spike_is_visible_but_never_query_ready(market_config):
+    store = MarketTapeStore(market_config)
+    now = datetime.now(timezone.utc)
+    store.start_run("single-spike-run", "discovery")
+    store.ingest(
+        _content_for_keyword("single-spike", "One enormous isolated spike", now, 90_000_000),
+        "single-spike-run",
+    )
+    store.finish_run("single-spike-run")
+
+    signals = store.keyword_signals(limit=100, window_hours=168, min_videos=1)
+    signal = next(value for value in signals if value["keyword"] == "enormous isolated")
+    assert signal["videos_total"] == 1
+    assert signal["query_ready"] is False
+
+
 def test_transactional_outbox_flushes_to_supabase_rest(provider_server, market_config, monkeypatch):
     store = MarketTapeStore(market_config)
     store.start_run("sync-run", "full")
@@ -420,7 +491,7 @@ def test_market_tape_migration_contract_matches_outbox_tables():
     sink_tables = {definition[0] for definition in ENTITY_TABLES.values()}
 
     assert validation["state"] == "ready"
-    assert validation["tables_expected"] == 11
+    assert validation["tables_expected"] == 12
     assert set(MARKET_TAPE_TABLES) == sink_tables
     assert set(ENTITY_SYNC_ORDER) == set(ENTITY_TABLES)
     assert project_ref_from_url("https://ivhfuhxorppptyuofbgq.supabase.co") == "ivhfuhxorppptyuofbgq"
@@ -446,7 +517,7 @@ def test_market_tape_migration_applies_and_verifies_over_real_http(provider_serv
     posts = ProviderTestHandler.received_posts[posts_before:]
     gets = ProviderTestHandler.received_gets[gets_before:]
     assert result["state"] == "applied", result
-    assert result["inspection"]["tables_ready"] == 11
+    assert result["inspection"]["tables_ready"] == 12
     assert posts[0]["path"] == f"/v1/projects/{project_ref}/database/query"
     assert "create table if not exists public.actp_market_observations" in posts[0]["body"]["query"]
     assert posts[0]["body"]["read_only"] is False
@@ -487,7 +558,7 @@ def test_market_tape_migration_verifies_security_invariants_over_real_http(provi
 
     posts = ProviderTestHandler.received_posts[posts_before:]
     assert result["state"] == "ready", result
-    assert result["tables_verified"] == 11
+    assert result["tables_verified"] == 12
     assert result["missing_tables"] == []
     assert result["rls_disabled"] == []
     assert result["unexpected_rls_policies"] == {}
@@ -496,8 +567,8 @@ def test_market_tape_migration_verifies_security_invariants_over_real_http(provi
     assert posts[0]["body"]["read_only"] is True
     assert "pg_catalog.pg_policies" in posts[0]["body"]["query"]
     assert counts["state"] == "ready", counts
-    assert counts["tables_counted"] == 11
-    assert counts["total_rows"] == 66
+    assert counts["tables_counted"] == 12
+    assert counts["total_rows"] == 78
     assert posts[1]["body"]["read_only"] is True
     assert "count(*)::bigint" in posts[1]["body"]["query"]
 
@@ -528,6 +599,36 @@ def test_transactional_outbox_drain_processes_multiple_batches(provider_server, 
     assert result["batches"] > 1
     assert result["synced"] > 2
     assert result["pending"] == 0
+
+
+def test_outbox_reconcile_queues_only_local_records_never_enqueued(
+    provider_server, market_config, monkeypatch,
+):
+    store = MarketTapeStore(market_config)
+    store.start_run("pre-outbox-run", "full")
+    observed = datetime.now(timezone.utc)
+    store.ingest(_content_for_id("pre-outbox-video", observed), "pre-outbox-run")
+    store.finish_run("pre-outbox-run")
+
+    queued = store.enqueue_missing_for_sync()
+    assert queued > 0
+    assert store.enqueue_missing_for_sync() == 0
+
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-integration-key-1234567890")
+    enabled = replace(market_config, supabase_sync_enabled=True)
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        result = sink.drain(max_batches=100)
+    finally:
+        sink.close()
+
+    assert result["state"] == "ready"
+    assert result["synced"] == queued
+    assert result["pending"] == 0
+    paths = {post["path"] for post in ProviderTestHandler.received_posts}
+    assert "/actp_market_videos" in paths
+    assert "/actp_market_observations" in paths
 
 
 def test_supabase_sink_orders_parent_run_before_earlier_receipt(provider_server, market_config, monkeypatch):
@@ -920,6 +1021,7 @@ def test_market_tape_api_is_readable_and_write_control_is_local(market_config):
     assert client.get("/api/market-tape/videos").status_code == 200
     assert client.get("/api/market-tape/trends").status_code == 200
     assert client.get("/api/market-tape/keywords").status_code == 200
+    assert client.get("/api/market-tape/query-frontier").status_code == 200
     assert client.get("/api/market-tape/predictions").status_code == 200
     assert client.get("/api/market-tape/candles?window_minutes=15").status_code == 200
     denied = client.post(
@@ -928,6 +1030,18 @@ def test_market_tape_api_is_readable_and_write_control_is_local(market_config):
         environ_overrides={"REMOTE_ADDR": "203.0.113.10"},
     )
     assert denied.status_code == 401
+
+
+def test_dedicated_market_tape_app_health_and_security_headers(market_config):
+    from market_tape_app import create_market_tape_app
+
+    client = create_market_tape_app(market_config).test_client()
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.get_json()["service"] == "content-intelligence-market-tape"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert client.get("/api/market-tape/query-frontier").status_code == 200
 
 
 def test_market_tape_tick_selects_due_mode_without_external_calls(market_config):
@@ -951,7 +1065,9 @@ def test_secret_sanitization_and_scale_defaults():
     config = MarketTapeConfig()
     assert config.daily_unique_target == 5000
     assert config.overflow_platforms == ["youtube"]
-    assert len(config.topics) == 15
+    assert len(config.topics) >= 20
+    assert "live sports" in config.topics
+    assert "ai automation" not in config.topics
     assert set(config.platforms) == {"youtube", "tiktok", "instagram", "x", "facebook", "threads"}
 
 

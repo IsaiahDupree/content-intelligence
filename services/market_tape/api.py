@@ -61,6 +61,17 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             "min_videos": minimum,
         })
 
+    @app.get("/api/market-tape/query-frontier")
+    def market_tape_query_frontier():
+        limit = _limit(request.args.get("limit"), 100)
+        window = _limit(request.args.get("window_hours"), 168, maximum=24 * 90)
+        minimum = _limit(request.args.get("min_videos"), 2, maximum=1000)
+        return jsonify({
+            "queries": store.discovery_query_signals(limit, window, minimum),
+            "window_hours": window,
+            "min_videos": minimum,
+        })
+
     @app.get("/api/market-tape/runs")
     def market_tape_runs():
         return jsonify({"runs": store.list_runs(_limit(request.args.get("limit"), 50))})
@@ -117,14 +128,18 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             return jsonify({"error": "local control token required"}), 401
         body: Any = request.get_json(silent=True) or {}
         def flush() -> Dict[str, Any]:
+            reconciled = store.enqueue_missing_for_sync() if body.get("reconcile") is True else 0
             if body.get("force") is True:
                 store.make_outbox_due()
             sink = SupabaseSink(resolved, store)
             try:
                 if body.get("drain") is True:
                     max_batches = _limit(body.get("max_batches"), 250, maximum=1000)
-                    return sink.drain(max_batches)
-                return sink.flush()
+                    result = sink.drain(max_batches)
+                else:
+                    result = sink.flush()
+                result["reconciled_records"] = reconciled
+                return result
             finally:
                 sink.close()
 

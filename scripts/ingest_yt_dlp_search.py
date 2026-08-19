@@ -26,6 +26,7 @@ from services.market_tape.models import (  # noqa: E402
     utc_now,
 )
 from services.market_tape.store import MarketTapeStore  # noqa: E402
+from services.market_tape.sinks import SupabaseSink  # noqa: E402
 
 
 DEFAULT_ENV = (
@@ -219,6 +220,12 @@ def main() -> int:
     store.save_receipt(receipt)
     final_state = "completed" if receipt.state == SourceState.READY else "degraded"
     store.finish_run(run_id, final_state, receipt.error_detail)
+    outbox_records = store.enqueue_run_for_sync(run_id)
+    sink = SupabaseSink(config, store)
+    try:
+        central_sync = sink.flush()
+    finally:
+        sink.close()
 
     result = {
         "run_id": run_id,
@@ -230,6 +237,8 @@ def main() -> int:
         "unique_videos_added": unique_videos,
         "duplicate_observations": duplicate_observations,
         "failed_count": failed_count,
+        "outbox_records": outbox_records,
+        "central_sync": central_sync,
         "source_files": source_files,
     }
     manifest = args.manifest or (

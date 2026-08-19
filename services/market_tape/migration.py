@@ -17,15 +17,20 @@ from .config import REPO_ROOT, load_runtime_environment
 from .sources.base import sanitize
 
 
-MIGRATION_NAME = "market_tape_v1"
-MIGRATION_PATH = REPO_ROOT / "migrations" / f"{MIGRATION_NAME}.sql"
-VERIFICATION_PATH = REPO_ROOT / "migrations" / f"verify_{MIGRATION_NAME}.sql"
+MIGRATION_NAME = "market_tape_v2"
+MIGRATION_PATHS = (
+    REPO_ROOT / "migrations" / "market_tape_v1.sql",
+    REPO_ROOT / "migrations" / "market_tape_v2_discovery_attributions.sql",
+)
+MIGRATION_PATH = MIGRATION_PATHS[-1]
+VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v2.sql"
 MANAGEMENT_API_URL = "https://api.supabase.com"
 
 # The probe columns are deliberately the conflict keys used by the outbox sink.
 MARKET_TAPE_TABLES: Dict[str, str] = {
     "actp_market_creators": "creator_id",
     "actp_market_videos": "video_id",
+    "actp_market_discovery_attributions": "attribution_key",
     "actp_market_observations": "observation_key",
     "actp_content_genomes": "video_id",
     "actp_trends": "trend_id",
@@ -39,17 +44,19 @@ MARKET_TAPE_TABLES: Dict[str, str] = {
 
 APPEND_ONLY_TABLES = {
     "actp_market_observations",
+    "actp_market_discovery_attributions",
     "actp_trend_observations",
 }
 
 APPEND_ONLY_TRIGGERS = {
     "actp_market_observations": "actp_market_observations_no_update",
+    "actp_market_discovery_attributions": "actp_market_discovery_attributions_no_update",
     "actp_trend_observations": "actp_trend_observations_no_update",
 }
 
 
 def migration_sql() -> str:
-    return MIGRATION_PATH.read_text(encoding="utf-8")
+    return "\n\n".join(path.read_text(encoding="utf-8") for path in MIGRATION_PATHS)
 
 
 def migration_sha256(sql: Optional[str] = None) -> str:
@@ -101,7 +108,7 @@ def validate_migration(sql: Optional[str] = None) -> Dict[str, Any]:
     return {
         "state": state,
         "migration": MIGRATION_NAME,
-        "path": str(MIGRATION_PATH),
+        "paths": [str(path) for path in MIGRATION_PATHS],
         "sha256": migration_sha256(source),
         "tables_expected": len(expected),
         "tables_declared": len(created & expected),

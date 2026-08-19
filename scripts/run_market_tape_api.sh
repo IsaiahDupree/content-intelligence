@@ -24,4 +24,4 @@ export HOST="127.0.0.1"
 export PORT="${PORT:-6006}"
 export FLASK_DEBUG="false"
 cd /tmp
-exec "$PYTHON_BIN" -P "$ROOT/app.py"
+exec "$PYTHON_BIN" -P "$ROOT/market_tape_app.py"

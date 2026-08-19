@@ -11,6 +11,7 @@ mkdir -p "$RUNTIME_ROOT/scripts" "$RUNTIME_DATA"
 
 /usr/bin/ditto "$ROOT/services" "$RUNTIME_ROOT/services"
 cp "$ROOT/app.py" "$RUNTIME_ROOT/app.py"
+cp "$ROOT/market_tape_app.py" "$RUNTIME_ROOT/market_tape_app.py"
 cp "$ROOT/scripts/run_market_tape_api.sh" "$RUNTIME_ROOT/scripts/run_market_tape_api.sh"
 cp "$ROOT/scripts/run_market_tape_scheduler.sh" "$RUNTIME_ROOT/scripts/run_market_tape_scheduler.sh"
 chmod +x "$RUNTIME_ROOT/scripts/run_market_tape_api.sh" "$RUNTIME_ROOT/scripts/run_market_tape_scheduler.sh"
@@ -20,6 +21,11 @@ PYTHON_BIN="${MARKET_TAPE_PYTHON_BIN:-/opt/homebrew/bin/python3}"
   --repo-root "$ROOT" \
   --runtime-base "$RUNTIME_BASE" \
   --output "$RUNTIME_ROOT/.env.market-tape"
+
+"$PYTHON_BIN" -m compileall -q \
+  "$RUNTIME_ROOT/market_tape_app.py" \
+  "$RUNTIME_ROOT/services/market_tape" \
+  "$RUNTIME_ROOT/services/middleware"
 
 if [[ ! -f "$RUNTIME_DATA/market-tape.sqlite3" && -f "$ROOT/data/market-tape.sqlite3" ]]; then
   cp "$ROOT/data/market-tape.sqlite3" "$RUNTIME_DATA/market-tape.sqlite3"

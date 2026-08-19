@@ -43,9 +43,12 @@ def rank_keywords(
     min_videos: int = 1,
     limit: int = 100,
     now: datetime | None = None,
+    candidate_mode: str = "all",
 ) -> List[Dict[str, Any]]:
     """Rank query terms by fresh performance, breadth, and repeat-observation evidence."""
 
+    if candidate_mode not in {"all", "queries"}:
+        raise ValueError("candidate_mode must be all or queries")
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -72,7 +75,16 @@ def rank_keywords(
         text = " ".join(str(row.get(field) or "") for field in ("title", "caption")).strip()
         if not text:
             text = str(row.get("description") or "")
-        candidates = extract_candidates(text, hashtags)
+        discovery_queries = _json_list(row.get("discovery_queries_json"))
+        query_candidates = [
+            (normalized, "query")
+            for query in discovery_queries
+            if (normalized := _normalize(query)) and _usable(normalized)
+        ]
+        candidates = list(query_candidates)
+        if candidate_mode == "all":
+            candidates.extend(extract_candidates(text, hashtags))
+        candidates = list(dict.fromkeys(candidates))
         if not candidates:
             continue
 
@@ -169,15 +181,11 @@ def rank_keywords(
             "top1_view_concentration": round(concentration, 6),
             "confidence": round(confidence, 6),
             "raw_score": round(raw_score, 6),
-            "query_ready": (
-                videos >= max(2, minimum)
-                and creators >= 2
-                or aggregate["views_total"] >= 250_000
-            ),
+            "query_ready": videos >= max(2, minimum) and creators >= 2,
             "examples": examples,
         })
 
-    type_priority = {"keyword": 0, "hashtag": 1, "phrase": 2}
+    type_priority = {"keyword": 0, "hashtag": 1, "phrase": 2, "query": 3}
     ranked.sort(
         key=lambda value: (
             value["raw_score"],
@@ -253,7 +261,7 @@ def _new_accumulator() -> Dict[str, Any]:
 
 
 def _preferred_type(current: str, incoming: str) -> str:
-    priority = {"keyword": 0, "phrase": 1, "hashtag": 2}
+    priority = {"keyword": 0, "phrase": 1, "hashtag": 2, "query": 3}
     return incoming if priority.get(incoming, 0) > priority.get(current, 0) else current
 
 

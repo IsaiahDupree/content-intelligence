@@ -88,9 +88,9 @@ class MarketTapeConfig:
     topics: List[str] = field(default_factory=lambda: _csv(
         "MARKET_TAPE_TOPICS",
         (
-            "ai automation,saas growth,content creation,digital marketing,creator economy,"
-            "ai agents,local ai,ai phone agents,marketing automation,saas marketing,"
-            "founder systems,creator tools,social media growth,short form video,content strategy"
+            "live sports,music releases,celebrity news,movie trailers,television,video games,"
+            "breaking news,politics,weather,food,consumer products,finance,technology,science,"
+            "health,travel,pets,comedy,relationships,true crime,fashion,cars"
         ),
     ))
     adaptive_topics_enabled: bool = field(default_factory=lambda: _bool(

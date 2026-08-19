@@ -27,6 +27,7 @@ def main() -> int:
     subparsers.add_parser("status")
     sync = subparsers.add_parser("sync")
     sync.add_argument("--force", action="store_true", help="Retry backed-off outbox rows immediately")
+    sync.add_argument("--reconcile", action="store_true", help="Queue local records missing from the outbox")
     sync.add_argument("--drain", action="store_true", help="Drain bounded batches until empty or blocked")
     sync.add_argument("--max-batches", type=int, default=250)
     subparsers.add_parser("doctor")
@@ -40,6 +41,10 @@ def main() -> int:
     keywords.add_argument("--limit", type=int, default=100)
     keywords.add_argument("--window-hours", type=int, default=168)
     keywords.add_argument("--min-videos", type=int, default=1)
+    query_frontier = subparsers.add_parser("query-frontier")
+    query_frontier.add_argument("--limit", type=int, default=100)
+    query_frontier.add_argument("--window-hours", type=int, default=168)
+    query_frontier.add_argument("--min-videos", type=int, default=2)
     predictions = subparsers.add_parser("predictions")
     predictions.add_argument("--subject-type", choices=["video", "trend"])
     predictions.add_argument("--limit", type=int, default=100)
@@ -63,11 +68,14 @@ def main() -> int:
     if args.command == "status":
         return _print(store.status())
     if args.command == "sync":
+        reconciled = store.enqueue_missing_for_sync() if args.reconcile else 0
         if args.force:
             store.make_outbox_due()
         sink = SupabaseSink(config, store)
         try:
-            return _print(sink.drain(args.max_batches) if args.drain else sink.flush())
+            result = sink.drain(args.max_batches) if args.drain else sink.flush()
+            result["reconciled_records"] = reconciled
+            return _print(result)
         finally:
             sink.close()
     if args.command == "videos":
@@ -77,6 +85,14 @@ def main() -> int:
     if args.command == "keywords":
         return _print({
             "keywords": store.keyword_signals(
+                args.limit,
+                args.window_hours,
+                args.min_videos,
+            )
+        })
+    if args.command == "query-frontier":
+        return _print({
+            "queries": store.discovery_query_signals(
                 args.limit,
                 args.window_hours,
                 args.min_videos,

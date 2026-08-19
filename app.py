@@ -4,6 +4,7 @@ Port: 6006
 """
 import os
 import sys
+from importlib.util import find_spec
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -33,19 +34,22 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# Try to import OpenAI client
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = bool(OPENAI_API_KEY)
-except ImportError:
-    OPENAI_AVAILABLE = False
+# Provider SDKs are intentionally lazy. Importing their generated type trees can
+# delay the health and Market Tape endpoints by minutes on launchd's cold start.
+OPENAI_AVAILABLE = bool(OPENAI_API_KEY and find_spec("openai"))
+GROQ_AVAILABLE = bool(GROQ_API_KEY and find_spec("groq"))
 
-# Try to import Groq client
-try:
+
+def get_openai_client():
+    from openai import OpenAI
+
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_groq_client():
     from groq import Groq
-    GROQ_AVAILABLE = bool(GROQ_API_KEY)
-except ImportError:
-    GROQ_AVAILABLE = False
+
+    return Groq(api_key=GROQ_API_KEY)
 
 # Import real service implementations
 try:
@@ -77,12 +81,10 @@ except Exception as e:
 
 try:
     from services.analysis.vision_analyzer_standalone import get_vision_analyzer
-    VISION_ANALYZER = get_vision_analyzer()
-    VISION_AVAILABLE = VISION_ANALYZER.is_enabled()
+    VISION_AVAILABLE = bool(OPENAI_API_KEY and find_spec("openai"))
 except Exception as e:
     print(f"VisionAnalyzer not available: {e}")
     VISION_AVAILABLE = False
-    VISION_ANALYZER = None
 
 SERVICE_NAME = "content-intelligence"
 SERVICE_VERSION = "1.1.0"
@@ -493,7 +495,7 @@ Return ONLY the titles, one per line, numbered 1-{count}."""
         
         # Try Groq first (fast and free)
         if GROQ_AVAILABLE:
-            client = Groq(api_key=GROQ_API_KEY)
+            client = get_groq_client()
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
@@ -505,7 +507,7 @@ Return ONLY the titles, one per line, numbered 1-{count}."""
         
         # Fallback to OpenAI
         elif OPENAI_AVAILABLE:
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = get_openai_client()
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
@@ -561,7 +563,7 @@ Return ONLY the caption, nothing else."""
         hashtags = []
         
         if GROQ_AVAILABLE:
-            client = Groq(api_key=GROQ_API_KEY)
+            client = get_groq_client()
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
@@ -570,7 +572,7 @@ Return ONLY the caption, nothing else."""
             )
             caption = response.choices[0].message.content.strip()
         elif OPENAI_AVAILABLE:
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = get_openai_client()
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
@@ -726,9 +728,9 @@ def analyze_vision():
     if not image_path and not image_base64:
         return jsonify({"error": "image_path or image_base64 required"}), 400
     
-    if VISION_AVAILABLE and VISION_ANALYZER:
+    if VISION_AVAILABLE:
         try:
-            result = VISION_ANALYZER.analyze(
+            result = get_vision_analyzer().analyze(
                 image_path=image_path,
                 image_base64=image_base64,
                 analysis_type=analysis_type

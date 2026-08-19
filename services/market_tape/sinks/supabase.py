@@ -17,6 +17,9 @@ from ..store import MarketTapeStore
 ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
     "creator": ("actp_market_creators", "creator_id", True),
     "video": ("actp_market_videos", "video_id", True),
+    "discovery_attribution": (
+        "actp_market_discovery_attributions", "attribution_key", False,
+    ),
     "observation": ("actp_market_observations", "observation_key", False),
     "genome": ("actp_content_genomes", "video_id", True),
     "trend": ("actp_trends", "trend_id", True),
@@ -35,6 +38,7 @@ ENTITY_SYNC_ORDER = (
     "trend",
     "run",
     "video",
+    "discovery_attribution",
     "observation",
     "genome",
     "membership",

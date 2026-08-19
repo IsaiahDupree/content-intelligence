@@ -18,13 +18,23 @@ from .math import age_bucket, concentration, counter_motion, poll_interval_secon
 from .models import MarketContent, SourceReceipt, isoformat, stable_hash, utc_now
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+-]*", re.IGNORECASE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how",
     "i", "in", "is", "it", "my", "of", "on", "or", "our", "that", "the", "this", "to",
     "was", "we", "what", "when", "where", "why", "with", "you", "your",
 }
+
+
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Commit or roll back a context block, then release its file descriptor."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
 
 
 class MarketTapeStore:
@@ -35,7 +45,11 @@ class MarketTapeStore:
         self.initialize()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.config.db_path, timeout=30.0)
+        connection = sqlite3.connect(
+            self.config.db_path,
+            timeout=30.0,
+            factory=ClosingSQLiteConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -85,6 +99,35 @@ class MarketTapeStore:
                     FOREIGN KEY(creator_id) REFERENCES mt_creators(creator_id),
                     UNIQUE(platform, external_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS mt_discovery_attributions (
+                    attribution_key TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL,
+                    surface TEXT NOT NULL DEFAULT '',
+                    query TEXT NOT NULL,
+                    context_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_discovery_attribution_query_idx
+                    ON mt_discovery_attributions(query, discovered_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_discovery_attribution_video_idx
+                    ON mt_discovery_attributions(video_id, discovered_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_discovery_attributions_no_update
+                BEFORE UPDATE ON mt_discovery_attributions
+                BEGIN
+                    SELECT RAISE(ABORT, 'discovery attributions are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_discovery_attributions_no_delete
+                BEFORE DELETE ON mt_discovery_attributions
+                BEGIN
+                    SELECT RAISE(ABORT, 'discovery attributions are append-only');
+                END;
 
                 CREATE TABLE IF NOT EXISTS mt_raw_objects (
                     raw_sha256 TEXT PRIMARY KEY,
@@ -483,6 +526,16 @@ class MarketTapeStore:
                 records.append(("creator", row["creator_id"], row))
             for row in _select_in(connection, "mt_videos", "video_id", video_ids):
                 records.append(("video", row["video_id"], row))
+            for row in connection.execute(
+                "SELECT * FROM mt_discovery_attributions WHERE run_id = ?",
+                (run_id,),
+            ).fetchall():
+                payload = dict(row)
+                records.append((
+                    "discovery_attribution",
+                    payload["attribution_key"],
+                    payload,
+                ))
             for row in observations:
                 row.pop("observation_id", None)
                 records.append(("observation", row["observation_key"], row))
@@ -551,6 +604,102 @@ class MarketTapeStore:
                            synced_at = NULL, error_detail = ''""",
                     (entity_type, entity_key, json.dumps(payload, sort_keys=True, default=str), created_at, created_at),
                 )
+        return len(records)
+
+    def enqueue_missing_for_sync(self) -> int:
+        """Queue local canonical records that never entered the durable outbox."""
+        created_at = isoformat(utc_now())
+        records: List[Tuple[str, str, Dict[str, Any]]] = []
+        with self.connect() as connection:
+            existing: Dict[str, set[str]] = {}
+            for row in connection.execute(
+                "SELECT entity_type, entity_key FROM mt_sync_outbox"
+            ).fetchall():
+                existing.setdefault(str(row["entity_type"]), set()).add(str(row["entity_key"]))
+
+            def add(entity_type: str, entity_key: str, payload: Dict[str, Any]) -> None:
+                keys = existing.setdefault(entity_type, set())
+                if entity_key in keys:
+                    return
+                keys.add(entity_key)
+                records.append((entity_type, entity_key, payload))
+
+            for row in connection.execute("SELECT * FROM mt_creators").fetchall():
+                payload = dict(row)
+                add("creator", payload["creator_id"], payload)
+            for row in connection.execute("SELECT * FROM mt_trends").fetchall():
+                payload = dict(row)
+                add("trend", payload["trend_id"], payload)
+            for row in connection.execute("SELECT * FROM mt_collection_runs").fetchall():
+                payload = dict(row)
+                add("run", payload["run_id"], payload)
+            for row in connection.execute("SELECT * FROM mt_videos").fetchall():
+                payload = dict(row)
+                add("video", payload["video_id"], payload)
+            for row in connection.execute("SELECT * FROM mt_discovery_attributions").fetchall():
+                payload = dict(row)
+                add("discovery_attribution", payload["attribution_key"], payload)
+            for row in connection.execute("SELECT * FROM mt_market_observations").fetchall():
+                payload = dict(row)
+                payload.pop("observation_id", None)
+                add("observation", payload["observation_key"], payload)
+            for row in connection.execute("SELECT * FROM mt_content_genomes").fetchall():
+                payload = dict(row)
+                add("genome", payload["video_id"], payload)
+            for row in connection.execute("SELECT * FROM mt_trend_memberships").fetchall():
+                payload = dict(row)
+                add("membership", f"{payload['trend_id']}|{payload['video_id']}", payload)
+            for row in connection.execute("SELECT * FROM mt_trend_observations").fetchall():
+                payload = dict(row)
+                payload.pop("trend_observation_id", None)
+                key = stable_hash({
+                    "trend_id": payload["trend_id"],
+                    "observed_at": payload["observed_at"],
+                })
+                payload["trend_observation_key"] = key
+                add("trend_observation", key, payload)
+            for row in connection.execute("SELECT * FROM mt_predictions").fetchall():
+                payload = dict(row)
+                payload.pop("prediction_id", None)
+                key = stable_hash({
+                    "subject_type": payload["subject_type"],
+                    "subject_id": payload["subject_id"],
+                    "model_version": payload["model_version"],
+                    "predicted_at": payload["predicted_at"],
+                    "horizon": payload["horizon"],
+                })
+                payload["prediction_key"] = key
+                add("prediction", key, payload)
+            for row in connection.execute("SELECT * FROM mt_source_receipts").fetchall():
+                payload = dict(row)
+                payload.pop("receipt_id", None)
+                key = stable_hash({
+                    "run_id": payload["run_id"],
+                    "source_id": payload["source_id"],
+                    "started_at": payload["started_at"],
+                    "finished_at": payload["finished_at"],
+                })
+                payload["receipt_key"] = key
+                add("receipt", key, payload)
+            for row in connection.execute("SELECT * FROM mt_source_health").fetchall():
+                payload = dict(row)
+                add("source_health", payload["source_id"], payload)
+
+            connection.executemany(
+                """INSERT INTO mt_sync_outbox(
+                       entity_type, entity_key, payload_json, created_at, next_attempt_at
+                   ) VALUES(?, ?, ?, ?, ?)""",
+                [
+                    (
+                        entity_type,
+                        entity_key,
+                        json.dumps(payload, sort_keys=True, default=str),
+                        created_at,
+                        created_at,
+                    )
+                    for entity_type, entity_key, payload in records
+                ],
+            )
         return len(records)
 
     def pending_outbox(
@@ -770,6 +919,7 @@ class MarketTapeStore:
                     item.media_type, item.duration_seconds, run_id,
                 ),
             )
+            self._record_discovery_attributions(connection, item, run_id, observed)
             cursor = connection.execute(
                 """INSERT INTO mt_market_observations(
                        observation_key, run_id, observed_at, wall_clock_date, video_id, creator_id, platform,
@@ -792,6 +942,49 @@ class MarketTapeStore:
                 self._map_trends(connection, item, observed)
                 self._schedule_next(connection, item, age_seconds or 0.0, motion.acceleration > 0.1 or relative_strength >= 2.0)
             return added, not bool(exists)
+
+    def _record_discovery_attributions(
+        self,
+        connection: sqlite3.Connection,
+        item: MarketContent,
+        run_id: str,
+        observed: str,
+    ) -> None:
+        context = item.discovery_context if isinstance(item.discovery_context, dict) else {}
+        raw_queries: List[Any] = []
+        configured_queries = context.get("queries")
+        if isinstance(configured_queries, list):
+            raw_queries.extend(configured_queries)
+        for key in ("query", "topic", "niche"):
+            if context.get(key):
+                raw_queries.append(context[key])
+        queries = list(dict.fromkeys(
+            " ".join(str(value).split())[:200]
+            for value in raw_queries
+            if str(value).strip()
+        ))
+        if not queries:
+            return
+        surface = str(context.get("surface") or context.get("lane") or "")[:100]
+        context_json = json.dumps(context, sort_keys=True, default=str)
+        for query in queries:
+            attribution_key = stable_hash({
+                "run_id": run_id,
+                "video_id": item.video_id,
+                "source_id": item.source_id,
+                "query": query.casefold(),
+            })
+            connection.execute(
+                """INSERT INTO mt_discovery_attributions(
+                       attribution_key, run_id, video_id, source_id, discovered_at,
+                       surface, query, context_json
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(attribution_key) DO NOTHING""",
+                (
+                    attribution_key, run_id, item.video_id, item.source_id, observed,
+                    surface, query, context_json,
+                ),
+            )
 
     def _archive_raw(self, item: MarketContent) -> Tuple[str, str, int]:
         payload = item.raw_payload or {"empty_payload": True, "video_id": item.video_id}
@@ -1382,8 +1575,32 @@ class MarketTapeStore:
     ) -> List[Dict[str, Any]]:
         """Mine fresh query candidates without relying on the configured seed vocabulary."""
 
+        return rank_keywords(
+            self._keyword_signal_rows(),
+            limit=limit,
+            window_hours=window_hours,
+            min_videos=min_videos,
+        )
+
+    def discovery_query_signals(
+        self,
+        limit: int = 100,
+        window_hours: int = 168,
+        min_videos: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Rank exact discovery queries independently from extracted text fragments."""
+
+        return rank_keywords(
+            self._keyword_signal_rows(),
+            limit=limit,
+            window_hours=window_hours,
+            min_videos=min_videos,
+            candidate_mode="queries",
+        )
+
+    def _keyword_signal_rows(self) -> List[Dict[str, Any]]:
         with self.connect() as connection:
-            rows = [dict(row) for row in connection.execute(
+            return [dict(row) for row in connection.execute(
                 """WITH latest AS (
                        SELECT observation.*,
                               ROW_NUMBER() OVER (
@@ -1399,7 +1616,15 @@ class MarketTapeStore:
                           video.title, video.caption, video.description, video.url,
                           latest.observed_at, latest.views, latest.likes, latest.comments,
                           latest.shares, latest.view_velocity,
-                          genome.hashtags_json, observation_counts.observation_count
+                          genome.hashtags_json, observation_counts.observation_count,
+                          COALESCE((
+                              SELECT json_group_array(attribution.query)
+                              FROM (
+                                  SELECT DISTINCT query
+                                  FROM mt_discovery_attributions
+                                  WHERE video_id = video.video_id AND query != ''
+                              ) attribution
+                          ), '[]') AS discovery_queries_json
                    FROM latest
                    JOIN mt_videos video ON video.video_id = latest.video_id
                    JOIN observation_counts ON observation_counts.video_id = latest.video_id
@@ -1407,12 +1632,6 @@ class MarketTapeStore:
                    WHERE latest.row_number = 1 AND video.published_at IS NOT NULL
                    ORDER BY latest.observed_at DESC LIMIT 50000"""
             ).fetchall()]
-        return rank_keywords(
-            rows,
-            limit=limit,
-            window_hours=window_hours,
-            min_videos=min_videos,
-        )
 
     def list_runs(self, limit: int = 50) -> List[Dict[str, Any]]:
         with self.connect() as connection:

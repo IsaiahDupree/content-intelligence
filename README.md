@@ -6,11 +6,11 @@ Content Intelligence now contains two production surfaces: the original UGC form
 
 Market Tape appends real metric observations across YouTube, TikTok, Instagram, X, Facebook, and Threads; archives raw provider payloads; computes velocity, acceleration, relative strength, trends, social candles, and predictions; and records quota, cost, source health, and central-sync receipts.
 
-Discovery is market-led rather than niche-led. YouTube category charts provide a keyword-independent current universe, then the adaptive keyword frontier ranks fresh terms by views/hour, breadth, engagement, repeat observations, freshness, and concentration. Most query capacity follows those measured winners while a bounded fraction remains available for configured exploration topics.
+Discovery is market-led rather than niche-led. YouTube category charts provide a keyword-independent current universe, then the adaptive frontier ranks fresh terms by views/hour, breadth, engagement, repeat observations, freshness, and concentration. Exact external discovery queries are preserved as immutable video lineage and receive their own query-frontier ranking, so a measured Google or platform trend can be expanded without being reduced to generic title fragments. Most query capacity follows measured winners while a bounded fraction rotates across broad market sectors.
 
 The lock-safe local runtime is installed under `~/Library/Application Support/ContentIntelligence`, supervised by launchd, and available at `http://127.0.0.1:6006/api/market-tape/status`.
 
-Full architecture, commands, source states, APIs, safety controls, and current production evidence: [docs/MARKET-TAPE-V1.md](docs/MARKET-TAPE-V1.md).
+Full architecture, commands, source states, APIs, safety controls, and current production evidence: [docs/MARKET-TAPE-V1.md](docs/MARKET-TAPE-V1.md). The current topic-neutral market snapshot is [docs/MARKET-TREND-RESEARCH-2026-08-19.md](docs/MARKET-TREND-RESEARCH-2026-08-19.md).
 
 The local transcript bank turns performance-qualified Market Tape observations into auditable evidence. It downloads source audio to the configured external storage volume, transcribes locally with OpenAI Whisper, saves timestamped transcript JSON, and binds the audio/transcript SHA-256 hashes to the exact append-only metric observation. Cohorts fail closed below five videos, three creators, or 100,000 observed views; script relatability remains explicitly predictive until the published script has real audience outcomes.
 
@@ -25,8 +25,13 @@ Verify the Market Tape software:
 ```bash
 python3 -m pytest tests/test_market_tape.py -q
 python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --min-videos 2
+python3 -m services.market_tape.cli query-frontier --limit 100 --window-hours 168 --min-videos 2
+python3 -m services.market_tape.cli sync --reconcile --force --drain --max-batches 250
+python3 scripts/research_youtube_queries.py --query-file docs/adaptive-query-expansion-2026-08-19.txt --output-dir '/Volumes/My Passport/MarketTape/trend-frontier/manual'
 python3 scripts/backfill_transcript_bank.py --platform youtube --limit 20 --model base --cookies-from-browser chrome --topic 'creator burnout creative struggle content views work'
 ```
+
+`market_tape_app.py` is the lightweight production API entry point used by launchd. It avoids loading the UGC model/provider stack for Market Tape-only health, status, ranking, collection, and sync operations.
 
 Install the hourly resumable backfill worker (20 performance-ranked videos per
 batch; existing artifacts are skipped):

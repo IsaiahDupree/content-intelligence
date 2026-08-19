@@ -15,6 +15,13 @@ from .sinks import SupabaseSink
 from .store import MarketTapeStore
 
 
+AUTONOMOUS_QUERY_NOISE = {
+    "august", "breaking", "breaking news", "breakdown", "cash", "commentary", "family", "friends",
+    "game", "gameplay", "games", "gaming", "highlights", "live", "moments", "movie", "music",
+    "news", "reveal", "season", "trailer", "trailers", "trial", "game highlights august",
+}
+
+
 class MarketTapeCollector:
     def __init__(
         self,
@@ -284,16 +291,31 @@ class MarketTapeCollector:
             return self.config
 
         limit = max(1, min(100, int(self.config.adaptive_topic_limit)))
-        signals = self.store.keyword_signals(
+        text_signals = self.store.keyword_signals(
             limit=limit * 5,
             window_hours=self.config.adaptive_topic_window_hours,
             min_videos=self.config.adaptive_topic_min_videos,
         )
+        query_signals = self.store.discovery_query_signals(
+            limit=limit * 5,
+            window_hours=self.config.adaptive_topic_window_hours,
+            min_videos=self.config.adaptive_topic_min_videos,
+        )
+        by_keyword = {
+            str(signal.get("keyword") or "").casefold(): signal
+            for signal in text_signals
+            if signal.get("keyword")
+        }
+        for signal in query_signals:
+            if signal.get("keyword"):
+                by_keyword[str(signal["keyword"]).casefold()] = signal
+        signals = list(by_keyword.values())
         candidates = [
             signal for signal in signals
             if signal.get("query_ready")
             and int(signal.get("videos_total") or 0) >= 2
             and int(signal.get("creators_total") or 0) >= 2
+            and str(signal.get("keyword") or "").casefold() not in AUTONOMOUS_QUERY_NOISE
         ]
         candidates.sort(key=self._discovery_priority, reverse=True)
         if not candidates:
@@ -385,7 +407,12 @@ class MarketTapeCollector:
         confidence = max(0.0, min(1.0, float(signal.get("confidence") or 0.0)))
         score = max(0.0, float(signal.get("score") or 0.0))
         breadth = min(20, int(signal.get("videos_total") or 0))
-        return score * (0.65 + 0.35 * confidence), confidence, breadth
+        specificity = {
+            "query": 1.15,
+            "phrase": 1.08,
+            "hashtag": 1.04,
+        }.get(str(signal.get("keyword_type") or "keyword"), 1.0)
+        return score * (0.65 + 0.35 * confidence) * specificity, confidence, breadth
 
     @staticmethod
     def _canonical_topic_tokens(value: str) -> set[str]:

@@ -1,9 +1,9 @@
-# Social Market Tape V1
+# Social Market Tape V2
 
 Status: autonomous local production runtime installed
 Service: `content-intelligence`
 Loopback API: `http://127.0.0.1:6006`
-Schema version: `3`
+Schema version: `5`
 Daily unique target: `5,000` UTC-day items
 
 ## Purpose
@@ -28,6 +28,15 @@ provider response
 No AI assistant is required for configuration or execution. Environment configuration, source adapters, scheduler policy, storage, status, and receipts are deterministic software contracts.
 
 Discovery begins with provider charts that do not depend on configured keywords. The tape then mines titles and hashtags from recently published high-performing content and creates an adaptive query frontier. Ranking favors fresh view throughput, p75 and median implied views/hour, creator and platform breadth, engagement, repeated observations, and low single-video concentration. Each signal includes example content and its source URL, making query selection auditable without an LLM.
+
+The checked-in signed-in search runner turns an external demand list or an adaptive frontier export into an auditable batch. Every query receives its own command, elapsed time, state, output path, SHA-256, row count, and error. Completed and partial outputs are eligible for immutable ingest; partial, failed, and timed-out states remain visible so they can be retried without discarding useful rows.
+
+```bash
+python3 scripts/research_youtube_queries.py \
+  --query-file docs/adaptive-query-expansion-2026-08-19.txt \
+  --output-dir '/Volumes/My Passport/MarketTape/trend-frontier/manual' \
+  --limit 5 --candidate-multiplier 2 --max-age-days 3 --workers 3
+```
 
 ## Performance-bound local transcript bank
 
@@ -111,6 +120,34 @@ Today the tape acquired 2,280 unique items at a recorded provider cost of `$0.00
 
 Discovery run `mt-run-820747b0-2712-471d-94ff-6f2af60537c6` accepted 2,177 provider items and completed the full mapping, trend, prediction, receipt, and outbox loop. After deployment, unattended recheck run `mt-run-4ed4d78c-d5d0-4b7b-ba7b-2a86ca97a745` recovered from an initial API-start race, completed under launchd, and refreshed the heartbeat. Five-platform browser job `job_1787107045867_2psds9` then completed X, Threads, Instagram, Facebook, and TikTok in one 299.9-second coordinated run. It returned 24 X items and 34 Threads items while the other three signed-in pages returned measured zero-item results. Recheck `mt-run-aa241df0-26cf-439d-a3ac-d8f888d4403e` promoted those artifacts without provider spend. The retry, coordination, and promotion behavior is now part of the scheduler software.
 
+### Latest certified live state: 2026-08-19 07:13 UTC
+
+The production spool reported after four market-led query waves and relevance-gated browser archive promotion:
+
+| Record | Live count |
+|---|---:|
+| Canonical content items | 7,410 |
+| Market observations | 7,677 |
+| Canonical creators | 5,691 |
+| Trend objects | 20,585 |
+| Trend observations | 20,779 |
+| Versioned predictions | 26,622 |
+| Due trajectory polls | 4,111 |
+
+Today the tape has acquired 4,030 unique items at a recorded provider cost of `$0.00`:
+
+| Platform | Acquired today | Configured lane target | Current result |
+|---|---:|---:|---|
+| YouTube | 3,270 | 2,500 | Target exceeded through charts plus signed-in demand expansion |
+| TikTok | 24 | 1,000 | Relevance gate rejected most historical browser rows; API access remains limited |
+| Instagram | 31 | 750 | URL discovery live; caption/metric evidence is insufficient for promotion |
+| X | 225 | 500 | Controlled-browser evidence live at 56.2% whole-archive precision |
+| Facebook | 0 | 125 | No usable current evidence |
+| Threads | 480 | 125 | Target exceeded; whole-archive precision 72.7% |
+| **Total** | **4,030** | **5,000** | **970-item shortfall remains explicit** |
+
+Archive bootstrap `mt-run-5ca422be-36c3-4e91-9e42-68e4a14af819` examined 2,041 deduplicated browser candidates, wrote 562 observations, added 557 unique content items, and produced 1,515 trend observations plus 2,077 predictions. Every browser row was evaluated by `niche-token-overlap-v1`; stale and off-topic rows were rejected rather than counted. The resulting 11,922 outbox records were synchronized in three bounded batches with zero failures. A full parity audit then found 811 historical local entities that predated outbox enrollment; `sync --reconcile` queued and synchronized only those missing entities in one batch, leaving zero pending records.
+
 ### Certified central mirror: 2026-08-19 04:10 UTC
 
 Migration `market_tape_v1` is live on Supabase project `ivhfuhxorppptyuofbgq`.
@@ -139,6 +176,28 @@ After the drain and final runtime deployment, supervised recheck
 API, synchronized 14 changed entities with zero failures, and left the central
 outbox at zero. Its heartbeat records the deployed API process and confirms the
 15-minute launchd loop is operating on the production spool.
+
+### Latest central mirror: 2026-08-19 07:13 UTC
+
+The V2 verifier certified all 12 relations, RLS on every table, zero unexpected anonymous/authenticated policies, and append-only triggers on observations, trend observations, and discovery attributions. Authoritative Management API counts after the final drain were:
+
+| Supabase table | Rows |
+|---|---:|
+| `actp_market_creators` | 5,691 |
+| `actp_market_videos` | 7,410 |
+| `actp_market_observations` | 7,677 |
+| `actp_content_genomes` | 7,410 |
+| `actp_trends` | 20,585 |
+| `actp_trend_memberships` | 34,160 |
+| `actp_trend_observations` | 20,779 |
+| `actp_market_collection_runs` | 49 |
+| `actp_market_source_receipts` | 285 |
+| `actp_market_source_health` | 14 |
+| `actp_market_predictions` | 26,622 |
+| `actp_market_discovery_attributions` | 3,308 |
+| **Total** | **133,990** |
+
+Launchd retry run `mt-run-888fabdb-514e-49d7-a61a-aedb59dff50f` completed a real unattended recheck after the API startup race, synchronized 751 changed entities with zero failures, refreshed the heartbeat under the deployed API PID, and left local/central parity intact.
 
 ## Source Registry
 
@@ -261,7 +320,7 @@ The frontier is recomputed from immutable observations before each discovery cyc
 ```text
 broad category charts
   -> fresh content cohort
-  -> title and hashtag candidates
+  -> exact discovery-query attribution + title and hashtag candidates
   -> views/hour and freshness scoring
   -> breadth and concentration checks
   -> duplicate-topic suppression
@@ -270,7 +329,9 @@ broad category charts
   -> next frontier iteration
 ```
 
-Defaults use a seven-day window, require at least two independent videos and two independent creators for automatic querying, select at most 30 terms, and reserve 20% of slots for rotating configured exploration topics. Query priority combines performance with evidence confidence so a repeatable multi-creator signal outranks a one-off spike. Canonical spelling overlap and shared top-video evidence suppress variants from consuming multiple frontier slots. Single-video and single-creator terms remain visible in the read API with lower confidence but do not control autonomous queries under the default gate.
+Defaults use a seven-day window, require at least two independent videos and two independent creators for automatic querying, select at most 30 terms, and reserve 20% of slots for rotating broad-sector exploration. Query priority combines performance with evidence confidence and a specificity bonus, so an exact measured event query can outrank a generic word. Generic navigation terms such as `live`, `news`, `trailer`, `breakdown`, and `highlights` remain visible for analysis but cannot consume autonomous query slots. Canonical spelling overlap and shared top-video evidence suppress variants from consuming multiple frontier slots. Single-video and single-creator terms remain visible with lower confidence but are never query-ready.
+
+Every provider or signed-in search can attach `query`, `queries`, `topic`, or `niche` discovery context. Market Tape writes one immutable `mt_discovery_attributions` record per query/video/run, mirrors it to `actp_market_discovery_attributions`, and computes an exact-query frontier independently from title fragments. This closes the loop: a broad chart or external trend yields a named query; that query yields videos; their measured performance determines whether the same query expands on the next cycle.
 
 Browser expansion uses the research service's explicit `trend` query mode. That mode searches the measured term, exact phrase, and platform-native hashtag or current-event variants; it does not append business-niche suffixes such as `tips`, `strategy`, or `community`. On archive ingest, `niche-token-overlap-v1` independently rejects carryover from a prior browser query. Each source receipt reports evaluated, accepted, rejected, unscoped, and precision counts under `metadata.archive_qc`, so raw browser output cannot silently become validated trend evidence.
 
@@ -307,6 +368,7 @@ python3 -m services.market_tape.cli videos --limit 100
 python3 -m services.market_tape.cli videos --platform youtube --limit 100
 python3 -m services.market_tape.cli trends --limit 100
 python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --min-videos 2
+python3 -m services.market_tape.cli query-frontier --limit 100 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli predictions --subject-type trend --limit 100
 python3 -m services.market_tape.cli candles --window-minutes 15 --limit 96
 ```
@@ -315,13 +377,16 @@ Equivalent read API:
 
 ```text
 GET /api/market-tape/keywords?limit=100&window_hours=168&min_videos=2
+GET /api/market-tape/query-frontier?limit=100&window_hours=168&min_videos=2
 ```
 
 Retry or drain central sync after the target schema is authorized:
 
 ```bash
-python3 -m services.market_tape.cli sync --force --drain --max-batches 250
+python3 -m services.market_tape.cli sync --reconcile --force --drain --max-batches 250
 ```
+
+`--reconcile` queues only canonical local entities that never entered the durable outbox. This repairs historical pre-outbox gaps without replaying already-synchronized rows.
 
 Validate, inspect, or apply the shared Supabase schema:
 
@@ -336,14 +401,15 @@ python3 scripts/market_tape_migration.py counts --project-ref ivhfuhxorppptyuofb
 `apply` uses the official Supabase Management API and requires
 `SUPABASE_ACCESS_TOKEN` with `database_write` permission. It refuses to run if
 the explicit project ref differs from the project encoded in `SUPABASE_URL`.
-The canonical SQL remains `migrations/market_tape_v1.sql`; print that exact
-checked-in artifact for an authorized SQL Editor session with:
+The migration manager applies the idempotent V1 base schema followed by
+`migrations/market_tape_v2_discovery_attributions.sql`; print the exact
+combined checked-in SQL for an authorized SQL Editor session with:
 
 ```bash
 python3 scripts/market_tape_migration.py sql
 ```
 
-`status` probes all 11 PostgREST table contracts with the service-role
+`status` probes all 12 PostgREST table contracts with the service-role
 credential. `verify` uses a read-only Management API query to certify relation,
 RLS, policy, and append-only trigger state. `counts` uses the same read-only
 path to return an authoritative row-count receipt. None print credentials. The
@@ -366,10 +432,11 @@ spool at `data/market-tape.sqlite3`; always inspect `database_path` before a
 production operation.
 
 Database owners can additionally run the checked-in read-only catalog audit at
-`migrations/verify_market_tape_v1.sql`. It reports relation existence, RLS,
+`migrations/verify_market_tape_v2.sql`. It reports relation existence, RLS,
 policy count, and trigger names for every Market Tape table. The expected state
-is 11 existing relations with RLS enabled, zero anon/authenticated policies,
-and append-only triggers on the two observation tables.
+is 12 existing relations with RLS enabled, zero anon/authenticated policies,
+and append-only triggers on observations, trend observations, and discovery
+attributions.
 
 Install or update the private runtime and LaunchAgents:
 
@@ -407,6 +474,8 @@ Read-only routes:
 | GET | `/api/market-tape/sources` | Latest state per source lane |
 | GET | `/api/market-tape/videos` | Latest canonical content and observation state |
 | GET | `/api/market-tape/trends` | Current trend objects and strengths |
+| GET | `/api/market-tape/keywords` | Evidence-ranked title, hashtag, phrase, and exact-query terms |
+| GET | `/api/market-tape/query-frontier` | Exact discovery queries ranked independently from text fragments |
 | GET | `/api/market-tape/runs` | Collection receipts |
 | GET | `/api/market-tape/predictions` | Versioned video and trend predictions |
 | GET | `/api/market-tape/candles` | Delta-based social candles |
@@ -438,11 +507,15 @@ They are not yet outcome-calibrated learned temporal models. Outcome evaluation 
 ## Verification
 
 ```bash
-python3 -m pytest tests/test_market_tape.py -q
+python3 -m pytest \
+  tests/test_market_tape.py \
+  tests/test_youtube_query_research.py \
+  tests/test_health.py \
+  tests/test_api_e2e.py -q
 python3 -m json.tool Sources/OpsConsole/Resources/content-intelligence-contract.json
 ```
 
-The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, adaptive polling, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, partial-batch preservation, provider receipts, spend accounting, circuit breakers, local archive normalization, dependency-ordered transactional outbox behavior, Management API verification, API authorization, and automatic tick selection. The repository currently passes 99 tests, including 22 Market Tape integration tests.
+The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, adaptive polling, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, partial-batch preservation, provider receipts, spend accounting, circuit breakers, local archive normalization and relevance QC, exact-query lineage, dependency-ordered transactional outbox behavior, central parity reconciliation, Management API verification, API authorization, and automatic tick selection. The focused production suite currently passes all 52 tests.
 
 ## Remaining Work
 
