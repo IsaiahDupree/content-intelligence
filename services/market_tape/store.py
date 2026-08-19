@@ -485,14 +485,25 @@ class MarketTapeStore:
                 )
         return len(records)
 
-    def pending_outbox(self, limit: int) -> List[Dict[str, Any]]:
+    def pending_outbox(
+        self,
+        limit: int,
+        entity_order: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        order = tuple(entity_order or ())
+        if order:
+            rank_sql = " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(order))
+            order_sql = f"CASE entity_type {rank_sql} ELSE {len(order)} END, outbox_id ASC"
+        else:
+            order_sql = "outbox_id ASC"
+        row_limit = min(max(1, limit), 5000)
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT outbox_id, entity_type, entity_key, payload_json, attempts
-                   FROM mt_sync_outbox
-                   WHERE synced_at IS NULL AND next_attempt_at <= ?
-                   ORDER BY outbox_id ASC LIMIT ?""",
-                (isoformat(utc_now()), min(max(1, limit), 5000)),
+                f"""SELECT outbox_id, entity_type, entity_key, payload_json, attempts
+                    FROM mt_sync_outbox
+                    WHERE synced_at IS NULL AND next_attempt_at <= ?
+                    ORDER BY {order_sql} LIMIT ?""",
+                (isoformat(utc_now()), *order, row_limit),
             ).fetchall()
         output = []
         for row in rows:

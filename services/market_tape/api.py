@@ -110,6 +110,9 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
                 store.make_outbox_due()
             sink = SupabaseSink(resolved, store)
             try:
+                if body.get("drain") is True:
+                    max_batches = _limit(body.get("max_batches"), 250, maximum=1000)
+                    return sink.drain(max_batches)
                 return sink.flush()
             finally:
                 sink.close()

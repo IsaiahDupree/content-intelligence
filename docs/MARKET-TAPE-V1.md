@@ -73,6 +73,35 @@ Today the tape acquired 2,280 unique items at a recorded provider cost of `$0.00
 
 Discovery run `mt-run-820747b0-2712-471d-94ff-6f2af60537c6` accepted 2,177 provider items and completed the full mapping, trend, prediction, receipt, and outbox loop. After deployment, unattended recheck run `mt-run-4ed4d78c-d5d0-4b7b-ba7b-2a86ca97a745` recovered from an initial API-start race, completed under launchd, and refreshed the heartbeat. Five-platform browser job `job_1787107045867_2psds9` then completed X, Threads, Instagram, Facebook, and TikTok in one 299.9-second coordinated run. It returned 24 X items and 34 Threads items while the other three signed-in pages returned measured zero-item results. Recheck `mt-run-aa241df0-26cf-439d-a3ac-d8f888d4403e` promoted those artifacts without provider spend. The retry, coordination, and promotion behavior is now part of the scheduler software.
 
+### Certified central mirror: 2026-08-19 04:10 UTC
+
+Migration `market_tape_v1` is live on Supabase project `ivhfuhxorppptyuofbgq`.
+The read-only catalog verifier certified all 11 relations, RLS on every table,
+zero anon/authenticated policies, and both append-only observation triggers.
+The developer and launchd-supervised outboxes were drained to zero after a
+5,000-row smoke batch. The central mirror then reported:
+
+| Supabase table | Rows |
+|---|---:|
+| `actp_market_creators` | 4,174 |
+| `actp_market_videos` | 5,660 |
+| `actp_market_observations` | 5,778 |
+| `actp_content_genomes` | 5,660 |
+| `actp_trends` | 15,437 |
+| `actp_trend_memberships` | 26,010 |
+| `actp_trend_observations` | 16,720 |
+| `actp_market_collection_runs` | 28 |
+| `actp_market_source_receipts` | 183 |
+| `actp_market_source_health` | 13 |
+| `actp_market_predictions` | 21,372 |
+| **Total** | **101,035** |
+
+After the drain and final runtime deployment, supervised recheck
+`mt-run-ea49d1f8-23a3-4445-b62e-2af900e02424` completed through the loopback
+API, synchronized 14 changed entities with zero failures, and left the central
+outbox at zero. Its heartbeat records the deployed API process and confirms the
+15-minute launchd loop is operating on the production spool.
+
 ## Source Registry
 
 Every lane implements the same `MarketSource` contract and returns a `SourceReceipt`. A lane is never deleted because it is temporarily unavailable.
@@ -145,7 +174,7 @@ Source remains in this Git repository. The installers deploy both collector and 
 
 The local SQLite spool is authoritative while disconnected. Database triggers reject updates and deletes to market and trend observations. Raw payloads are gzip-compressed and content-addressed by SHA-256.
 
-The Supabase sink uses a transactional outbox. Central sync failure does not discard or stop local collection. The shared target project currently lacks the `actp_market_*` tables, so the outbox is intentionally degraded and pending until `migrations/market_tape_v1.sql` is applied to the authorized target project.
+The Supabase sink uses a transactional outbox. Central sync failure does not discard or stop local collection. The shared target schema is live and verified. Sink batches use a fixed dependency order so creators precede videos, trends precede memberships and trend observations, and collection runs precede source receipts even when a batch begins in the middle of a run's outbox records.
 
 ## Autonomous Scheduling
 
@@ -223,11 +252,59 @@ python3 -m services.market_tape.cli predictions --subject-type trend --limit 100
 python3 -m services.market_tape.cli candles --window-minutes 15 --limit 96
 ```
 
-Retry central sync only after the target schema is authorized:
+Retry or drain central sync after the target schema is authorized:
 
 ```bash
-python3 -m services.market_tape.cli sync --force
+python3 -m services.market_tape.cli sync --force --drain --max-batches 250
 ```
+
+Validate, inspect, or apply the shared Supabase schema:
+
+```bash
+python3 scripts/market_tape_migration.py validate
+python3 scripts/market_tape_migration.py status
+python3 scripts/market_tape_migration.py apply --project-ref ivhfuhxorppptyuofbgq
+python3 scripts/market_tape_migration.py verify --project-ref ivhfuhxorppptyuofbgq
+python3 scripts/market_tape_migration.py counts --project-ref ivhfuhxorppptyuofbgq
+```
+
+`apply` uses the official Supabase Management API and requires
+`SUPABASE_ACCESS_TOKEN` with `database_write` permission. It refuses to run if
+the explicit project ref differs from the project encoded in `SUPABASE_URL`.
+The canonical SQL remains `migrations/market_tape_v1.sql`; print that exact
+checked-in artifact for an authorized SQL Editor session with:
+
+```bash
+python3 scripts/market_tape_migration.py sql
+```
+
+`status` probes all 11 PostgREST table contracts with the service-role
+credential. `verify` uses a read-only Management API query to certify relation,
+RLS, policy, and append-only trigger state. `counts` uses the same read-only
+path to return an authoritative row-count receipt. None print credentials. The
+drain command processes bounded configured batches, stops when the queue is
+empty or cannot make progress, and returns aggregate batch, success, failure,
+and pending counts.
+
+To operate on the installed production spool from the source checkout, point
+the CLI at the private runtime environment explicitly:
+
+```bash
+MARKET_TAPE_ENV_FILES="$HOME/Library/Application Support/ContentIntelligence/runtime/.env.market-tape" \
+  python3 -m services.market_tape.cli status
+MARKET_TAPE_ENV_FILES="$HOME/Library/Application Support/ContentIntelligence/runtime/.env.market-tape" \
+  python3 -m services.market_tape.cli sync --force --drain --max-batches 250
+```
+
+Without `MARKET_TAPE_ENV_FILES`, source-tree commands can target the developer
+spool at `data/market-tape.sqlite3`; always inspect `database_path` before a
+production operation.
+
+Database owners can additionally run the checked-in read-only catalog audit at
+`migrations/verify_market_tape_v1.sql`. It reports relation existence, RLS,
+policy count, and trigger names for every Market Tape table. The expected state
+is 11 existing relations with RLS enabled, zero anon/authenticated policies,
+and append-only triggers on the two observation tables.
 
 Install or update the private runtime and LaunchAgents:
 
@@ -300,16 +377,15 @@ python3 -m pytest tests/test_market_tape.py -q
 python3 -m json.tool Sources/OpsConsole/Resources/content-intelligence-contract.json
 ```
 
-The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, adaptive polling, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, partial-batch preservation, provider receipts, spend accounting, circuit breakers, local archive normalization, transactional outbox behavior, API authorization, and automatic tick selection. The repository currently passes 91 tests, including 15 Market Tape integration tests.
+The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, adaptive polling, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, partial-batch preservation, provider receipts, spend accounting, circuit breakers, local archive normalization, dependency-ordered transactional outbox behavior, Management API verification, API authorization, and automatic tick selection. The repository currently passes 99 tests, including 22 Market Tape integration tests.
 
 ## Remaining Work
 
-1. Apply `migrations/market_tape_v1.sql` to the authorized shared Supabase project and drain the durable outbox.
-2. Certify one complete 5,000-unique UTC production day and tune per-platform targets from observed capacity.
-3. Restore or obtain valid authorized TikTok, Instagram, X, Facebook, and Threads provider access where platform policy permits.
-4. Add transcript, visual, audio, and embedding workers to populate the existing content-genome contract.
-5. Add outcome labels, backtesting, calibration, and learned temporal predictors.
-6. Add ClickHouse and vector storage when local observation volume justifies separation from the control-plane spool.
-7. Feed qualified emerging and breakout trends into the experiment planner without authorizing generation or publishing automatically.
+1. Certify one complete 5,000-unique UTC production day and tune per-platform targets from observed capacity.
+2. Restore or obtain valid authorized TikTok, Instagram, X, Facebook, and Threads provider access where platform policy permits.
+3. Add transcript, visual, audio, and embedding workers to populate the existing content-genome contract.
+4. Add outcome labels, backtesting, calibration, and learned temporal predictors.
+5. Add ClickHouse and vector storage when local observation volume justifies separation from the control-plane spool.
+6. Feed qualified emerging and breakout trends into the experiment planner without authorizing generation or publishing automatically.
 
 The runtime continues collecting and rechecking while these gaps remain visible.

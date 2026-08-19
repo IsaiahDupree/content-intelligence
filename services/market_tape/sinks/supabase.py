@@ -28,6 +28,22 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
     "prediction": ("actp_market_predictions", "prediction_key", False),
 }
 
+# A batch can begin in the middle of a run's outbox records. Always process parent
+# tables before dependent tables instead of relying on the first row's entity type.
+ENTITY_SYNC_ORDER = (
+    "creator",
+    "trend",
+    "run",
+    "video",
+    "observation",
+    "genome",
+    "membership",
+    "trend_observation",
+    "prediction",
+    "receipt",
+    "source_health",
+)
+
 
 class SupabaseSink:
     sink_id = "supabase"
@@ -70,14 +86,26 @@ class SupabaseSink:
             self.store.save_sink_health("blocked_credential", pending, detail)
             return {"state": "blocked_credential", "synced": 0, "failed": 0, "pending": pending}
 
-        rows = self.store.pending_outbox(limit or self.config.supabase_sync_batch_size)
+        rows = self.store.pending_outbox(
+            limit or self.config.supabase_sync_batch_size,
+            entity_order=ENTITY_SYNC_ORDER,
+        )
         grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for row in rows:
             grouped[row["entity_type"]].append(row)
         synced = 0
         failed = 0
         errors: List[str] = []
-        for entity_type, group in grouped.items():
+        for entity_type in sorted(set(grouped) - set(ENTITY_TABLES)):
+            ids = [int(row["outbox_id"]) for row in grouped[entity_type]]
+            detail = f"unregistered outbox entity type: {sanitize(entity_type)}"
+            self.store.mark_outbox_failed(ids, detail)
+            failed += len(ids)
+            errors.append(detail)
+        for entity_type in ENTITY_SYNC_ORDER:
+            group = grouped.get(entity_type, [])
+            if not group:
+                continue
             table, conflict, merge = ENTITY_TABLES[entity_type]
             ids = [int(row["outbox_id"]) for row in group]
             payload = [_normalize_payload(row["payload"]) for row in group]
@@ -106,6 +134,45 @@ class SupabaseSink:
         state = "ready" if failed == 0 else "degraded"
         self.store.save_sink_health(state, pending, "; ".join(errors)[:1000])
         return {"state": state, "synced": synced, "failed": failed, "pending": pending, "errors": errors[:5]}
+
+    def drain(self, max_batches: int = 250) -> Dict[str, Any]:
+        """Flush bounded batches until empty or the queue stops making progress."""
+        batch_limit = max(1, min(1000, int(max_batches)))
+        total_synced = 0
+        total_failed = 0
+        batches = 0
+        last: Dict[str, Any] = {
+            "state": "ready",
+            "synced": 0,
+            "failed": 0,
+            "pending": self.store.outbox_pending_count(),
+        }
+        while batches < batch_limit and int(last.get("pending", 0)) > 0:
+            last = self.flush()
+            batches += 1
+            total_synced += int(last.get("synced", 0))
+            total_failed += int(last.get("failed", 0))
+            if int(last.get("pending", 0)) == 0:
+                break
+            if int(last.get("synced", 0)) == 0:
+                break
+        pending = self.store.outbox_pending_count()
+        if pending == 0:
+            state = "ready"
+        elif total_synced == 0:
+            state = str(last.get("state") or "blocked_no_progress")
+            if state == "ready":
+                state = "blocked_no_progress"
+        else:
+            state = "partial"
+        return {
+            "state": state,
+            "batches": batches,
+            "synced": total_synced,
+            "failed": total_failed,
+            "pending": pending,
+            "last_batch": last,
+        }
 
 
 def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:

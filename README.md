@@ -22,6 +22,17 @@ Verify the Market Tape software:
 python3 -m pytest tests/test_market_tape.py -q
 ```
 
+Deploy and verify the Market Tape control-plane schema:
+
+```bash
+python3 scripts/market_tape_migration.py validate
+python3 scripts/market_tape_migration.py status
+python3 scripts/market_tape_migration.py apply --project-ref ivhfuhxorppptyuofbgq
+python3 scripts/market_tape_migration.py verify --project-ref ivhfuhxorppptyuofbgq
+python3 scripts/market_tape_migration.py counts --project-ref ivhfuhxorppptyuofbgq
+python3 -m services.market_tape.cli sync --force --drain --max-batches 250
+```
+
 ## UGC Format Classifier
 
 A service for analyzing user-generated content, detecting format types, calculating performance scores, and recommending content repurposing strategies.

@@ -20,11 +20,17 @@ from services.market_tape.api import register_market_tape_routes
 from services.market_tape.collector import MarketTapeCollector
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.math import age_bucket, concentration, counter_motion, log_velocity, poll_interval_seconds
+from services.market_tape.migration import (
+    MARKET_TAPE_TABLES,
+    SupabaseMigrationManager,
+    project_ref_from_url,
+    validate_migration,
+)
 from services.market_tape.models import MarketContent, MetricCounters, SourceReceipt, SourceState
 from services.market_tape.sources.base import sanitize
 from services.market_tape.sources.local_research import LocalResearchSource
 from services.market_tape.sources.youtube import YouTubeSource
-from services.market_tape.sinks.supabase import SupabaseSink
+from services.market_tape.sinks.supabase import ENTITY_SYNC_ORDER, ENTITY_TABLES, SupabaseSink
 from services.market_tape.store import MarketTapeStore
 
 
@@ -32,6 +38,7 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     received_posts = []
     received_gets = []
+    remote_runs = set()
 
     def do_GET(self):  # noqa: N802 - HTTP handler contract
         parsed = urlparse(self.path)
@@ -83,12 +90,53 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
             ids = query.get("id", ["video-chart"])[0].split(",")
             self._json({"items": [self._video(video_id) for video_id in ids if video_id]})
             return
+        if parsed.path.removeprefix("/") in MARKET_TAPE_TABLES:
+            self._json([])
+            return
         self._json({"error": "not found"}, status=404)
 
     def do_POST(self):  # noqa: N802 - HTTP handler contract
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length) or b"[]")
         self.__class__.received_posts.append({"path": urlparse(self.path).path, "body": body})
+        if isinstance(body, dict) and body.get("read_only") is True:
+            if "row_count" in body.get("query", ""):
+                self._json([
+                    {"table_name": table, "row_count": index}
+                    for index, table in enumerate(MARKET_TAPE_TABLES, start=1)
+                ])
+                return
+            rows = []
+            for table in MARKET_TAPE_TABLES:
+                trigger_names = []
+                if table == "actp_market_observations":
+                    trigger_names.append("actp_market_observations_no_update")
+                if table == "actp_trend_observations":
+                    trigger_names.append("actp_trend_observations_no_update")
+                rows.append({
+                    "table_name": table,
+                    "relation_exists": True,
+                    "rls_enabled": True,
+                    "policy_count": 0,
+                    "trigger_names": trigger_names,
+                })
+            self._json(rows)
+            return
+        path = urlparse(self.path).path
+        records = body if isinstance(body, list) else [body]
+        if path == "/actp_market_collection_runs":
+            self.__class__.remote_runs.update(
+                record["run_id"] for record in records if isinstance(record, dict) and record.get("run_id")
+            )
+        if path == "/actp_market_source_receipts":
+            missing = [
+                record.get("run_id")
+                for record in records
+                if isinstance(record, dict) and record.get("run_id") not in self.__class__.remote_runs
+            ]
+            if missing:
+                self._json({"code": "23503", "message": "missing parent run"}, status=409)
+                return
         self._json({}, status=201)
 
     def log_message(self, *_):
@@ -123,6 +171,9 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def provider_server():
+    ProviderTestHandler.received_posts = []
+    ProviderTestHandler.received_gets = []
+    ProviderTestHandler.remote_runs = set()
     server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderTestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -256,6 +307,194 @@ def test_transactional_outbox_flushes_to_supabase_rest(provider_server, market_c
     assert result["pending"] == 0
     assert any(post["path"] == "/actp_market_observations" for post in ProviderTestHandler.received_posts)
     assert any(post["path"] == "/actp_market_source_health" for post in ProviderTestHandler.received_posts)
+
+
+def test_market_tape_migration_contract_matches_outbox_tables():
+    validation = validate_migration()
+    sink_tables = {definition[0] for definition in ENTITY_TABLES.values()}
+
+    assert validation["state"] == "ready"
+    assert validation["tables_expected"] == 11
+    assert set(MARKET_TAPE_TABLES) == sink_tables
+    assert set(ENTITY_SYNC_ORDER) == set(ENTITY_TABLES)
+    assert project_ref_from_url("https://ivhfuhxorppptyuofbgq.supabase.co") == "ivhfuhxorppptyuofbgq"
+    assert project_ref_from_url("https://example.com") == ""
+
+
+def test_market_tape_migration_applies_and_verifies_over_real_http(provider_server):
+    project_ref = "abcdefghijklmnopqrst"
+    posts_before = len(ProviderTestHandler.received_posts)
+    gets_before = len(ProviderTestHandler.received_gets)
+    manager = SupabaseMigrationManager(
+        supabase_url=f"https://{project_ref}.supabase.co",
+        service_role_key="service-role-integration-key-12345678901234567890",
+        access_token="management-access-token-123456789012345678901234",
+        management_api_url=provider_server,
+        rest_base_url=provider_server,
+    )
+    try:
+        result = manager.apply(project_ref, verify_delay_seconds=0)
+    finally:
+        manager.close()
+
+    posts = ProviderTestHandler.received_posts[posts_before:]
+    gets = ProviderTestHandler.received_gets[gets_before:]
+    assert result["state"] == "applied", result
+    assert result["inspection"]["tables_ready"] == 11
+    assert posts[0]["path"] == f"/v1/projects/{project_ref}/database/query"
+    assert "create table if not exists public.actp_market_observations" in posts[0]["body"]["query"]
+    assert posts[0]["body"]["read_only"] is False
+    assert {request["path"].removeprefix("/") for request in gets} >= set(MARKET_TAPE_TABLES)
+
+
+def test_market_tape_migration_rejects_target_mismatch(provider_server):
+    manager = SupabaseMigrationManager(
+        supabase_url="https://abcdefghijklmnopqrst.supabase.co",
+        service_role_key="service-role-integration-key-12345678901234567890",
+        access_token="management-access-token-123456789012345678901234",
+        management_api_url=provider_server,
+        rest_base_url=provider_server,
+    )
+    try:
+        result = manager.apply("zyxwvutsrqponmlkjihg")
+    finally:
+        manager.close()
+
+    assert result["state"] == "blocked_target_mismatch"
+
+
+def test_market_tape_migration_verifies_security_invariants_over_real_http(provider_server):
+    project_ref = "abcdefghijklmnopqrst"
+    posts_before = len(ProviderTestHandler.received_posts)
+    manager = SupabaseMigrationManager(
+        supabase_url=f"https://{project_ref}.supabase.co",
+        service_role_key="service-role-integration-key-12345678901234567890",
+        access_token="management-access-token-123456789012345678901234",
+        management_api_url=provider_server,
+        rest_base_url=provider_server,
+    )
+    try:
+        result = manager.verify_database(project_ref)
+        counts = manager.remote_counts(project_ref)
+    finally:
+        manager.close()
+
+    posts = ProviderTestHandler.received_posts[posts_before:]
+    assert result["state"] == "ready", result
+    assert result["tables_verified"] == 11
+    assert result["missing_tables"] == []
+    assert result["rls_disabled"] == []
+    assert result["unexpected_rls_policies"] == {}
+    assert result["missing_append_only_triggers"] == []
+    assert posts[0]["path"] == f"/v1/projects/{project_ref}/database/query"
+    assert posts[0]["body"]["read_only"] is True
+    assert "pg_catalog.pg_policies" in posts[0]["body"]["query"]
+    assert counts["state"] == "ready", counts
+    assert counts["tables_counted"] == 11
+    assert counts["total_rows"] == 66
+    assert posts[1]["body"]["read_only"] is True
+    assert "count(*)::bigint" in posts[1]["body"]["query"]
+
+
+def test_transactional_outbox_drain_processes_multiple_batches(provider_server, market_config, monkeypatch):
+    store = MarketTapeStore(market_config)
+    store.start_run("drain-run", "full")
+    observed = datetime.now(timezone.utc)
+    for index in range(4):
+        store.ingest(_content_for_id(f"drain-{index}", observed), "drain-run")
+    store.finish_run("drain-run")
+    assert store.enqueue_run_for_sync("drain-run") > 2
+
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-integration-key-1234567890")
+    enabled = replace(
+        market_config,
+        supabase_sync_enabled=True,
+        supabase_sync_batch_size=2,
+    )
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        result = sink.drain(max_batches=100)
+    finally:
+        sink.close()
+
+    assert result["state"] == "ready"
+    assert result["batches"] > 1
+    assert result["synced"] > 2
+    assert result["pending"] == 0
+
+
+def test_supabase_sink_orders_parent_run_before_earlier_receipt(provider_server, market_config, monkeypatch):
+    store = MarketTapeStore(market_config)
+    run_id = "dependency-run"
+    store.start_run(run_id, "full")
+    now = datetime.now(timezone.utc)
+    store.save_receipt(SourceReceipt(
+        run_id=run_id,
+        source_id="dependency-provider",
+        platform="youtube",
+        state=SourceState.READY,
+        started_at=now,
+        finished_at=now,
+        accepted_count=0,
+    ))
+    store.finish_run(run_id)
+    store.enqueue_run_for_sync(run_id)
+    with store.connect() as connection:
+        run_outbox_id = connection.execute(
+            "SELECT outbox_id FROM mt_sync_outbox WHERE entity_type = 'run' AND entity_key = ?",
+            (run_id,),
+        ).fetchone()[0]
+        receipt_outbox_id = connection.execute(
+            "SELECT outbox_id FROM mt_sync_outbox WHERE entity_type = 'receipt'",
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE mt_sync_outbox SET outbox_id = ? WHERE outbox_id = ?",
+            (receipt_outbox_id + 1000, run_outbox_id),
+        )
+
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-integration-key-1234567890")
+    enabled = replace(
+        market_config,
+        supabase_sync_enabled=True,
+        supabase_sync_batch_size=1,
+    )
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        result = sink.drain(max_batches=10)
+    finally:
+        sink.close()
+
+    paths = [post["path"] for post in ProviderTestHandler.received_posts]
+    assert result["state"] == "ready", result
+    assert paths.index("/actp_market_collection_runs") < paths.index("/actp_market_source_receipts")
+
+
+def test_supabase_sink_reports_unregistered_outbox_entity(provider_server, market_config, monkeypatch):
+    store = MarketTapeStore(market_config)
+    now = datetime.now(timezone.utc).isoformat()
+    with store.connect() as connection:
+        connection.execute(
+            """INSERT INTO mt_sync_outbox(
+                   entity_type, entity_key, payload_json, created_at, next_attempt_at
+               ) VALUES('unknown_contract', 'unknown-1', '{}', ?, ?)""",
+            (now, now),
+        )
+
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-integration-key-1234567890")
+    enabled = replace(market_config, supabase_sync_enabled=True)
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        result = sink.flush()
+    finally:
+        sink.close()
+
+    assert result["state"] == "degraded"
+    assert result["failed"] == 1
+    assert result["pending"] == 1
+    assert result["errors"] == ["unregistered outbox entity type: unknown_contract"]
 
 
 def test_youtube_discovery_uses_quota_bounded_pagination(provider_server, market_config, monkeypatch):

@@ -27,6 +27,8 @@ def main() -> int:
     subparsers.add_parser("status")
     sync = subparsers.add_parser("sync")
     sync.add_argument("--force", action="store_true", help="Retry backed-off outbox rows immediately")
+    sync.add_argument("--drain", action="store_true", help="Drain bounded batches until empty or blocked")
+    sync.add_argument("--max-batches", type=int, default=250)
     subparsers.add_parser("doctor")
     videos = subparsers.add_parser("videos")
     videos.add_argument("--platform")
@@ -61,7 +63,7 @@ def main() -> int:
             store.make_outbox_due()
         sink = SupabaseSink(config, store)
         try:
-            return _print(sink.flush())
+            return _print(sink.drain(args.max_batches) if args.drain else sink.flush())
         finally:
             sink.close()
     if args.command == "videos":
