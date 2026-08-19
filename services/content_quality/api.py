@@ -86,6 +86,13 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         result = engine.scripts.generate(json_body())
         return jsonify(result), 422 if result.get("status") == "rejected" else 200
 
+    @app.get("/api/scripts/<script_id>")
+    def get_script(script_id: str):
+        script = engine.store.script(script_id)
+        if script is None:
+            return jsonify({"status": "error", "code": "SCRIPT_NOT_FOUND", "script_id": script_id}), 404
+        return jsonify({"status": "ok", "script": script, "gates": engine.store.script_gate_summary(script_id)})
+
     @app.post("/api/relatability/script-audit")
     def relatability_audit():
         return jsonify(engine.relatability.audit(json_body()))
@@ -142,5 +149,18 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     def learning_receipts():
         limit = int(request.args.get("limit", "50"))
         return jsonify({"status": "ok", "receipts": engine.store.receipts(limit=limit), "counts": engine.store.counts()})
+
+    @app.get("/api/learning/scripts")
+    def learning_scripts():
+        limit = int(request.args.get("limit", "50"))
+        scripts = engine.store.scripts(limit=limit)
+        return jsonify({
+            "status": "ok",
+            "scripts": [
+                {"script": script, "gates": engine.store.script_gate_summary(script["script_id"])}
+                for script in scripts
+            ],
+            "count": len(scripts),
+        })
 
     return app

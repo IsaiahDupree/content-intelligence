@@ -90,8 +90,13 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         script = generated.get_json()
         relatability = self.client.post("/api/relatability/script-audit", json=script).get_json()
         attention = self.client.post("/api/attention/script-audit", json=script).get_json()
+        preflight = self.client.post("/api/attention/video-preflight", json=script).get_json()
         self.assertEqual(relatability["decision"], "PASS")
         self.assertEqual(attention["decision"], "PASS")
+        self.assertEqual(preflight["decision"], "PASS")
+        handoff = self.client.get(f"/api/scripts/{script['script_id']}")
+        self.assertEqual(handoff.status_code, 200)
+        self.assertTrue(handoff.get_json()["gates"]["ready_for_render"])
 
     def test_script_generation_fails_closed_without_receipts(self):
         response = self.client.post(

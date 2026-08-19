@@ -202,6 +202,45 @@ class QualityStore:
             )
             connection.commit()
 
+    def script(self, script_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT script_json FROM cq_scripts WHERE script_id=?", (script_id,)
+            ).fetchone()
+        return json.loads(row["script_json"]) if row else None
+
+    def scripts(self, limit: int = 50) -> list[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT script_json FROM cq_scripts ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [json.loads(row["script_json"]) for row in rows]
+
+    def script_gate_summary(self, script_id: str) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT audit_type, decision, score, audit_id, created_at
+                FROM cq_audits WHERE subject_id=? ORDER BY created_at DESC
+                """,
+                (script_id,),
+            ).fetchall()
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if row["audit_type"] not in latest:
+                latest[row["audit_type"]] = dict(row)
+        required = {
+            "relatability_script": "PASS",
+            "attention_script": "PASS",
+            "attention_video_preflight": "PASS",
+        }
+        return {
+            "ready_for_render": all(latest.get(kind, {}).get("decision") == decision for kind, decision in required.items()),
+            "required_decisions": required,
+            "latest_audits": latest,
+        }
+
     def put_audit(
         self,
         audit_type: str,
