@@ -28,6 +28,16 @@ python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --mi
 python3 scripts/backfill_transcript_bank.py --platform youtube --limit 20 --model base --cookies-from-browser chrome --topic 'creator burnout creative struggle content views work'
 ```
 
+Install the hourly resumable backfill worker (20 performance-ranked videos per
+batch; existing artifacts are skipped):
+
+```bash
+/bin/zsh -l scripts/install_transcript_backfill_launchd.sh
+```
+
+The worker stores audio, timestamped Whisper JSON, hashes, and append-only run
+manifests under `/Volumes/My Passport/MarketTape/transcript-bank`.
+
 Deploy and verify the Market Tape control-plane schema:
 
 ```bash
