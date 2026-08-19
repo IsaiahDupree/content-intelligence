@@ -1,4 +1,6 @@
+import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from contextlib import closing
@@ -110,6 +112,37 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["normalized"]["kind"], "aggregate_only")
         self.assertNotIn("points", response.get_json()["normalized"])
+
+    def test_real_uploaded_video_is_decoded_and_semantically_audited(self):
+        video = Path(self.tempdir.name) / "real-test-pattern.mp4"
+        subprocess.run(
+            [
+                "/opt/homebrew/bin/ffmpeg", "-y", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x180:rate=10",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(video),
+            ],
+            check=True,
+            timeout=30,
+        )
+        timeline = [
+            {"start": 0.0, "end": 0.5, "beat": "human_hook", "text": "You know this moment?"},
+            {"start": 0.5, "end": 1.0, "beat": "stakes", "text": "The cost is real."},
+            {"start": 1.0, "end": 1.5, "beat": "proof", "text": "Here is the receipt."},
+            {"start": 1.5, "end": 2.0, "beat": "payoff", "text": "Now the pattern is visible."},
+            {"start": 2.0, "end": 3.0, "beat": "cta", "text": "Test it on the next result."},
+        ]
+        with video.open("rb") as stream:
+            response = self.client.post(
+                "/api/attention/video-upload-audit",
+                data={"video": (stream, video.name), "timeline_json": json.dumps(timeline), "script_id": "script-real"},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()
+        self.assertEqual(result["decision"], "PASS")
+        self.assertTrue(result["findings"]["media_probe"]["has_audio"])
+        self.assertGreaterEqual(result["findings"]["frame_change_report"]["change_count"], 1)
 
 
 if __name__ == "__main__":

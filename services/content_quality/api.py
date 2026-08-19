@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +101,34 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     @app.post("/api/attention/video-file-audit")
     def video_file_audit():
         return jsonify(engine.attention.video_file_audit(json_body()))
+
+    @app.post("/api/attention/video-upload-audit")
+    def video_upload_audit():
+        upload = request.files.get("video")
+        if upload is None or not upload.filename:
+            raise ValueError("multipart field 'video' is required")
+        extension = Path(upload.filename).suffix.lower()
+        if extension not in {".mp4", ".mov", ".m4v", ".webm"}:
+            raise ValueError("video must be mp4, mov, m4v, or webm")
+        try:
+            timeline = json.loads(request.form.get("timeline_json") or "[]")
+        except json.JSONDecodeError as exc:
+            raise ValueError("timeline_json must be valid JSON") from exc
+        if not isinstance(timeline, list) or not timeline:
+            raise ValueError("timeline_json must contain a non-empty semantic timeline")
+        staging = engine.store.path.parent / "staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        destination = staging / f"upload_{uuid.uuid4().hex}{extension}"
+        upload.save(destination)
+        result = engine.attention.video_file_audit({
+            "video_path": str(destination),
+            "video_id": request.form.get("video_id"),
+            "script_id": request.form.get("script_id"),
+            "timeline": timeline,
+        })
+        result["staged_video_path"] = str(destination)
+        result["original_filename"] = Path(upload.filename).name
+        return jsonify(result)
 
     @app.post("/api/retention/normalize")
     def normalize_retention():

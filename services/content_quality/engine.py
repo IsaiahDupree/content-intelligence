@@ -775,7 +775,13 @@ def probe_media(path: Path) -> dict[str, Any]:
         "-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,r_frame_rate",
         "-of", "json", str(path),
     ]
-    completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "ffprobe failed").strip().splitlines()[-1:]
+        raise ValueError("media probe failed: " + (detail[0][:240] if detail else "ffprobe failed")) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("media probe timed out after 30 seconds") from exc
     payload = json.loads(completed.stdout)
     streams = payload.get("streams") or []
     video = next((item for item in streams if item.get("codec_type") == "video"), {})
@@ -797,7 +803,9 @@ def sample_frame_changes(path: Path, duration: float) -> dict[str, Any]:
     if not capture.isOpened():
         return {"sample_count": 0, "change_count": 0, "mean_change": None, "error": "video_decode_failed"}
     sample_count = max(3, min(24, int(math.ceil(duration / 2.5)))) if duration else 3
-    times = [duration * index / max(sample_count - 1, 1) for index in range(sample_count)]
+    # Avoid sampling exactly at EOF, where valid files commonly return no frame.
+    sample_span = duration * 0.98 if duration else 0.0
+    times = [sample_span * index / max(sample_count - 1, 1) for index in range(sample_count)]
     previous = None
     changes: list[float] = []
     successful = 0
