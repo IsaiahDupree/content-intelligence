@@ -504,10 +504,20 @@ class MarketTapeCollector:
                         continue
                     batch = source.refresh(tracked)
                     returned = {item.video_id for item in batch.items}
-                    missing = [row["video_id"] for row in tracked if row["video_id"] not in returned]
+                    tracked_ids = {str(row["video_id"]) for row in tracked}
+                    missing = sorted(tracked_ids - returned)
                     if missing:
                         batch.receipt.failed_count += len(missing)
-                        self.store.mark_poll_failure(missing, batch.receipt.error_code or "provider_item_missing")
+                        batch.receipt.metadata.update({
+                            "tracked_count": len(tracked_ids),
+                            "returned_tracked_count": len(tracked_ids & returned),
+                            "missing_tracked_count": len(missing),
+                            "item_failure_code": "provider_item_missing",
+                        })
+                        self.store.mark_poll_failure(
+                            missing,
+                            batch.receipt.error_code or "provider_item_missing",
+                        )
                     accepted_ids = self._persist_batch(batch, run_id)
                     unchanged = returned - accepted_ids
                     if unchanged:
@@ -729,7 +739,9 @@ class MarketTapeCollector:
         accepted = 0
         accepted_ids: set[str] = set()
         duplicates = 0
-        failures = batch.receipt.failed_count
+        provider_item_failures = batch.receipt.failed_count
+        ingest_failures = 0
+        ingest_failure_types: Dict[str, int] = {}
         for item in batch.items:
             try:
                 added, _ = self.store.ingest(item, run_id)
@@ -738,12 +750,17 @@ class MarketTapeCollector:
                     accepted_ids.add(item.video_id)
                 else:
                     duplicates += 1
-            except (TypeError, ValueError, KeyError):
-                failures += 1
+            except (TypeError, ValueError, KeyError) as error:
+                ingest_failures += 1
+                error_type = type(error).__name__
+                ingest_failure_types[error_type] = ingest_failure_types.get(error_type, 0) + 1
         batch.receipt.accepted_count = accepted
         batch.receipt.duplicate_count = duplicates
-        batch.receipt.failed_count = failures
-        if batch.receipt.state == SourceState.READY and failures and not accepted:
+        batch.receipt.failed_count = provider_item_failures + ingest_failures
+        if ingest_failures:
+            batch.receipt.metadata["ingest_failure_count"] = ingest_failures
+            batch.receipt.metadata["ingest_failure_types"] = ingest_failure_types
+        if batch.receipt.state == SourceState.READY and ingest_failures and not accepted:
             batch.receipt.state = SourceState.DEGRADED
             batch.receipt.error_code = batch.receipt.error_code or "normalization_failed"
             batch.receipt.error_detail = batch.receipt.error_detail or "Provider items failed canonical validation"

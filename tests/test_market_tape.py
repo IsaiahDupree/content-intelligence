@@ -30,6 +30,7 @@ from services.market_tape.migration import (
 from services.market_tape.models import (
     MarketContent,
     MetricCounters,
+    ProviderBatch,
     SourceReceipt,
     SourceState,
     stable_hash,
@@ -1037,6 +1038,137 @@ def test_local_research_archive_source_normalizes_and_schedules(provider_server,
     assert batch.query_attempts[0].query == "ai agents"
     assert batch.query_attempts[0].result_count == 2
     assert any(post["path"] == "/api/research/twitter/full" for post in ProviderTestHandler.received_posts)
+
+
+def test_local_research_cache_miss_does_not_poison_source_health(market_config, tmp_path):
+    archive = tmp_path / "research" / "twitter"
+    archive.mkdir(parents=True)
+    observed = datetime.now(timezone.utc) - timedelta(hours=2)
+    returned_id = "1900000000000000101"
+    missing_id = "1900000000000000102"
+    payload = {
+        "results": [{
+            "query": "live sports",
+            "collectionFinished": observed.isoformat(),
+            "tweets": [{
+                "id": returned_id,
+                "url": f"https://x.com/sports/status/{returned_id}",
+                "author": "sportsdesk",
+                "text": "Live sports result",
+                "views": 1200,
+                "likes": 80,
+                "collectedAt": observed.isoformat(),
+            }],
+        }],
+    }
+    (archive / "twitter-research-final.json").write_text(json.dumps(payload), encoding="utf-8")
+    config = replace(
+        market_config,
+        platforms=["x"],
+        local_research_dir=tmp_path / "research",
+        local_research_trigger_enabled=False,
+        platform_daily_targets={"x": 10},
+        provider_daily_request_limits={"x": 20},
+        provider_cost_per_request_usd={"x": 0.0},
+    )
+    store = MarketTapeStore(config)
+    source = LocalResearchSource(
+        config,
+        "seed-run",
+        20,
+        platform="x",
+        api_platform="twitter",
+        archive_root=tmp_path / "research",
+    )
+    source._reset_archive_qc()
+    returned_item = source._load_archive(10)[0]
+    source.close()
+    missing_item = MarketContent(
+        platform="x",
+        external_id=missing_id,
+        creator_external_id="missing-source-record",
+        creator_handle="missing-source-record",
+        published_at=observed - timedelta(minutes=10),
+        observed_at=observed,
+        source_id="safari-local-research-x",
+        metrics=MetricCounters(views=400),
+        caption="Record no longer present in the bounded fallback archive",
+        url=f"https://x.com/missing/status/{missing_id}",
+        media_type="post",
+        raw_payload={"id": missing_id, "views": 400},
+    )
+    store.start_run("seed-run", "discovery")
+    assert store.ingest(returned_item, "seed-run") == (True, True)
+    assert store.ingest(missing_item, "seed-run") == (True, True)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE mt_poll_queue SET due_at = ? WHERE platform = 'x'",
+            ((observed - timedelta(minutes=1)).isoformat(),),
+        )
+
+    store.start_run("recheck-run", "recheck")
+    receipts = MarketTapeCollector(config, store)._run_rechecks("recheck-run")
+
+    local_receipt = next(
+        receipt for receipt in receipts
+        if receipt["source_id"] == "safari-local-research-x"
+    )
+    assert local_receipt["state"] == "ready"
+    assert local_receipt["error_code"] == ""
+    assert local_receipt["accepted_count"] == 0
+    assert local_receipt["duplicate_count"] == 1
+    assert local_receipt["failed_count"] == 1
+    assert local_receipt["metadata"]["tracked_count"] == 2
+    assert local_receipt["metadata"]["returned_tracked_count"] == 1
+    assert local_receipt["metadata"]["missing_tracked_count"] == 1
+    assert local_receipt["metadata"]["item_failure_code"] == "provider_item_missing"
+    with store.connect() as connection:
+        health = connection.execute(
+            "SELECT state, consecutive_failures, error_code FROM mt_source_health "
+            "WHERE source_id = 'safari-local-research-x'"
+        ).fetchone()
+        missing_poll = connection.execute(
+            "SELECT last_error_code FROM mt_poll_queue WHERE video_id = ?",
+            (missing_item.video_id,),
+        ).fetchone()
+    assert dict(health) == {
+        "state": "ready",
+        "consecutive_failures": 0,
+        "error_code": "",
+    }
+    assert missing_poll["last_error_code"] == "provider_item_missing"
+
+
+def test_genuine_ingest_failure_remains_a_normalization_failure(market_config):
+    store = MarketTapeStore(market_config)
+    store.start_run("invalid-payload-run", "discovery")
+    item = _content(datetime.now(timezone.utc), views=100)
+    cyclic_payload = {}
+    cyclic_payload["self"] = cyclic_payload
+    item.raw_payload = cyclic_payload
+    now = datetime.now(timezone.utc)
+    batch = ProviderBatch(
+        items=[item],
+        receipt=SourceReceipt(
+            run_id="invalid-payload-run",
+            source_id="captured-provider",
+            platform="youtube",
+            state=SourceState.READY,
+            started_at=now,
+            finished_at=now,
+        ),
+    )
+
+    MarketTapeCollector(market_config, store)._persist_batch(
+        batch,
+        "invalid-payload-run",
+    )
+
+    assert batch.receipt.state == SourceState.DEGRADED
+    assert batch.receipt.error_code == "normalization_failed"
+    assert batch.receipt.failed_count == 1
+    assert batch.receipt.metadata["ingest_failure_count"] == 1
+    assert batch.receipt.metadata["ingest_failure_types"] == {"ValueError": 1}
 
 
 def test_local_research_dispatch_blocks_before_browser_when_disk_is_low(

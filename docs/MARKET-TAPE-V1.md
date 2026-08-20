@@ -613,6 +613,13 @@ Prediction contracts are deliberately distinct:
 
 Each observation stores cumulative counters plus their derivatives. Relative strength is a z-score against recent observations in the same platform and video-age bucket.
 
+Recheck receipts distinguish source-item availability from canonical corruption. A
+tracked ID absent from a bounded fallback archive increments `missing_tracked_count`
+and the poll's `provider_item_missing` status without opening the source circuit.
+Only an exception while committing a returned typed record can emit
+`normalization_failed`; receipts expose exception-class counts without content or
+secret-bearing error values.
+
 `trend-strength-v2` derives recent activity only from measured per-video counter
 deltas. A lifetime total first observed on an old post contributes zero recent
 views; a first observation contributes only when the post was actually published
@@ -647,7 +654,7 @@ python3 -m pytest \
 python3 -m json.tool Sources/OpsConsole/Resources/content-intelligence-contract.json
 ```
 
-The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, lifetime-counter exclusion, adaptive and fair polling, unchanged-snapshot deferral, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, per-operation request receipts, partial-batch preservation, spend accounting, circuit breakers, browser disk-pressure gates, failed-lane and missing-job retry, local archive normalization and relevance QC, exact-query lineage, provider-free context backfill and trend reindexing, idempotent daily certification, dependency-ordered transactional outbox behavior, grouped predictor validation, index/model compatibility, early-entry label semantics, actionable-opportunity filtering, central parity reconciliation, Management API verification, API authorization, and automatic tick selection. The repository suite currently passes all 127 tests.
+The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, lifetime-counter exclusion, adaptive and fair polling, unchanged-snapshot deferral, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, per-operation request receipts, partial-batch preservation, fallback-cache miss classification, genuine canonical-failure reporting, spend accounting, circuit breakers, browser disk-pressure gates, failed-lane and missing-job retry, local archive normalization and relevance QC, exact-query lineage, provider-free context backfill and trend reindexing, idempotent daily certification, dependency-ordered transactional outbox behavior, grouped predictor validation, index/model compatibility, early-entry label semantics, actionable-opportunity filtering, central parity reconciliation, Management API verification, API authorization, and automatic tick selection. The repository suite currently passes all 129 tests.
 
 ## Remaining Work
 
