@@ -36,7 +36,7 @@ STOP_WORDS = {
     "was", "we", "what", "when", "where", "why", "with", "you", "your",
 }
 OPPORTUNITY_CONTRACT = "market_tape_actionable_opportunities_v1"
-OPPORTUNITY_RANKER_VERSION = "actionable-opportunity-v5"
+OPPORTUNITY_RANKER_VERSION = "actionable-opportunity-v6"
 TREND_INDEX_VERSION = "trend-strength-v2"
 ACTIONABLE_TREND_STATES = {"discovering", "emerging", "breakout", "recurring"}
 GENERIC_TREND_LABELS = {
@@ -62,6 +62,20 @@ VAGUE_PHRASE_TRAILERS = {
     "instagram", "people", "really", "saying", "someone", "something", "things",
     "than", "thinking", "threads", "tiktok", "want", "what", "when", "where", "who",
     "why", "year", "youtube",
+}
+GENERIC_HOOK_TOKENS = {
+    "actually", "always", "anybody", "anyone", "believe", "did", "does",
+    "doing", "everybody", "everyone", "finally", "gets", "getting", "going",
+    "got", "happened", "happens", "just", "know", "knows", "made", "make",
+    "makes", "need", "needs", "never", "no", "nobody", "one", "people",
+    "really", "somebody", "someone", "thing", "things", "think", "thinks",
+    "want", "wanted", "wants", "watch", "you",
+}
+CONTEXT_BOILERPLATE_TOKENS = {
+    "about", "bio", "channel", "com", "connect", "discord", "facebook",
+    "follow", "group", "groups", "http", "https", "info", "instagram",
+    "join", "link", "member", "members", "profile", "subscribe", "tiktok",
+    "twitter", "user", "users", "www", "youtube",
 }
 
 
@@ -2755,17 +2769,65 @@ class MarketTapeStore:
         memberships: Dict[str, set[str]] = {
             str(candidate["trend_id"]): set() for candidate in candidates
         }
+        contexts: Dict[str, List[set[str]]] = {
+            str(candidate["trend_id"]): [] for candidate in candidates
+        }
+        label_tokens = {
+            str(candidate["trend_id"]): _trend_label_tokens(
+                str(candidate["display_name"])
+            )
+            for candidate in candidates
+        }
         candidate_ids = list(memberships)
         with self.connect() as connection:
             for offset in range(0, len(candidate_ids), 400):
                 chunk = candidate_ids[offset:offset + 400]
                 placeholders = ",".join("?" for _ in chunk)
                 for row in connection.execute(
-                    f"""SELECT trend_id, video_id FROM mt_trend_memberships
-                         WHERE trend_id IN ({placeholders})""",
+                    f"""SELECT membership.trend_id, membership.video_id,
+                                video.title, video.caption, video.description
+                         FROM mt_trend_memberships membership
+                         JOIN mt_videos video ON video.video_id = membership.video_id
+                         WHERE membership.trend_id IN ({placeholders})
+                         ORDER BY membership.trend_id, membership.video_id""",
                     chunk,
                 ).fetchall():
-                    memberships[str(row["trend_id"])].add(str(row["video_id"]))
+                    trend_id = str(row["trend_id"])
+                    memberships[trend_id].add(str(row["video_id"]))
+                    context_tokens = _opportunity_context_tokens(
+                        " ".join(
+                            str(row[field] or "")
+                            for field in ("title", "caption", "description")
+                        ),
+                        label_tokens[trend_id],
+                    )
+                    if context_tokens:
+                        contexts[trend_id].append(context_tokens)
+        coherent_candidates: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            trend_id = str(candidate["trend_id"])
+            context_cohesion = _opportunity_context_cohesion(contexts[trend_id])
+            context_summary = _opportunity_context_summary(contexts[trend_id])
+            candidate["evidence"]["context_documents"] = len(contexts[trend_id])
+            candidate["evidence"]["context_cohesion"] = context_cohesion
+            candidate["evidence"]["context_summary"] = context_summary
+            candidate["resolved_display_name"] = str(candidate["display_name"])
+            if len(label_tokens[trend_id]) == 1 and context_summary:
+                candidate["resolved_display_name"] = (
+                    f'{candidate["display_name"]} · {context_summary}'
+                )
+            if (
+                str(candidate["trend_type"]).casefold() == "hashtag"
+                and len(label_tokens[trend_id]) == 1
+                and len(contexts[trend_id]) >= 2
+                and context_cohesion < 0.15
+            ):
+                suppressed["low_context_cohesion"] = (
+                    suppressed.get("low_context_cohesion", 0) + 1
+                )
+                continue
+            coherent_candidates.append(candidate)
+        candidates = coherent_candidates
         selected: List[Dict[str, Any]] = []
         selected_tokens: List[set[str]] = []
         selected_memberships: List[set[str]] = []
@@ -2838,6 +2900,8 @@ class MarketTapeStore:
                 "minimum_measured_videos": minimum_measured_videos,
                 "format_aggregates_excluded": True,
                 "generic_distribution_labels_excluded": True,
+                "generic_hook_phrases_excluded": True,
+                "single_token_hashtag_minimum_context_cohesion": 0.15,
                 "crawler_expansion_excluded_from_activity": True,
                 "near_duplicate_token_overlap": 0.8,
                 "near_duplicate_membership_overlap": 0.4,
@@ -3126,6 +3190,8 @@ def _opportunity_exclusion_reason(
     compact = re.sub(r"[^a-z0-9]+", "", normalized)
     if normalized in GENERIC_TREND_LABELS or compact in GENERIC_TREND_LABELS:
         return "generic_distribution_label"
+    if _is_generic_hook_phrase(normalized, str(row["trend_type"])):
+        return "generic_hook_phrase"
     if not compact or compact.isdigit() or len(compact) < 3:
         return "non_specific_label"
     if not _is_specific_trend_phrase(str(row["display_name"]), str(row["trend_type"])):
@@ -3139,6 +3205,74 @@ def _trend_label_tokens(value: str) -> set[str]:
         for token in WORD_RE.findall(value.lstrip("#"))
         if token.casefold() not in STOP_WORDS
     }
+
+
+def _is_generic_hook_phrase(value: str, trend_type: str) -> bool:
+    if trend_type.casefold() not in {"topic", "hook"}:
+        return False
+    tokens = [token.casefold() for token in WORD_RE.findall(value)]
+    return 2 <= len(tokens) <= 5 and all(
+        token in GENERIC_HOOK_TOKENS or token in STOP_WORDS
+        for token in tokens
+    )
+
+
+def _opportunity_context_tokens(
+    value: str,
+    label_tokens: set[str],
+) -> set[str]:
+    cleaned = re.sub(
+        r"(?:https?://|www\.)\S+|@[a-z0-9_.-]+",
+        " ",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return {
+        token.casefold()
+        for token in WORD_RE.findall(cleaned)
+        if len(token) >= 3
+        and token.casefold() not in STOP_WORDS
+        and token.casefold() not in label_tokens
+        and token.casefold() not in GENERIC_TREND_LABELS
+        and token.casefold() not in GENERIC_HOOK_TOKENS
+        and token.casefold() not in CONTEXT_BOILERPLATE_TOKENS
+        and sum(character.isdigit() for character in token) < 4
+    }
+
+
+def _opportunity_context_cohesion(documents: Sequence[set[str]]) -> float:
+    if len(documents) < 2:
+        return 0.0
+    nearest_neighbor_scores: List[float] = []
+    for index, document in enumerate(documents):
+        peers = [
+            _membership_overlap(document, other)
+            for peer_index, other in enumerate(documents)
+            if peer_index != index
+        ]
+        nearest_neighbor_scores.append(max(peers, default=0.0))
+    return round(
+        sum(nearest_neighbor_scores) / len(nearest_neighbor_scores),
+        6,
+    )
+
+
+def _opportunity_context_summary(documents: Sequence[set[str]]) -> str:
+    if len(documents) < 2:
+        return ""
+    counts: Dict[str, int] = {}
+    for document in documents:
+        for token in document:
+            counts[token] = counts.get(token, 0) + 1
+    shared = sorted(
+        (token for token, count in counts.items() if count >= 2),
+        key=lambda token: (-counts[token], any(char.isdigit() for char in token), token),
+    )[:3]
+    acronyms = {"ai", "mlb", "nba", "nfl", "nhl", "ufc", "wnba"}
+    return " ".join(
+        token.upper() if token in acronyms else token.title()
+        for token in shared
+    )
 
 
 def _context_trend_key(context: Any) -> str:

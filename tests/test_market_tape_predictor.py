@@ -138,6 +138,110 @@ def test_opportunity_ranker_remains_available_without_a_promoted_model(tmp_path)
     )
 
 
+def test_opportunity_ranker_rejects_generic_and_incoherent_clusters(tmp_path):
+    config = _config(tmp_path)
+    store = MarketTapeStore(config)
+    observed = datetime.now(timezone.utc)
+    store.start_run("cohesion-run", "discovery")
+    content = (
+        ("house", "Nobody Wants to Buy a House in America Anymore"),
+        ("boats", "Why Nobody Wants New Cabin Cruisers Anymore"),
+        ("dash-game", "Poor Chunk to Millionaire Chunk Battle in Minecraft"),
+        ("dash-phone", "Trolling My Friends in Gartic Phone"),
+        ("nba-build", "NBA 2K26 Best Guard Builds and Badges"),
+        ("nba-badges", "NBA 2K26 New Badge Tier Guide"),
+    )
+    video_ids = {}
+    for index, (external_id, title) in enumerate(content, start=1):
+        item = MarketContent(
+            platform="youtube",
+            external_id=external_id,
+            creator_external_id=f"creator-{index}",
+            published_at=observed - timedelta(minutes=30),
+            observed_at=observed,
+            source_id="integration-provider",
+            metrics=MetricCounters(views=1000 * index),
+            title=title,
+            caption=(
+                "Join https://discord.com/users/4391860484/groups/info "
+                "or follow @shared-profile"
+                if external_id.startswith("dash-") else ""
+            ),
+            raw_payload={"id": external_id, "title": title},
+        )
+        store.ingest(item, "cohesion-run")
+        video_ids[external_id] = item.video_id
+
+    fixtures = (
+        (
+            "generic-hook-opportunity",
+            "Nobody Wants",
+            "topic",
+            ("house", "boats"),
+        ),
+        (
+            "incoherent-hashtag-opportunity",
+            "#dash",
+            "hashtag",
+            ("dash-game", "dash-phone"),
+        ),
+        (
+            "coherent-hashtag-opportunity",
+            "#nba2k26",
+            "hashtag",
+            ("nba-build", "nba-badges"),
+        ),
+    )
+    with store.connect() as connection:
+        for trend_id, display_name, trend_type, member_ids in fixtures:
+            _insert_trend_observation(
+                connection,
+                trend_id,
+                display_name,
+                trend_type,
+                observed,
+                state="emerging",
+                strength=62.0,
+                saturation=0.1,
+                videos=2,
+            )
+            for external_id in member_ids:
+                connection.execute(
+                    """INSERT INTO mt_trend_memberships(
+                           trend_id, video_id, confidence, evidence_json,
+                           first_seen_at
+                       ) VALUES(?, ?, 0.95, '{}', ?)""",
+                    (
+                        trend_id,
+                        video_ids[external_id],
+                        observed.isoformat(),
+                    ),
+                )
+
+    opportunities = store.trend_opportunities(
+        limit=20,
+        min_videos=2,
+        min_measured_videos=2,
+    )
+    names = {
+        row["display_name"] for row in opportunities["opportunities"]
+    }
+
+    assert "Nobody Wants" not in names
+    assert "#dash" not in names
+    assert "#nba2k26" in names
+    assert opportunities["suppressed_by_reason"]["generic_hook_phrase"] >= 1
+    assert opportunities["suppressed_by_reason"]["low_context_cohesion"] >= 1
+    coherent = next(
+        row for row in opportunities["opportunities"]
+        if row["display_name"] == "#nba2k26"
+    )
+    assert coherent["evidence"]["context_documents"] == 2
+    assert coherent["evidence"]["context_cohesion"] >= 0.15
+    assert coherent["evidence"]["context_summary"] == "NBA 2K26"
+    assert coherent["resolved_display_name"] == "#nba2k26 · NBA 2K26"
+
+
 def test_early_entry_horizon_rejects_already_hot_baselines(tmp_path):
     config = _config(tmp_path)
     store = MarketTapeStore(config)
