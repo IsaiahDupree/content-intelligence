@@ -14,16 +14,54 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import MarketTapeConfig
 from .keywords import rank_keywords
-from .math import age_bucket, concentration, counter_motion, poll_interval_seconds, trend_state, trend_strength, zscore
-from .models import MarketContent, SourceReceipt, isoformat, stable_hash, utc_now
+from .math import age_bucket, concentration, counter_motion, log_velocity, poll_interval_seconds, trend_state, trend_strength, zscore
+from .models import MarketContent, QueryAttempt, SourceReceipt, isoformat, stable_hash, utc_now
+from .predictor import (
+    ENTRY_HORIZON,
+    PROGRESSION_HORIZON,
+    eligible_for_early_entry,
+    load_active_model,
+    model_accepts_features,
+    model_prediction_horizon,
+    model_purpose,
+    predict_probability,
+)
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+-]*", re.IGNORECASE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how",
     "i", "in", "is", "it", "my", "of", "on", "or", "our", "that", "the", "this", "to",
     "was", "we", "what", "when", "where", "why", "with", "you", "your",
+}
+OPPORTUNITY_CONTRACT = "market_tape_actionable_opportunities_v1"
+OPPORTUNITY_RANKER_VERSION = "actionable-opportunity-v5"
+TREND_INDEX_VERSION = "trend-strength-v2"
+ACTIONABLE_TREND_STATES = {"discovering", "emerging", "breakout", "recurring"}
+GENERIC_TREND_LABELS = {
+    "1", "best tool", "business", "businessgrowth", "clips", "content",
+    "creatoreconomy", "digitalmarketing", "edit", "edits", "explore",
+    "explorepage", "fact", "facts", "foryou", "foryoupage", "funny",
+    "funny moments", "futureofwork",
+    "fyp", "fypシ", "gaming", "growth", "instagram", "learning", "longform",
+    "love", "most useful", "movies", "music", "new", "news", "breaking news",
+    "reel", "reels", "science",
+    "short", "shorts", "sports", "taking over", "technology", "tiktok",
+    "trending", "video", "video longform", "video short", "viral", "viralshorts",
+    "youtube", "youtube shorts", "entertainment",
+}
+VAGUE_PHRASE_LEADERS = {
+    "about", "brand", "does", "dont", "get", "getting", "guys", "hey", "how",
+    "instagram", "isn", "just", "last", "not", "people", "really", "saying",
+    "more", "someone", "something", "things", "thinking", "threads", "tiktok", "top",
+    "shorts", "want", "what", "when", "where", "who", "why", "year", "youtube",
+}
+VAGUE_PHRASE_TRAILERS = {
+    "about", "does", "get", "getting", "guys", "isn", "just", "new", "not",
+    "instagram", "people", "really", "saying", "someone", "something", "things",
+    "than", "thinking", "threads", "tiktok", "want", "what", "when", "where", "who",
+    "why", "year", "youtube",
 }
 
 
@@ -127,6 +165,41 @@ class MarketTapeStore:
                 BEFORE DELETE ON mt_discovery_attributions
                 BEGIN
                     SELECT RAISE(ABORT, 'discovery attributions are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_query_attempts (
+                    attempt_key TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    result_count INTEGER NOT NULL DEFAULT 0,
+                    request_count INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    error_detail TEXT NOT NULL DEFAULT '',
+                    artifact_path TEXT NOT NULL DEFAULT '',
+                    artifact_sha256 TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_query_attempts_query_time_idx
+                    ON mt_query_attempts(query, attempted_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_query_attempts_platform_time_idx
+                    ON mt_query_attempts(platform, attempted_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_query_attempts_no_update
+                BEFORE UPDATE ON mt_query_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'query attempts are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_query_attempts_no_delete
+                BEFORE DELETE ON mt_query_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'query attempts are append-only');
                 END;
 
                 CREATE TABLE IF NOT EXISTS mt_raw_objects (
@@ -317,6 +390,12 @@ class MarketTapeStore:
                     likes_total INTEGER NOT NULL,
                     comments_total INTEGER NOT NULL,
                     shares_total INTEGER NOT NULL,
+                    views_new_1h INTEGER NOT NULL DEFAULT 0,
+                    likes_new_1h INTEGER NOT NULL DEFAULT 0,
+                    comments_new_1h INTEGER NOT NULL DEFAULT 0,
+                    shares_new_1h INTEGER NOT NULL DEFAULT 0,
+                    counter_delta_videos INTEGER NOT NULL DEFAULT 0,
+                    activity_coverage REAL NOT NULL DEFAULT 0,
                     median_video_velocity REAL NOT NULL,
                     p90_video_velocity REAL NOT NULL,
                     creator_breadth REAL NOT NULL,
@@ -439,6 +518,11 @@ class MarketTapeStore:
                     outcome_json TEXT
                 );
 
+                CREATE INDEX IF NOT EXISTS mt_predictions_subject_time_idx
+                    ON mt_predictions(subject_type, subject_id, predicted_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_predictions_outcome_idx
+                    ON mt_predictions(outcome_json, predicted_at);
+
                 CREATE TABLE IF NOT EXISTS mt_sync_outbox (
                     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_type TEXT NOT NULL,
@@ -474,6 +558,25 @@ class MarketTapeStore:
                 )
             if "next_retry_at" not in source_health_columns:
                 connection.execute("ALTER TABLE mt_source_health ADD COLUMN next_retry_at TEXT")
+            trend_observation_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(mt_trend_observations)"
+                ).fetchall()
+            }
+            trend_activity_columns = {
+                "views_new_1h": "INTEGER NOT NULL DEFAULT 0",
+                "likes_new_1h": "INTEGER NOT NULL DEFAULT 0",
+                "comments_new_1h": "INTEGER NOT NULL DEFAULT 0",
+                "shares_new_1h": "INTEGER NOT NULL DEFAULT 0",
+                "counter_delta_videos": "INTEGER NOT NULL DEFAULT 0",
+                "activity_coverage": "REAL NOT NULL DEFAULT 0",
+            }
+            for column, definition in trend_activity_columns.items():
+                if column not in trend_observation_columns:
+                    connection.execute(
+                        f"ALTER TABLE mt_trend_observations ADD COLUMN {column} {definition}"
+                    )
             connection.execute(
                 "INSERT INTO mt_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -536,6 +639,12 @@ class MarketTapeStore:
                     payload["attribution_key"],
                     payload,
                 ))
+            for row in connection.execute(
+                "SELECT * FROM mt_query_attempts WHERE run_id = ?",
+                (run_id,),
+            ).fetchall():
+                payload = dict(row)
+                records.append(("query_attempt", payload["attempt_key"], payload))
             for row in observations:
                 row.pop("observation_id", None)
                 records.append(("observation", row["observation_key"], row))
@@ -639,6 +748,9 @@ class MarketTapeStore:
             for row in connection.execute("SELECT * FROM mt_discovery_attributions").fetchall():
                 payload = dict(row)
                 add("discovery_attribution", payload["attribution_key"], payload)
+            for row in connection.execute("SELECT * FROM mt_query_attempts").fetchall():
+                payload = dict(row)
+                add("query_attempt", payload["attempt_key"], payload)
             for row in connection.execute("SELECT * FROM mt_market_observations").fetchall():
                 payload = dict(row)
                 payload.pop("observation_id", None)
@@ -854,6 +966,34 @@ class MarketTapeStore:
                 ),
             )
 
+    def save_query_attempts(self, attempts: Sequence[QueryAttempt]) -> int:
+        """Persist query coverage even when a provider returned zero content."""
+        if not attempts:
+            return 0
+        inserted = 0
+        with self.connect() as connection:
+            for attempt in attempts:
+                data = attempt.to_dict()
+                cursor = connection.execute(
+                    """INSERT INTO mt_query_attempts(
+                           attempt_key, run_id, source_id, platform, query, attempted_at,
+                           finished_at, state, result_count, request_count, error_code,
+                           error_detail, artifact_path, artifact_sha256, metadata_json
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(attempt_key) DO NOTHING""",
+                    (
+                        data["attempt_key"], attempt.run_id, attempt.source_id,
+                        attempt.platform, " ".join(attempt.query.split())[:300],
+                        data["attempted_at"], data["finished_at"], attempt.state,
+                        max(0, int(attempt.result_count)), max(0, int(attempt.request_count)),
+                        attempt.error_code[:100], attempt.error_detail[:1000],
+                        attempt.artifact_path, attempt.artifact_sha256,
+                        json.dumps(attempt.metadata, sort_keys=True, default=str),
+                    ),
+                )
+                inserted += int(cursor.rowcount == 1)
+        return inserted
+
     def ingest(self, item: MarketContent, run_id: str) -> Tuple[bool, bool]:
         """Append an observation. Returns (observation_added, unique_video_added)."""
         raw_sha, raw_path, raw_bytes = self._archive_raw(item)
@@ -919,7 +1059,6 @@ class MarketTapeStore:
                     item.media_type, item.duration_seconds, run_id,
                 ),
             )
-            self._record_discovery_attributions(connection, item, run_id, observed)
             cursor = connection.execute(
                 """INSERT INTO mt_market_observations(
                        observation_key, run_id, observed_at, wall_clock_date, video_id, creator_id, platform,
@@ -938,6 +1077,7 @@ class MarketTapeStore:
             )
             added = cursor.rowcount == 1
             if added:
+                self._record_discovery_attributions(connection, item, run_id, observed)
                 self._upsert_genome(connection, item, observed)
                 self._map_trends(connection, item, observed)
                 self._schedule_next(connection, item, age_seconds or 0.0, motion.acceleration > 0.1 or relative_strength >= 2.0)
@@ -969,7 +1109,6 @@ class MarketTapeStore:
         context_json = json.dumps(context, sort_keys=True, default=str)
         for query in queries:
             attribution_key = stable_hash({
-                "run_id": run_id,
                 "video_id": item.video_id,
                 "source_id": item.source_id,
                 "query": query.casefold(),
@@ -1034,13 +1173,18 @@ class MarketTapeStore:
         candidates: List[Tuple[str, str, str, float]] = []
         for hashtag in item.hashtags[:4]:
             candidates.append(("hashtag", hashtag, f"#{hashtag}", 0.95))
+        context_key = _context_trend_key(item.discovery_context)
+        if context_key:
+            candidates.append(("topic", context_key, context_key.title(), 0.82))
         if len(words) >= 2:
             key = " ".join(words[:3])
-            candidates.append(("hook", key, key.title(), 0.72))
+            if _is_specific_trend_phrase(key, "hook"):
+                candidates.append(("hook", key, key.title(), 0.72))
         for first, second in list(zip(words[:6], words[1:7]))[:2]:
             if first != second:
                 key = f"{first} {second}"
-                candidates.append(("topic", key, key.title(), 0.62))
+                if _is_specific_trend_phrase(key, "topic"):
+                    candidates.append(("topic", key, key.title(), 0.62))
         if item.audio_id:
             candidates.append(("audio", item.audio_id, item.audio_title or item.audio_id, 0.9))
         format_key = "short" if (item.duration_seconds or 0) <= 60 else "longform"
@@ -1066,6 +1210,72 @@ class MarketTapeStore:
                    ) VALUES(?, ?, ?, ?, ?) ON CONFLICT(trend_id, video_id) DO NOTHING""",
                 (trend_id, item.video_id, confidence, json.dumps({"type": trend_type, "value": key}), observed),
             )
+
+    def backfill_context_trends(self) -> Dict[str, Any]:
+        """Recover topic memberships from immutable discovery context without provider calls."""
+        scanned = 0
+        eligible = 0
+        invalid_context = 0
+        trends_inserted = 0
+        memberships_inserted = 0
+        affected_trend_ids: set[str] = set()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT attribution_key, video_id, discovered_at, context_json
+                   FROM mt_discovery_attributions
+                   ORDER BY discovered_at, attribution_key"""
+            ).fetchall()
+            for row in rows:
+                scanned += 1
+                try:
+                    context = json.loads(str(row["context_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    invalid_context += 1
+                    continue
+                key = _context_trend_key(context)
+                if not key:
+                    continue
+                eligible += 1
+                observed = str(row["discovered_at"])
+                trend_id = f"trend:topic:{stable_hash(key)[:16]}"
+                cursor = connection.execute(
+                    """INSERT INTO mt_trends(
+                           trend_id, trend_type, canonical_key, display_name,
+                           first_seen_at, last_seen_at
+                       ) VALUES(?, 'topic', ?, ?, ?, ?)
+                       ON CONFLICT(trend_id) DO NOTHING""",
+                    (trend_id, key, key.title(), observed, observed),
+                )
+                trends_inserted += int(cursor.rowcount == 1)
+                cursor = connection.execute(
+                    """INSERT INTO mt_trend_memberships(
+                           trend_id, video_id, confidence, evidence_json, first_seen_at
+                       ) VALUES(?, ?, 0.82, ?, ?)
+                       ON CONFLICT(trend_id, video_id) DO NOTHING""",
+                    (
+                        trend_id,
+                        str(row["video_id"]),
+                        json.dumps({
+                            "attribution_key": str(row["attribution_key"]),
+                            "contract": "discovery-context-trend-backfill-v1",
+                            "type": "topic",
+                            "value": key,
+                        }, sort_keys=True),
+                        observed,
+                    ),
+                )
+                membership_added = int(cursor.rowcount == 1)
+                memberships_inserted += membership_added
+                if membership_added:
+                    affected_trend_ids.add(trend_id)
+        return {
+            "attributions_scanned": scanned,
+            "eligible_attributions": eligible,
+            "invalid_context": invalid_context,
+            "trends_inserted": trends_inserted,
+            "memberships_inserted": memberships_inserted,
+            "affected_trend_ids": sorted(affected_trend_ids),
+        }
 
     def _schedule_next(
         self, connection: sqlite3.Connection, item: MarketContent, age_seconds: float, hot_mode: bool
@@ -1094,22 +1304,79 @@ class MarketTapeStore:
                 [(due, error_code[:80], video_id) for video_id in video_ids],
             )
 
+    def defer_unchanged_polls(
+        self,
+        video_ids: Iterable[str],
+        delay_seconds: int = 3600,
+    ) -> int:
+        ids = sorted(set(str(value) for value in video_ids if str(value)))
+        if not ids:
+            return 0
+        due = isoformat(
+            utc_now() + timedelta(seconds=max(300, int(delay_seconds)))
+        )
+        with self.connect() as connection:
+            connection.executemany(
+                """UPDATE mt_poll_queue
+                   SET due_at = ?, last_error_code = 'unchanged_source_snapshot'
+                   WHERE video_id = ?""",
+                [(due, video_id) for video_id in ids],
+            )
+        return len(ids)
+
     def due_polls(self, limit: int) -> Dict[str, List[Dict[str, Any]]]:
+        maximum = max(1, int(limit))
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT q.video_id, q.platform, q.external_id, q.preferred_source_id, q.hot_mode,
-                          v.published_at, v.title, v.caption, v.description, v.language, v.url,
-                          v.thumbnail_url, v.duration_seconds, c.external_id AS creator_external_id,
-                          c.handle AS creator_handle, c.display_name AS creator_name, c.followers AS creator_followers
-                   FROM mt_poll_queue q
-                   JOIN mt_videos v ON v.video_id = q.video_id
-                   JOIN mt_creators c ON c.creator_id = v.creator_id
-                   WHERE q.due_at <= ? ORDER BY q.due_at ASC LIMIT ?""",
-                (isoformat(utc_now()), limit),
+                """WITH ranked AS (
+                       SELECT q.video_id, q.platform, q.external_id,
+                              q.preferred_source_id, q.hot_mode, q.due_at,
+                              v.published_at, v.title, v.caption, v.description,
+                              v.language, v.url, v.thumbnail_url,
+                              v.duration_seconds,
+                              c.external_id AS creator_external_id,
+                              c.handle AS creator_handle,
+                              c.display_name AS creator_name,
+                              c.followers AS creator_followers,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY q.platform ORDER BY q.due_at, q.video_id
+                              ) AS platform_rank
+                       FROM mt_poll_queue q
+                       JOIN mt_videos v ON v.video_id = q.video_id
+                       JOIN mt_creators c ON c.creator_id = v.creator_id
+                       WHERE q.due_at <= ?
+                   )
+                   SELECT * FROM ranked
+                   WHERE platform_rank <= ?
+                   ORDER BY due_at, platform, video_id""",
+                (isoformat(utc_now()), maximum),
             ).fetchall()
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        available: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
-            grouped.setdefault(row["platform"], []).append(dict(row))
+            payload = dict(row)
+            payload.pop("platform_rank", None)
+            available.setdefault(str(row["platform"]), []).append(payload)
+        selected: List[Dict[str, Any]] = []
+        platforms = sorted(
+            available,
+            key=lambda platform: (
+                str(available[platform][0]["due_at"]),
+                platform,
+            ),
+        )
+        while len(selected) < maximum:
+            advanced = False
+            for platform in platforms:
+                if available[platform]:
+                    selected.append(available[platform].pop(0))
+                    advanced = True
+                    if len(selected) >= maximum:
+                        break
+            if not advanced:
+                break
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in selected:
+            grouped.setdefault(str(row["platform"]), []).append(row)
         return grouped
 
     def remaining_request_budget(self, source_id: str, daily_limit: int) -> int:
@@ -1190,12 +1457,21 @@ class MarketTapeStore:
             finished = finished.replace(tzinfo=timezone.utc)
         return max(0.0, (utc_now() - finished).total_seconds())
 
-    def aggregate_trends(self, observed_at: Optional[datetime] = None, run_id: Optional[str] = None) -> int:
+    def aggregate_trends(
+        self,
+        observed_at: Optional[datetime] = None,
+        run_id: Optional[str] = None,
+        trend_ids: Optional[Sequence[str]] = None,
+    ) -> int:
         observed_at = observed_at or utc_now()
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
         observed = isoformat(observed_at)
         since = isoformat(observed_at - timedelta(hours=1))
         with self.connect() as connection:
-            if run_id:
+            if trend_ids is not None:
+                trend_ids = sorted(set(str(value) for value in trend_ids if str(value)))
+            elif run_id:
                 trends = connection.execute(
                     """SELECT DISTINCT m.trend_id
                        FROM mt_trend_memberships m
@@ -1203,16 +1479,23 @@ class MarketTapeStore:
                        WHERE o.run_id = ?""",
                     (run_id,),
                 ).fetchall()
+                trend_ids = [str(row["trend_id"]) for row in trends]
             else:
                 trends = connection.execute("SELECT trend_id FROM mt_trends").fetchall()
-            trend_ids = [str(row["trend_id"]) for row in trends]
+                trend_ids = [str(row["trend_id"]) for row in trends]
             if not trend_ids:
                 return 0
             placeholders = ",".join("?" for _ in trend_ids)
             latest_by_trend: Dict[str, List[sqlite3.Row]] = {}
             latest_rows = connection.execute(
-                f"""SELECT m.trend_id, v.video_id, v.creator_id, v.platform, v.first_seen_at,
-                            o.views, o.likes, o.comments, o.shares, o.view_velocity
+                f"""SELECT m.trend_id, v.video_id, v.creator_id, v.platform,
+                            v.first_seen_at, v.published_at,
+                            o.observed_at, o.views, o.likes, o.comments, o.shares,
+                            o.view_velocity, o.view_acceleration,
+                            prior.observed_at AS prior_observed_at,
+                            prior.views AS prior_views, prior.likes AS prior_likes,
+                            prior.comments AS prior_comments,
+                            prior.shares AS prior_shares
                      FROM mt_trend_memberships m
                      JOIN mt_videos v ON v.video_id = m.video_id
                      JOIN mt_market_observations o ON o.observation_id = (
@@ -1220,6 +1503,16 @@ class MarketTapeStore:
                          WHERE latest.video_id = v.video_id
                          ORDER BY latest.observed_at DESC, latest.observation_id DESC LIMIT 1
                      )
+                     LEFT JOIN mt_market_observations prior
+                       ON prior.observation_id = (
+                           SELECT previous.observation_id
+                           FROM mt_market_observations previous
+                           WHERE previous.video_id = v.video_id
+                             AND previous.observation_id != o.observation_id
+                             AND previous.observed_at <= o.observed_at
+                           ORDER BY previous.observed_at DESC,
+                                    previous.observation_id DESC LIMIT 1
+                       )
                      WHERE m.trend_id IN ({placeholders})""",
                 trend_ids,
             ).fetchall()
@@ -1228,24 +1521,28 @@ class MarketTapeStore:
             previous_by_trend: Dict[str, List[Dict[str, Any]]] = {}
             previous_rows = connection.execute(
                 f"""WITH ranked AS (
-                         SELECT trend_id, observed_at, views_total AS views,
+                         SELECT trend_id, observed_at, momentum, acceleration,
                                 ROW_NUMBER() OVER (
                                     PARTITION BY trend_id ORDER BY observed_at DESC, trend_observation_id DESC
                                 ) AS row_number
                          FROM mt_trend_observations
                          WHERE trend_id IN ({placeholders})
+                           AND index_version = 'trend-strength-v2'
                      )
-                     SELECT trend_id, observed_at, views FROM ranked
+                     SELECT trend_id, observed_at, momentum, acceleration FROM ranked
                      WHERE row_number <= 3 ORDER BY trend_id, observed_at""",
                 trend_ids,
             ).fetchall()
             for row in previous_rows:
                 previous_by_trend.setdefault(str(row["trend_id"]), []).append({
-                    "observed_at": row["observed_at"], "views": row["views"],
+                    "observed_at": row["observed_at"],
+                    "momentum": row["momentum"],
+                    "acceleration": row["acceleration"],
                 })
             cohort = [float(row[0]) for row in connection.execute(
                 """SELECT momentum FROM mt_trend_observations
-                   WHERE observed_at >= ? ORDER BY observed_at DESC LIMIT 5000""",
+                   WHERE observed_at >= ? AND index_version = 'trend-strength-v2'
+                   ORDER BY observed_at DESC LIMIT 5000""",
                 (isoformat(observed_at - timedelta(days=30)),),
             ).fetchall()]
             inserted = 0
@@ -1258,28 +1555,52 @@ class MarketTapeStore:
                 creator_views: Dict[str, int] = {}
                 for row in latest:
                     creator_views[row["creator_id"]] = creator_views.get(row["creator_id"], 0) + int(row["views"])
-                velocities = sorted(float(row["view_velocity"]) for row in latest)
+                activity = [_recent_counter_activity(row, observed_at) for row in latest]
+                measured_activity = [value for value in activity if value["measured"]]
+                velocities = sorted(
+                    float(value["view_velocity"])
+                    for value in measured_activity
+                )
+                accelerations = sorted(
+                    float(value["view_acceleration"])
+                    for value in measured_activity
+                )
                 median_velocity = _percentile(velocities, 0.5)
                 p90_velocity = _percentile(velocities, 0.9)
+                p90_acceleration = _percentile(accelerations, 0.9)
                 previous = previous_by_trend.get(trend_id, [])
                 views_total = sum(int(row["views"]) for row in latest)
-                motion = counter_motion(previous + [{"observed_at": observed, "views": views_total}])
-                relative = zscore(motion.velocity, cohort)
-                new_videos = sum(1 for row in latest if row["first_seen_at"] >= since)
-                new_creator_ids = {row["creator_id"] for row in latest if row["first_seen_at"] >= since}
+                views_new_1h = sum(int(value["views"]) for value in activity)
+                likes_new_1h = sum(int(value["likes"]) for value in activity)
+                comments_new_1h = sum(int(value["comments"]) for value in activity)
+                shares_new_1h = sum(int(value["shares"]) for value in activity)
+                activity_coverage = len(measured_activity) / max(1, len(latest))
+                relative = zscore(p90_velocity, cohort)
+                recently_published = [
+                    row for row in latest
+                    if _in_observation_window(row["published_at"], observed_at, hours=1)
+                ]
+                new_videos = len(recently_published)
+                new_creator_ids = {row["creator_id"] for row in recently_published}
                 saturation = min(1.0, len(latest) / 1000.0)
-                state = trend_state(relative, motion.acceleration, saturation, len(creators), len(new_creator_ids))
+                state = trend_state(
+                    relative,
+                    p90_acceleration,
+                    saturation,
+                    len(creators),
+                    len(new_creator_ids),
+                )
                 breadth = min(1.0, len(creators) / max(1, len(latest)))
                 platform_breadth = min(1.0, len(platforms) / max(1, len(self.config.platforms)))
-                engagement = sum(int(row["likes"]) + int(row["comments"]) + int(row["shares"]) for row in latest)
+                recent_engagement = likes_new_1h + comments_new_1h + shares_new_1h
                 strength = trend_strength({
                     "relative_view_velocity": _sigmoid(relative),
-                    "acceleration": _sigmoid(motion.acceleration),
+                    "acceleration": _sigmoid(p90_acceleration),
                     "creator_adoption_velocity": min(1.0, len(new_creator_ids) / 25.0),
                     "creator_breadth": breadth,
-                    "share_velocity": min(1.0, sum(int(row["shares"]) for row in latest) / max(1, views_total) * 20),
+                    "share_velocity": min(1.0, shares_new_1h / max(1, views_new_1h) * 20),
                     "cross_platform_diffusion": platform_breadth,
-                    "engagement_quality": min(1.0, engagement / max(1, views_total) * 10),
+                    "engagement_quality": min(1.0, recent_engagement / max(1, views_new_1h) * 10),
                     "novelty": max(0.0, 1.0 - saturation),
                     "persistence": min(1.0, len(previous) / 3.0),
                 })
@@ -1287,17 +1608,26 @@ class MarketTapeStore:
                     """INSERT INTO mt_trend_observations(
                            trend_id, observed_at, videos_total, videos_new_1h, creators_total, creators_new_1h,
                            platforms_total, views_total, likes_total, comments_total, shares_total,
+                           views_new_1h, likes_new_1h, comments_new_1h, shares_new_1h,
+                           counter_delta_videos, activity_coverage,
                            median_video_velocity, p90_video_velocity, creator_breadth, platform_breadth,
                            top1_concentration, top10_concentration, momentum, acceleration, relative_strength,
                            saturation, trend_strength, index_version, state
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'trend-strength-v1', ?)""",
+                       ) VALUES(
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                       )""",
                     (
                         trend_id, observed, len(latest), new_videos, len(creators), len(new_creator_ids),
                         len(platforms), views_total, sum(int(row["likes"]) for row in latest),
                         sum(int(row["comments"]) for row in latest), sum(int(row["shares"]) for row in latest),
+                        views_new_1h, likes_new_1h, comments_new_1h, shares_new_1h,
+                        len(measured_activity), activity_coverage,
                         median_velocity, p90_velocity, breadth, platform_breadth,
                         concentration(creator_views.values(), 1), concentration(creator_views.values(), 10),
-                        motion.velocity, motion.acceleration, relative, saturation, strength, state,
+                        p90_velocity, p90_acceleration, relative, saturation, strength,
+                        TREND_INDEX_VERSION, state,
                     ),
                 )
                 connection.execute(
@@ -1336,6 +1666,7 @@ class MarketTapeStore:
         """Persist transparent baseline forecasts; later model versions append new rows."""
         predicted_at = predicted_at or utc_now()
         predicted = isoformat(predicted_at)
+        active_trend_model = load_active_model(self.config)
         inserted = 0
         with self.connect() as connection:
             video_rows = connection.execute(
@@ -1411,6 +1742,9 @@ class MarketTapeStore:
                     "platform_breadth": float(row["platform_breadth"]),
                     "saturation": float(row["saturation"]),
                     "state": row["state"],
+                    "index_version": row["index_version"],
+                    "views_new_1h": int(row["views_new_1h"]),
+                    "activity_coverage": float(row["activity_coverage"]),
                 }
                 score = (
                     (features["trend_strength"] - 55.0) / 15.0
@@ -1422,19 +1756,514 @@ class MarketTapeStore:
                 )
                 probability = round(_sigmoid(score), 6)
                 peak_hours = max(0.5, 6.0 * (1.0 - probability))
-                connection.execute(
+                if eligible_for_early_entry(features):
+                    connection.execute(
+                        """INSERT INTO mt_predictions(
+                               subject_type, subject_id, model_version, predicted_at,
+                               horizon, probability, expected_peak_at,
+                               expected_remaining_life_hours, features_json
+                           ) VALUES('trend', ?, 'transparent-entry-baseline-v3', ?, ?, ?, ?, ?, ?)""",
+                        (
+                            row["trend_id"], predicted, ENTRY_HORIZON, probability,
+                            isoformat(predicted_at + timedelta(hours=peak_hours)),
+                            round(6.0 + 42.0 * probability, 3),
+                            json.dumps(features, sort_keys=True),
+                        ),
+                    )
+                    inserted += 1
+                if (
+                    active_trend_model is not None
+                    and model_accepts_features(active_trend_model, features)
+                ):
+                    model_probability = predict_probability(active_trend_model, features)
+                    model_peak_hours = max(0.5, 6.0 * (1.0 - model_probability))
+                    model_horizon = model_prediction_horizon(active_trend_model)
+                    model_features = {
+                        **features,
+                        "model_purpose": model_purpose(active_trend_model),
+                        "training_dataset_sha256": active_trend_model[
+                            "training_dataset_sha256"
+                        ],
+                    }
+                    connection.execute(
+                        """INSERT INTO mt_predictions(
+                               subject_type, subject_id, model_version, predicted_at,
+                               horizon, probability, expected_peak_at,
+                               expected_remaining_life_hours, features_json
+                           ) VALUES('trend', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            row["trend_id"],
+                            active_trend_model["model_version"],
+                            predicted,
+                            model_horizon,
+                            model_probability,
+                            isoformat(predicted_at + timedelta(hours=model_peak_hours)),
+                            round(6.0 + 42.0 * model_probability, 3),
+                            json.dumps(model_features, sort_keys=True),
+                        ),
+                    )
+                    inserted += 1
+        return inserted
+
+    def forecast_baseline_trends(
+        self,
+        predicted_at: Optional[datetime] = None,
+        limit: int = 50000,
+        run_id: str = "",
+    ) -> Dict[str, Any]:
+        """Create deterministic early-entry forecasts for the current trend index."""
+        predicted_at = predicted_at or utc_now()
+        predicted = isoformat(predicted_at)
+        cutoff = isoformat(predicted_at - timedelta(hours=24))
+        inserted_ids: List[int] = []
+        skipped_ineligible = 0
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT observation.*
+                   FROM mt_trend_observations observation
+                   WHERE observation.observed_at >= ?
+                     AND observation.index_version = ?
+                     AND observation.state != 'dead'
+                     AND observation.trend_observation_id = (
+                         SELECT MAX(current.trend_observation_id)
+                         FROM mt_trend_observations current
+                         WHERE current.trend_id = observation.trend_id
+                     )
+                   ORDER BY observation.trend_strength DESC,
+                            observation.observed_at DESC
+                   LIMIT ?""",
+                (
+                    cutoff,
+                    TREND_INDEX_VERSION,
+                    min(100000, max(1, int(limit))),
+                ),
+            ).fetchall()
+            for row in rows:
+                features = {
+                    "forecast_source": "transparent_trend_snapshot",
+                    "run_id": run_id,
+                    "trend_strength": float(row["trend_strength"]),
+                    "relative_strength": float(row["relative_strength"]),
+                    "momentum": float(row["momentum"]),
+                    "acceleration": float(row["acceleration"]),
+                    "creator_breadth": float(row["creator_breadth"]),
+                    "platform_breadth": float(row["platform_breadth"]),
+                    "saturation": float(row["saturation"]),
+                    "state": row["state"],
+                    "index_version": row["index_version"],
+                    "views_new_1h": int(row["views_new_1h"]),
+                    "activity_coverage": float(row["activity_coverage"]),
+                }
+                if not eligible_for_early_entry(features):
+                    skipped_ineligible += 1
+                    continue
+                score = (
+                    (features["trend_strength"] - 55.0) / 15.0
+                    + 0.45 * features["relative_strength"]
+                    + 0.2 * min(6.0, max(-6.0, features["acceleration"]))
+                    + features["creator_breadth"]
+                    + features["platform_breadth"]
+                    - 1.5 * features["saturation"]
+                )
+                probability = round(_sigmoid(score), 6)
+                peak_hours = max(0.5, 6.0 * (1.0 - probability))
+                cursor = connection.execute(
                     """INSERT INTO mt_predictions(
-                           subject_type, subject_id, model_version, predicted_at, horizon, probability,
-                           expected_peak_at, expected_remaining_life_hours, features_json
-                       ) VALUES('trend', ?, 'transparent-baseline-v1', ?, ?, ?, ?, ?, ?)""",
+                           subject_type, subject_id, model_version, predicted_at,
+                           horizon, probability, expected_peak_at,
+                           expected_remaining_life_hours, features_json
+                       ) VALUES('trend', ?, 'transparent-entry-baseline-v3', ?, ?, ?, ?, ?, ?)""",
                     (
-                        row["trend_id"], predicted, "reaches_breakout_within_6h", probability,
-                        isoformat(predicted_at + timedelta(hours=peak_hours)), round(6.0 + 42.0 * probability, 3),
+                        row["trend_id"],
+                        predicted,
+                        ENTRY_HORIZON,
+                        probability,
+                        isoformat(predicted_at + timedelta(hours=peak_hours)),
+                        round(6.0 + 42.0 * probability, 3),
                         json.dumps(features, sort_keys=True),
                     ),
                 )
-                inserted += 1
-        return inserted
+                inserted_ids.append(int(cursor.lastrowid))
+        queued = self.enqueue_prediction_updates(inserted_ids)
+        return {
+            "state": "completed",
+            "model_version": "transparent-entry-baseline-v3",
+            "model_purpose": "deterministic_early_entry_baseline",
+            "index_version": TREND_INDEX_VERSION,
+            "horizon": ENTRY_HORIZON,
+            "predicted_at": predicted,
+            "predictions_added": len(inserted_ids),
+            "skipped_ineligible": skipped_ineligible,
+            "outbox_records": queued,
+        }
+
+    def forecast_active_trends(
+        self,
+        predicted_at: Optional[datetime] = None,
+        limit: int = 5000,
+    ) -> Dict[str, Any]:
+        """Apply the promoted model to recent trend states without requiring a new ingest."""
+        predicted_at = predicted_at or utc_now()
+        active_model = load_active_model(self.config)
+        if active_model is None:
+            return {"state": "no_promoted_model", "predictions_added": 0}
+        predicted = isoformat(predicted_at)
+        cutoff = isoformat(predicted_at - timedelta(hours=24))
+        inserted_ids: List[int] = []
+        skipped_ineligible = 0
+        model_horizon = model_prediction_horizon(active_model)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT observation.*
+                   FROM mt_trend_observations observation
+                   WHERE observation.observed_at >= ?
+                     AND observation.state != 'dead'
+                     AND observation.trend_observation_id = (
+                         SELECT MAX(current.trend_observation_id)
+                         FROM mt_trend_observations current
+                         WHERE current.trend_id = observation.trend_id
+                     )
+                   ORDER BY observation.trend_strength DESC,
+                            observation.observed_at DESC
+                   LIMIT ?""",
+                (cutoff, min(20000, max(1, int(limit)))),
+            ).fetchall()
+            for row in rows:
+                features = {
+                    "forecast_source": "active_trend_snapshot",
+                    "trend_strength": float(row["trend_strength"]),
+                    "relative_strength": float(row["relative_strength"]),
+                    "momentum": float(row["momentum"]),
+                    "acceleration": float(row["acceleration"]),
+                    "creator_breadth": float(row["creator_breadth"]),
+                    "platform_breadth": float(row["platform_breadth"]),
+                    "saturation": float(row["saturation"]),
+                    "state": row["state"],
+                    "index_version": row["index_version"],
+                    "views_new_1h": int(row["views_new_1h"]),
+                    "activity_coverage": float(row["activity_coverage"]),
+                    "training_dataset_sha256": active_model[
+                        "training_dataset_sha256"
+                    ],
+                }
+                if not model_accepts_features(active_model, features):
+                    skipped_ineligible += 1
+                    continue
+                features["model_purpose"] = model_purpose(active_model)
+                probability = predict_probability(active_model, features)
+                peak_hours = max(0.5, 6.0 * (1.0 - probability))
+                cursor = connection.execute(
+                    """INSERT INTO mt_predictions(
+                           subject_type, subject_id, model_version, predicted_at,
+                           horizon, probability, expected_peak_at,
+                           expected_remaining_life_hours, features_json
+                       ) VALUES('trend', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row["trend_id"],
+                        active_model["model_version"],
+                        predicted,
+                        model_horizon,
+                        probability,
+                        isoformat(predicted_at + timedelta(hours=peak_hours)),
+                        round(6.0 + 42.0 * probability, 3),
+                        json.dumps(features, sort_keys=True),
+                    ),
+                )
+                inserted_ids.append(int(cursor.lastrowid))
+        queued = self.enqueue_prediction_updates(inserted_ids)
+        return {
+            "state": "completed",
+            "model_version": active_model["model_version"],
+            "model_purpose": model_purpose(active_model),
+            "horizon": model_horizon,
+            "predicted_at": predicted,
+            "predictions_added": len(inserted_ids),
+            "skipped_ineligible": skipped_ineligible,
+            "outbox_records": queued,
+        }
+
+    def evaluate_predictions(self, as_of: Optional[datetime] = None) -> Dict[str, Any]:
+        """Attach horizon outcomes only when enough future tape exists to score them."""
+        as_of = as_of or utc_now()
+        pending: List[Dict[str, Any]] = []
+        with self.connect() as connection:
+            pending = [dict(row) for row in connection.execute(
+                """SELECT * FROM mt_predictions
+                   WHERE outcome_json IS NULL AND predicted_at <= ?
+                   ORDER BY predicted_at, prediction_id""",
+                (isoformat(as_of),),
+            ).fetchall()]
+            video_ids = sorted({
+                str(row["subject_id"])
+                for row in pending
+                if row["subject_type"] == "video"
+            })
+            trend_ids = sorted({
+                str(row["subject_id"])
+                for row in pending
+                if row["subject_type"] == "trend"
+            })
+            video_observations = _grouped_rows(
+                connection,
+                """SELECT video_id AS subject_id, observed_at, views, creator_followers
+                   FROM mt_market_observations WHERE video_id IN ({placeholders})
+                   ORDER BY video_id, observed_at, observation_id""",
+                video_ids,
+            )
+            trend_observations = _grouped_rows(
+                connection,
+                """SELECT trend_id AS subject_id, observed_at, state, trend_strength
+                   FROM mt_trend_observations WHERE trend_id IN ({placeholders})
+                   ORDER BY trend_id, observed_at, trend_observation_id""",
+                trend_ids,
+            )
+
+            updates: List[Tuple[str, int]] = []
+            pending_due = 0
+            unscorable = 0
+            for prediction in pending:
+                predicted_at = _as_datetime(prediction["predicted_at"])
+                horizon_hours = _prediction_horizon_hours(str(prediction["horizon"]))
+                target_at = predicted_at + timedelta(hours=horizon_hours)
+                if as_of < target_at:
+                    continue
+                pending_due += 1
+                outcome: Optional[Dict[str, Any]] = None
+                if prediction["subject_type"] == "video":
+                    rows = video_observations.get(str(prediction["subject_id"]), [])
+                    baseline = [row for row in rows if _as_datetime(row["observed_at"]) <= predicted_at]
+                    followers = int(baseline[-1]["creator_followers"]) if baseline else 0
+                    follow_up = next((
+                        row for row in rows
+                        if target_at <= _as_datetime(row["observed_at"]) <= target_at + timedelta(hours=2)
+                    ), None)
+                    if followers <= 0:
+                        outcome = {
+                            "state": "unscorable",
+                            "reason": "missing_creator_follower_baseline",
+                            "evaluated_at": isoformat(as_of),
+                            "target_at": isoformat(target_at),
+                        }
+                        unscorable += 1
+                    elif follow_up is not None:
+                        threshold = followers * 10
+                        outcome = {
+                            "state": "scored",
+                            "actual": int(int(follow_up["views"]) >= threshold),
+                            "observed_views": int(follow_up["views"]),
+                            "threshold_views": threshold,
+                            "follow_up_at": follow_up["observed_at"],
+                            "evaluated_at": isoformat(as_of),
+                            "target_at": isoformat(target_at),
+                        }
+                else:
+                    rows = trend_observations.get(str(prediction["subject_id"]), [])
+                    baseline = [
+                        row for row in rows
+                        if _as_datetime(row["observed_at"]) <= predicted_at
+                    ]
+                    baseline_row = baseline[-1] if baseline else None
+                    baseline_hot = bool(
+                        baseline_row
+                        and (
+                            str(baseline_row["state"]).casefold()
+                            in {"breakout", "expanding", "saturating"}
+                            or float(baseline_row["trend_strength"]) >= 70.0
+                        )
+                    )
+                    if prediction["horizon"] == ENTRY_HORIZON and baseline_row is None:
+                        outcome = {
+                            "state": "unscorable",
+                            "reason": "missing_pre_breakout_baseline",
+                            "evaluated_at": isoformat(as_of),
+                            "target_at": isoformat(target_at),
+                        }
+                        unscorable += 1
+                    elif prediction["horizon"] == ENTRY_HORIZON and baseline_hot:
+                        outcome = {
+                            "state": "unscorable",
+                            "reason": "already_breakout_at_prediction",
+                            "initial_state": str(baseline_row["state"]),
+                            "initial_trend_strength": float(baseline_row["trend_strength"]),
+                            "evaluated_at": isoformat(as_of),
+                            "target_at": isoformat(target_at),
+                        }
+                        unscorable += 1
+                    window = [
+                        row for row in rows
+                        if predicted_at < _as_datetime(row["observed_at"]) <= target_at
+                    ]
+                    coverage = bool(
+                        window
+                        and _as_datetime(window[-1]["observed_at"])
+                        >= target_at - timedelta(minutes=30)
+                    )
+                    if outcome is None and coverage:
+                        breakout_states = {"breakout", "expanding", "saturating"}
+                        future_breakout = any(
+                            str(row["state"]).casefold() in breakout_states
+                            or float(row["trend_strength"]) >= 70.0
+                            for row in window
+                        )
+                        actual = (
+                            baseline_hot or future_breakout
+                            if prediction["horizon"] == PROGRESSION_HORIZON
+                            else future_breakout
+                        )
+                        outcome = {
+                            "state": "scored",
+                            "actual": int(actual),
+                            "observations_in_horizon": len(window),
+                            "max_trend_strength": round(max(
+                                float(row["trend_strength"]) for row in window
+                            ), 6),
+                            "terminal_state": str(window[-1]["state"]),
+                            "initial_state": (
+                                str(baseline_row["state"])
+                                if baseline_row is not None else None
+                            ),
+                            "initial_trend_strength": (
+                                float(baseline_row["trend_strength"])
+                                if baseline_row is not None else None
+                            ),
+                            "follow_up_at": window[-1]["observed_at"],
+                            "evaluated_at": isoformat(as_of),
+                            "target_at": isoformat(target_at),
+                        }
+                if outcome is not None:
+                    updates.append((json.dumps(outcome, sort_keys=True), int(prediction["prediction_id"])))
+
+            if updates:
+                connection.executemany(
+                    "UPDATE mt_predictions SET outcome_json = ? WHERE prediction_id = ?",
+                    updates,
+                )
+
+        updated_ids = [prediction_id for _, prediction_id in updates]
+        queued = self.enqueue_prediction_updates(updated_ids)
+        report = self.prediction_backtest()
+        report.update({
+            "evaluated_at": isoformat(as_of),
+            "pending_due": pending_due - len(updates),
+            "newly_labeled": len(updates),
+            "newly_unscorable": unscorable,
+            "outbox_records": queued,
+        })
+        return report
+
+    def enqueue_prediction_updates(self, prediction_ids: Sequence[int]) -> int:
+        ids = sorted({int(value) for value in prediction_ids})
+        if not ids:
+            return 0
+        created_at = isoformat(utc_now())
+        with self.connect() as connection:
+            rows = _select_in(connection, "mt_predictions", "prediction_id", ids)
+            for row in rows:
+                payload = dict(row)
+                payload.pop("prediction_id", None)
+                key = _prediction_key(payload)
+                payload["prediction_key"] = key
+                connection.execute(
+                    """INSERT INTO mt_sync_outbox(
+                           entity_type, entity_key, payload_json, created_at, next_attempt_at
+                       ) VALUES('prediction', ?, ?, ?, ?)
+                       ON CONFLICT(entity_type, entity_key) DO UPDATE SET
+                           payload_json = excluded.payload_json,
+                           next_attempt_at = excluded.next_attempt_at,
+                           synced_at = NULL,
+                           error_detail = ''""",
+                    (key, json.dumps(payload, sort_keys=True), created_at, created_at),
+                )
+        return len(rows)
+
+    def prediction_backtest(self) -> Dict[str, Any]:
+        with self.connect() as connection:
+            rows = [dict(row) for row in connection.execute(
+                """SELECT subject_type, model_version, horizon, probability, outcome_json
+                   FROM mt_predictions WHERE outcome_json IS NOT NULL"""
+            ).fetchall()]
+            pending = int(connection.execute(
+                "SELECT COUNT(*) FROM mt_predictions WHERE outcome_json IS NULL"
+            ).fetchone()[0])
+        grouped: Dict[Tuple[str, str, str], List[Tuple[float, int]]] = {}
+        unscorable = 0
+        for row in rows:
+            try:
+                outcome = json.loads(row["outcome_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if outcome.get("state") != "scored":
+                unscorable += 1
+                continue
+            key = (str(row["subject_type"]), str(row["model_version"]), str(row["horizon"]))
+            grouped.setdefault(key, []).append((
+                max(0.0, min(1.0, float(row["probability"]))),
+                int(bool(outcome.get("actual"))),
+            ))
+        models = []
+        for (subject_type, model_version, horizon), values in sorted(grouped.items()):
+            probabilities = [value[0] for value in values]
+            actuals = [value[1] for value in values]
+            labels = len(values)
+            positive_rate = sum(actuals) / labels
+            brier = sum((probability - actual) ** 2 for probability, actual in values) / labels
+            baseline_brier = positive_rate * (1.0 - positive_rate)
+            log_loss = -sum(
+                actual * math.log(max(1e-9, probability))
+                + (1 - actual) * math.log(max(1e-9, 1.0 - probability))
+                for probability, actual in values
+            ) / labels
+            calibration_bins = _calibration_bins(values)
+            ece = sum(
+                bucket["count"] / labels * abs(bucket["mean_probability"] - bucket["positive_rate"])
+                for bucket in calibration_bins
+            )
+            has_two_classes = 0 < sum(actuals) < labels
+            enough_labels = labels >= max(1, self.config.prediction_min_backtest_labels)
+            skill = (
+                1.0 - brier / baseline_brier
+                if baseline_brier > 0
+                else None
+            )
+            if not enough_labels or not has_two_classes:
+                state = "collecting_labels"
+            elif skill is not None and skill > 0:
+                state = "validated"
+            else:
+                state = "measured_not_validated"
+            models.append({
+                "subject_type": subject_type,
+                "model_version": model_version,
+                "horizon": horizon,
+                "state": state,
+                "labels": labels,
+                "positives": sum(actuals),
+                "positive_rate": round(positive_rate, 6),
+                "mean_probability": round(sum(probabilities) / labels, 6),
+                "brier_score": round(brier, 6),
+                "baseline_brier_score": round(baseline_brier, 6),
+                "brier_skill_score": round(skill, 6) if skill is not None else None,
+                "log_loss": round(log_loss, 6),
+                "accuracy_at_0_5": round(sum(
+                    int((probability >= 0.5) == bool(actual))
+                    for probability, actual in values
+                ) / labels, 6),
+                "roc_auc": _roc_auc(values),
+                "expected_calibration_error": round(ece, 6),
+                "calibration_bins": calibration_bins,
+            })
+        return {
+            "state": (
+                "validated"
+                if models and all(model["state"] == "validated" for model in models)
+                else "collecting_or_unvalidated"
+            ),
+            "minimum_labels": self.config.prediction_min_backtest_labels,
+            "scored_labels": sum(model["labels"] for model in models),
+            "unscorable": unscorable,
+            "pending": pending,
+            "models": models,
+        }
 
     def status(self) -> Dict[str, Any]:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -1446,6 +2275,7 @@ class MarketTapeStore:
                 "trends": connection.execute("SELECT COUNT(*) FROM mt_trends").fetchone()[0],
                 "trend_observations": connection.execute("SELECT COUNT(*) FROM mt_trend_observations").fetchone()[0],
                 "predictions": connection.execute("SELECT COUNT(*) FROM mt_predictions").fetchone()[0],
+                "query_attempts": connection.execute("SELECT COUNT(*) FROM mt_query_attempts").fetchone()[0],
                 "due_polls": connection.execute("SELECT COUNT(*) FROM mt_poll_queue WHERE due_at <= ?", (isoformat(utc_now()),)).fetchone()[0],
             }
             platform_rows = connection.execute(
@@ -1640,6 +2470,24 @@ class MarketTapeStore:
                 (min(max(1, limit), 500),),
             ).fetchall()]
 
+    def list_query_attempts(
+        self,
+        limit: int = 100,
+        platform: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM mt_query_attempts"
+        params: List[Any] = []
+        if platform:
+            query += " WHERE platform = ?"
+            params.append(platform)
+        query += " ORDER BY attempted_at DESC, query LIMIT ?"
+        params.append(min(max(1, limit), 5000))
+        with self.connect() as connection:
+            rows = [dict(row) for row in connection.execute(query, params).fetchall()]
+        for row in rows:
+            row["metadata"] = json.loads(row.pop("metadata_json"))
+        return rows
+
     def list_predictions(
         self, limit: int = 100, subject_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -1657,6 +2505,424 @@ class MarketTapeStore:
             if row.get("outcome_json"):
                 row["outcome"] = json.loads(row.pop("outcome_json"))
         return rows
+
+    def trend_opportunities(
+        self,
+        limit: int = 100,
+        max_saturation: float = 0.75,
+        min_videos: int = 2,
+        min_measured_videos: int = 2,
+    ) -> Dict[str, Any]:
+        """Rank specific, evidenced trends without conflating rank with probability."""
+        active_model = load_active_model(self.config)
+        maximum = min(500, max(1, int(limit)))
+        saturation_ceiling = min(1.0, max(0.0, float(max_saturation)))
+        minimum_videos = min(10000, max(1, int(min_videos)))
+        minimum_measured_videos = min(
+            10000,
+            max(1, int(min_measured_videos)),
+        )
+        cutoff = isoformat(utc_now() - timedelta(hours=24))
+        with self.connect() as connection:
+            rows = [dict(row) for row in connection.execute(
+                """WITH ranked_predictions AS (
+                       SELECT prediction.*, ROW_NUMBER() OVER (
+                           PARTITION BY prediction.subject_id
+                           ORDER BY prediction.predicted_at DESC,
+                                    prediction.prediction_id DESC
+                       ) AS row_number
+                       FROM mt_predictions prediction
+                       WHERE prediction.subject_type = 'trend'
+                         AND prediction.model_version = ?
+                         AND prediction.predicted_at >= ?
+                   ), ranked_observations AS (
+                       SELECT observation.*, ROW_NUMBER() OVER (
+                           PARTITION BY observation.trend_id
+                           ORDER BY observation.observed_at DESC,
+                                    observation.trend_observation_id DESC
+                       ) AS row_number
+                       FROM mt_trend_observations observation
+                       WHERE observation.observed_at >= ?
+                   )
+                   SELECT trend.trend_id, trend.trend_type, trend.canonical_key,
+                          trend.display_name, trend.first_seen_at, trend.last_seen_at,
+                          observation.observed_at, observation.videos_total,
+                          observation.videos_new_1h, observation.creators_total,
+                          observation.creators_new_1h, observation.platforms_total,
+                          observation.views_total, observation.likes_total,
+                          observation.comments_total, observation.shares_total,
+                          observation.views_new_1h, observation.likes_new_1h,
+                          observation.comments_new_1h, observation.shares_new_1h,
+                          observation.counter_delta_videos,
+                          observation.activity_coverage,
+                          observation.median_video_velocity,
+                          observation.p90_video_velocity,
+                          observation.creator_breadth, observation.platform_breadth,
+                          observation.top1_concentration, observation.top10_concentration,
+                          observation.momentum, observation.acceleration,
+                          observation.relative_strength, observation.saturation,
+                          observation.trend_strength, observation.index_version,
+                          observation.state, prediction.model_version,
+                          prediction.predicted_at, prediction.horizon,
+                          prediction.probability, prediction.expected_peak_at,
+                          prediction.expected_remaining_life_hours
+                   FROM mt_trends trend
+                   JOIN ranked_observations observation
+                     ON observation.trend_id = trend.trend_id
+                    AND observation.row_number = 1
+                   LEFT JOIN ranked_predictions prediction
+                     ON prediction.subject_id = trend.trend_id
+                    AND prediction.row_number = 1
+                   ORDER BY observation.trend_strength DESC,
+                            prediction.probability DESC
+                   LIMIT 20000""",
+                (
+                    str(active_model.get("model_version") or "")
+                    if active_model is not None else "",
+                    cutoff,
+                    cutoff,
+                ),
+            ).fetchall()]
+
+        candidates: List[Dict[str, Any]] = []
+        suppressed: Dict[str, int] = {}
+        purpose = model_purpose(active_model) if active_model is not None else "none"
+        model_index_version = str(
+            ((active_model or {}).get("training") or {}).get("index_version")
+            or "trend-strength-v1"
+        )
+        model_ready = bool(
+            active_model is not None
+            and model_index_version == TREND_INDEX_VERSION
+        )
+        if model_ready and purpose == "early_breakout_entry":
+            weights = {
+                "model_probability": 0.25,
+                "trend_strength": 0.10,
+                "relative_strength": 0.08,
+                "momentum": 0.08,
+                "acceleration": 0.07,
+                "breadth": 0.10,
+                "unsaturated": 0.05,
+                "evidence_reliability": 0.07,
+                "activity_coverage": 0.08,
+                "activity_volume": 0.12,
+            }
+        elif model_ready:
+            weights = {
+                "model_probability": 0.05,
+                "trend_strength": 0.12,
+                "relative_strength": 0.12,
+                "momentum": 0.12,
+                "acceleration": 0.10,
+                "breadth": 0.12,
+                "unsaturated": 0.08,
+                "evidence_reliability": 0.08,
+                "activity_coverage": 0.08,
+                "activity_volume": 0.13,
+            }
+        else:
+            weights = {
+                "model_probability": 0.0,
+                "trend_strength": 0.13,
+                "relative_strength": 0.13,
+                "momentum": 0.13,
+                "acceleration": 0.08,
+                "breadth": 0.13,
+                "unsaturated": 0.08,
+                "evidence_reliability": 0.10,
+                "activity_coverage": 0.10,
+                "activity_volume": 0.12,
+            }
+        for row in rows:
+            reason = _opportunity_exclusion_reason(
+                row,
+                saturation_ceiling=saturation_ceiling,
+                minimum_videos=minimum_videos,
+                minimum_measured_videos=minimum_measured_videos,
+            )
+            if reason:
+                suppressed[reason] = suppressed.get(reason, 0) + 1
+                continue
+            prediction_available = bool(
+                model_ready
+                and row.get("model_version")
+                and row.get("probability") is not None
+            )
+            probability = (
+                min(1.0, max(0.0, float(row["probability"])))
+                if prediction_available else 0.0
+            )
+            strength = min(1.0, max(0.0, float(row["trend_strength"]) / 70.0))
+            activity_coverage = min(
+                1.0,
+                max(0.0, float(row["activity_coverage"])),
+            )
+            activity_reliability = math.sqrt(activity_coverage)
+            activity_volume = min(
+                1.0,
+                math.log1p(max(0, int(row["views_new_1h"])))
+                / math.log1p(100000),
+            )
+            relative = _centered_signal(
+                float(row["relative_strength"])
+            ) * activity_reliability
+            momentum = _centered_signal(
+                float(row["momentum"])
+            ) * activity_reliability
+            acceleration = _centered_signal(
+                float(row["acceleration"])
+            ) * activity_reliability
+            breadth = (
+                min(1.0, max(0.0, float(row["creator_breadth"])))
+                + min(1.0, max(0.0, float(row["platform_breadth"])))
+            ) / 2.0
+            unsaturated = 1.0 - min(1.0, max(0.0, float(row["saturation"])))
+            evidence_reliability = (
+                min(1.0, math.log1p(int(row["videos_total"])) / math.log1p(50))
+                + min(1.0, int(row["creators_total"]) / 10.0)
+                + min(1.0, int(row["platforms_total"]) / 3.0)
+            ) / 3.0
+            components = {
+                "model_probability": round(probability, 6),
+                "trend_strength": round(strength, 6),
+                "relative_strength": round(relative, 6),
+                "momentum": round(momentum, 6),
+                "acceleration": round(acceleration, 6),
+                "breadth": round(breadth, 6),
+                "unsaturated": round(unsaturated, 6),
+                "evidence_reliability": round(evidence_reliability, 6),
+                "activity_coverage": round(activity_coverage, 6),
+                "activity_volume": round(activity_volume, 6),
+            }
+            score = 100.0 * sum(
+                weights[name] * components[name] for name in weights
+            )
+            candidates.append({
+                "trend_id": row["trend_id"],
+                "trend_type": row["trend_type"],
+                "display_name": row["display_name"],
+                "state": row["state"],
+                "opportunity_class": _opportunity_class(str(row["state"])),
+                "evidence_grade": _opportunity_evidence_grade(row),
+                "opportunity_score": round(score, 3),
+                "ranking_components": components,
+                "prediction": ({
+                    "model_version": row["model_version"],
+                    "model_purpose": purpose,
+                    "horizon": row["horizon"],
+                    "probability": probability,
+                    "predicted_at": row["predicted_at"],
+                    "expected_peak_at": row["expected_peak_at"],
+                    "expected_remaining_life_hours": row[
+                        "expected_remaining_life_hours"
+                    ],
+                } if prediction_available else None),
+                "signals": {
+                    "index_version": row["index_version"],
+                    "trend_strength": float(row["trend_strength"]),
+                    "relative_strength": float(row["relative_strength"]),
+                    "momentum": float(row["momentum"]),
+                    "acceleration": float(row["acceleration"]),
+                    "saturation": float(row["saturation"]),
+                    "median_video_velocity": float(row["median_video_velocity"]),
+                    "p90_video_velocity": float(row["p90_video_velocity"]),
+                },
+                "evidence": {
+                    "videos_total": int(row["videos_total"]),
+                    "videos_new_1h": int(row["videos_new_1h"]),
+                    "creators_total": int(row["creators_total"]),
+                    "creators_new_1h": int(row["creators_new_1h"]),
+                    "platforms_total": int(row["platforms_total"]),
+                    "views_total": int(row["views_total"]),
+                    "likes_total": int(row["likes_total"]),
+                    "comments_total": int(row["comments_total"]),
+                    "shares_total": int(row["shares_total"]),
+                    "views_new_1h": int(row["views_new_1h"]),
+                    "likes_new_1h": int(row["likes_new_1h"]),
+                    "comments_new_1h": int(row["comments_new_1h"]),
+                    "shares_new_1h": int(row["shares_new_1h"]),
+                    "counter_delta_videos": int(row["counter_delta_videos"]),
+                    "activity_coverage": activity_coverage,
+                    "observed_at": row["observed_at"],
+                },
+            })
+        candidates.sort(key=lambda row: (
+            -float(row["opportunity_score"]),
+            -int(row["evidence"]["videos_total"]),
+            str(row["display_name"]).casefold(),
+        ))
+        memberships: Dict[str, set[str]] = {
+            str(candidate["trend_id"]): set() for candidate in candidates
+        }
+        candidate_ids = list(memberships)
+        with self.connect() as connection:
+            for offset in range(0, len(candidate_ids), 400):
+                chunk = candidate_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in connection.execute(
+                    f"""SELECT trend_id, video_id FROM mt_trend_memberships
+                         WHERE trend_id IN ({placeholders})""",
+                    chunk,
+                ).fetchall():
+                    memberships[str(row["trend_id"])].add(str(row["video_id"]))
+        selected: List[Dict[str, Any]] = []
+        selected_tokens: List[set[str]] = []
+        selected_memberships: List[set[str]] = []
+        type_counts: Dict[str, int] = {}
+        class_counts: Dict[str, int] = {}
+        type_limit = max(1, math.ceil(maximum * 0.5))
+        class_limit = max(1, math.ceil(maximum * 0.6))
+        for candidate in candidates:
+            tokens = _trend_label_tokens(str(candidate["display_name"]))
+            if any(_token_overlap(tokens, existing) >= 0.8 for existing in selected_tokens):
+                suppressed["near_duplicate_label"] = (
+                    suppressed.get("near_duplicate_label", 0) + 1
+                )
+                continue
+            candidate_memberships = memberships[str(candidate["trend_id"])]
+            if any(
+                _membership_overlap(candidate_memberships, existing) >= 0.4
+                for existing in selected_memberships
+            ):
+                suppressed["near_duplicate_evidence"] = (
+                    suppressed.get("near_duplicate_evidence", 0) + 1
+                )
+                continue
+            trend_type = str(candidate["trend_type"])
+            if type_counts.get(trend_type, 0) >= type_limit:
+                suppressed["portfolio_type_limit"] = (
+                    suppressed.get("portfolio_type_limit", 0) + 1
+                )
+                continue
+            opportunity_class = str(candidate["opportunity_class"])
+            if class_counts.get(opportunity_class, 0) >= class_limit:
+                suppressed["portfolio_class_limit"] = (
+                    suppressed.get("portfolio_class_limit", 0) + 1
+                )
+                continue
+            candidate["rank"] = len(selected) + 1
+            selected.append(candidate)
+            selected_tokens.append(tokens)
+            selected_memberships.append(candidate_memberships)
+            type_counts[trend_type] = type_counts.get(trend_type, 0) + 1
+            class_counts[opportunity_class] = class_counts.get(opportunity_class, 0) + 1
+            if len(selected) >= maximum:
+                break
+        detail = self._opportunity_content_details(
+            [str(candidate["trend_id"]) for candidate in selected],
+            examples_per_trend=3,
+        )
+        for candidate in selected:
+            trend_detail = detail.get(str(candidate["trend_id"]), {})
+            candidate["platform_distribution"] = trend_detail.get("platforms", {})
+            candidate["representative_content"] = trend_detail.get("examples", [])
+        return {
+            "contract": OPPORTUNITY_CONTRACT,
+            "ranker_version": OPPORTUNITY_RANKER_VERSION,
+            "state": "ready",
+            "generated_at": isoformat(utc_now()),
+            "active_model": ({
+                "model_version": active_model["model_version"],
+                "model_purpose": purpose,
+                "training_index_version": model_index_version,
+                "compatible_with_current_index": model_ready,
+            } if active_model is not None else None),
+            "current_index_version": TREND_INDEX_VERSION,
+            "score_is_probability": False,
+            "ranking_weights": weights,
+            "filters": {
+                "states": sorted(ACTIONABLE_TREND_STATES),
+                "maximum_saturation": saturation_ceiling,
+                "minimum_videos": minimum_videos,
+                "minimum_measured_videos": minimum_measured_videos,
+                "format_aggregates_excluded": True,
+                "generic_distribution_labels_excluded": True,
+                "crawler_expansion_excluded_from_activity": True,
+                "near_duplicate_token_overlap": 0.8,
+                "near_duplicate_membership_overlap": 0.4,
+                "maximum_trend_type_share": 0.5,
+                "maximum_opportunity_class_share": 0.6,
+            },
+            "candidates_considered": len(rows),
+            "eligible_candidates": len(candidates),
+            "suppressed_by_reason": dict(sorted(suppressed.items())),
+            "opportunities": selected,
+        }
+
+    def _opportunity_content_details(
+        self,
+        trend_ids: Sequence[str],
+        examples_per_trend: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        detail: Dict[str, Dict[str, Any]] = {
+            trend_id: {"platforms": {}, "examples": []} for trend_id in trend_ids
+        }
+        if not trend_ids:
+            return detail
+        with self.connect() as connection:
+            for offset in range(0, len(trend_ids), 400):
+                chunk = list(trend_ids[offset:offset + 400])
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"""SELECT membership.trend_id, video.video_id,
+                                video.platform, video.external_id, video.title,
+                                video.caption, video.url, video.published_at,
+                                creator.handle AS creator_handle,
+                                observation.observed_at, observation.views,
+                                observation.likes, observation.comments,
+                                observation.shares, observation.view_velocity,
+                                observation.view_acceleration,
+                                observation.relative_strength
+                         FROM mt_trend_memberships membership
+                         JOIN mt_videos video ON video.video_id = membership.video_id
+                         JOIN mt_creators creator ON creator.creator_id = video.creator_id
+                         LEFT JOIN mt_market_observations observation
+                           ON observation.observation_id = (
+                               SELECT current.observation_id
+                               FROM mt_market_observations current
+                               WHERE current.video_id = video.video_id
+                               ORDER BY current.observed_at DESC,
+                                        current.observation_id DESC
+                               LIMIT 1
+                           )
+                         WHERE membership.trend_id IN ({placeholders})
+                         ORDER BY membership.trend_id,
+                                  COALESCE(observation.relative_strength, 0) DESC,
+                                  COALESCE(observation.view_velocity, 0) DESC,
+                                  COALESCE(observation.views, 0) DESC""",
+                    chunk,
+                ).fetchall()
+                for raw in rows:
+                    row = dict(raw)
+                    trend_detail = detail[str(row["trend_id"])]
+                    platform = str(row["platform"])
+                    platforms = trend_detail["platforms"]
+                    platforms[platform] = platforms.get(platform, 0) + 1
+                    examples = trend_detail["examples"]
+                    if len(examples) >= examples_per_trend:
+                        continue
+                    examples.append({
+                        "video_id": row["video_id"],
+                        "platform": platform,
+                        "external_id": row["external_id"],
+                        "creator_handle": row["creator_handle"],
+                        "title": row["title"],
+                        "caption_excerpt": str(row["caption"] or "")[:240],
+                        "url": row["url"],
+                        "published_at": row["published_at"],
+                        "observed_at": row["observed_at"],
+                        "views": int(row["views"] or 0),
+                        "likes": int(row["likes"] or 0),
+                        "comments": int(row["comments"] or 0),
+                        "shares": int(row["shares"] or 0),
+                        "view_velocity": float(row["view_velocity"] or 0.0),
+                        "view_acceleration": float(
+                            row["view_acceleration"] or 0.0
+                        ),
+                        "relative_strength": float(row["relative_strength"] or 0.0),
+                    })
+        return detail
 
     def social_candles(
         self, window_minutes: int = 15, limit: int = 96, platform: Optional[str] = None
@@ -1747,6 +3013,65 @@ class MarketTapeStore:
         return "statement"
 
 
+def _recent_counter_activity(row: Any, observed_at: datetime) -> Dict[str, Any]:
+    window_start = observed_at - timedelta(hours=1)
+    latest_at = _as_datetime(row["observed_at"])
+    empty: Dict[str, Any] = {
+        "measured": False,
+        "views": 0,
+        "likes": 0,
+        "comments": 0,
+        "shares": 0,
+        "view_velocity": 0.0,
+        "view_acceleration": 0.0,
+    }
+    if latest_at < window_start or latest_at > observed_at:
+        return empty
+
+    prior_value = row["prior_observed_at"]
+    if prior_value:
+        prior_at = _as_datetime(prior_value)
+        elapsed_seconds = (latest_at - prior_at).total_seconds()
+        covered_seconds = (
+            latest_at - max(prior_at, window_start)
+        ).total_seconds()
+        if elapsed_seconds <= 0 or covered_seconds <= 0:
+            return empty
+        fraction = min(1.0, covered_seconds / elapsed_seconds)
+        result = dict(empty)
+        result["measured"] = True
+        for field in ("views", "likes", "comments", "shares"):
+            delta = max(0, int(row[field]) - int(row[f"prior_{field}"]))
+            result[field] = max(0, round(delta * fraction))
+        result["view_velocity"] = float(row["view_velocity"])
+        result["view_acceleration"] = float(row["view_acceleration"])
+        return result
+
+    published_value = row["published_at"]
+    if not published_value:
+        return empty
+    published_at = _as_datetime(published_value)
+    if not (window_start <= published_at <= latest_at):
+        return empty
+    result = dict(empty)
+    result["measured"] = True
+    for field in ("views", "likes", "comments", "shares"):
+        result[field] = max(0, int(row[field]))
+    result["view_velocity"] = log_velocity(
+        0,
+        int(row["views"]),
+        max(1.0, (latest_at - published_at).total_seconds()),
+    )
+    return result
+
+
+def _in_observation_window(value: Any, observed_at: datetime, hours: int) -> bool:
+    if not value:
+        return False
+    timestamp = _as_datetime(value)
+    return observed_at - timedelta(hours=max(1, hours)) <= timestamp <= observed_at
+
+
 def _percentile(values: Sequence[float], percentile: float) -> float:
     if not values:
         return 0.0
@@ -1756,6 +3081,205 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
 
 def _sigmoid(value: float) -> float:
     return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, value))))
+
+
+def _as_datetime(value: Any) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _prediction_horizon_hours(horizon: str) -> float:
+    if horizon == "exceeds_10x_creator_baseline_within_24h":
+        return 24.0
+    if horizon in {
+        "reaches_breakout_within_6h",
+        ENTRY_HORIZON,
+        PROGRESSION_HORIZON,
+    }:
+        return 6.0
+    match = re.search(r"within_(\d+(?:\.\d+)?)h", horizon)
+    return float(match.group(1)) if match else 24.0
+
+
+def _opportunity_exclusion_reason(
+    row: Dict[str, Any],
+    saturation_ceiling: float,
+    minimum_videos: int,
+    minimum_measured_videos: int,
+) -> Optional[str]:
+    if str(row["index_version"]) != TREND_INDEX_VERSION:
+        return "stale_index_version"
+    if str(row["trend_type"]).casefold() == "format":
+        return "format_aggregate"
+    if str(row["state"]).casefold() not in ACTIONABLE_TREND_STATES:
+        return "non_actionable_state"
+    if float(row["saturation"]) > saturation_ceiling:
+        return "above_saturation_ceiling"
+    if int(row["videos_total"]) < minimum_videos:
+        return "insufficient_video_evidence"
+    if int(row["counter_delta_videos"]) < minimum_measured_videos:
+        return "insufficient_measured_activity"
+    normalized = " ".join(
+        token.casefold()
+        for token in WORD_RE.findall(str(row["display_name"]).lstrip("#"))
+    )
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    if normalized in GENERIC_TREND_LABELS or compact in GENERIC_TREND_LABELS:
+        return "generic_distribution_label"
+    if not compact or compact.isdigit() or len(compact) < 3:
+        return "non_specific_label"
+    if not _is_specific_trend_phrase(str(row["display_name"]), str(row["trend_type"])):
+        return "incomplete_phrase"
+    return None
+
+
+def _trend_label_tokens(value: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in WORD_RE.findall(value.lstrip("#"))
+        if token.casefold() not in STOP_WORDS
+    }
+
+
+def _context_trend_key(context: Any) -> str:
+    if not isinstance(context, dict):
+        return ""
+    raw_value = next((
+        str(context.get(field) or "").strip()
+        for field in ("query_family", "topic", "niche")
+        if str(context.get(field) or "").strip()
+    ), "")
+    words = [
+        word.casefold()
+        for word in WORD_RE.findall(raw_value)
+        if word.casefold() not in STOP_WORDS
+    ][:6]
+    key = " ".join(words)
+    if _is_specific_trend_phrase(key, "topic"):
+        return key
+    if len(words) == 1 and len(words[0]) >= 4 and words[0] not in GENERIC_TREND_LABELS:
+        return words[0]
+    return ""
+
+
+def _is_specific_trend_phrase(value: str, trend_type: str) -> bool:
+    if trend_type.casefold() not in {"topic", "hook"}:
+        return True
+    tokens = [token.casefold() for token in WORD_RE.findall(value)]
+    if len(tokens) < 2:
+        return False
+    return (
+        tokens[0] not in VAGUE_PHRASE_LEADERS
+        and tokens[-1] not in VAGUE_PHRASE_TRAILERS
+    )
+
+
+def _token_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _membership_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
+
+
+def _centered_signal(value: float) -> float:
+    return _sigmoid(max(-8.0, min(8.0, value)))
+
+
+def _opportunity_class(state: str) -> str:
+    normalized = state.casefold()
+    if normalized in {"discovering", "emerging"}:
+        return "early"
+    if normalized == "breakout":
+        return "active_breakout"
+    return "recurring_wave"
+
+
+def _opportunity_evidence_grade(row: Dict[str, Any]) -> str:
+    measured = int(row["counter_delta_videos"])
+    platforms = int(row["platforms_total"])
+    recent_views = int(row["views_new_1h"])
+    if measured >= 5 and platforms >= 2 and recent_views >= 10000:
+        return "high"
+    if measured >= 3 and recent_views >= 1000:
+        return "medium"
+    return "provisional"
+
+
+def _prediction_key(payload: Dict[str, Any]) -> str:
+    return stable_hash({
+        "subject_type": payload["subject_type"],
+        "subject_id": payload["subject_id"],
+        "model_version": payload["model_version"],
+        "predicted_at": payload["predicted_at"],
+        "horizon": payload["horizon"],
+    })
+
+
+def _grouped_rows(
+    connection: sqlite3.Connection,
+    query_template: str,
+    subject_ids: Sequence[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for offset in range(0, len(subject_ids), 400):
+        chunk = list(subject_ids[offset:offset + 400])
+        placeholders = ",".join("?" for _ in chunk)
+        for row in connection.execute(
+            query_template.format(placeholders=placeholders),
+            chunk,
+        ).fetchall():
+            payload = dict(row)
+            grouped.setdefault(str(payload["subject_id"]), []).append(payload)
+    return grouped
+
+
+def _calibration_bins(values: Sequence[Tuple[float, int]]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    for index in range(10):
+        lower = index / 10.0
+        upper = (index + 1) / 10.0
+        bucket = [
+            (probability, actual) for probability, actual in values
+            if lower <= probability < upper or (index == 9 and probability == 1.0)
+        ]
+        if not bucket:
+            continue
+        output.append({
+            "lower": lower,
+            "upper": upper,
+            "count": len(bucket),
+            "mean_probability": round(sum(value[0] for value in bucket) / len(bucket), 6),
+            "positive_rate": round(sum(value[1] for value in bucket) / len(bucket), 6),
+        })
+    return output
+
+
+def _roc_auc(values: Sequence[Tuple[float, int]]) -> Optional[float]:
+    ordered = sorted(values, key=lambda value: value[0])
+    positives = sum(actual for _, actual in ordered)
+    negatives = len(ordered) - positives
+    if positives == 0 or negatives == 0:
+        return None
+    positive_rank_sum = 0.0
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and ordered[end][0] == ordered[index][0]:
+            end += 1
+        average_rank = ((index + 1) + end) / 2.0
+        positive_rank_sum += average_rank * sum(
+            actual for _, actual in ordered[index:end]
+        )
+        index = end
+    auc = (
+        positive_rank_sum - positives * (positives + 1) / 2.0
+    ) / (positives * negatives)
+    return round(auc, 6)
 
 
 def _select_in(

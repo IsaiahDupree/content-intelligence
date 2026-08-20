@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import threading
@@ -26,7 +27,13 @@ from services.market_tape.migration import (
     project_ref_from_url,
     validate_migration,
 )
-from services.market_tape.models import MarketContent, MetricCounters, SourceReceipt, SourceState
+from services.market_tape.models import (
+    MarketContent,
+    MetricCounters,
+    SourceReceipt,
+    SourceState,
+    stable_hash,
+)
 from services.market_tape.sources.base import sanitize
 from services.market_tape.sources.local_research import LocalResearchSource
 from services.market_tape.sources.youtube import YouTubeSource
@@ -39,6 +46,7 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
     received_posts = []
     received_gets = []
     remote_runs = set()
+    research_jobs = {}
 
     def do_GET(self):  # noqa: N802 - HTTP handler contract
         parsed = urlparse(self.path)
@@ -49,6 +57,11 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/research/status":
             self._json({"currentJob": None, "recentJobs": []})
+            return
+        if parsed.path.startswith("/api/research/status/"):
+            job_id = parsed.path.rsplit("/", 1)[-1]
+            job = self.__class__.research_jobs.get(job_id)
+            self._json(job or {"error": "not found"}, status=200 if job else 404)
             return
         if parsed.path == "/search":
             if query.get("q") == ["force-http-error"]:
@@ -116,6 +129,8 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
                     trigger_names.append("actp_market_observations_no_update")
                 if table == "actp_market_discovery_attributions":
                     trigger_names.append("actp_market_discovery_attributions_no_update")
+                if table == "actp_market_query_attempts":
+                    trigger_names.append("actp_market_query_attempts_no_update")
                 if table == "actp_trend_observations":
                     trigger_names.append("actp_trend_observations_no_update")
                 rows.append({
@@ -179,6 +194,7 @@ def provider_server():
     ProviderTestHandler.received_posts = []
     ProviderTestHandler.received_gets = []
     ProviderTestHandler.remote_runs = set()
+    ProviderTestHandler.research_jobs = {}
     server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderTestHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -197,6 +213,9 @@ def market_config(tmp_path):
         object_dir=tmp_path / "objects",
         heartbeat_path=tmp_path / "heartbeat.json",
         lock_path=tmp_path / "market.lock",
+        local_research_state_path=tmp_path / "local-research-state.json",
+        prediction_model_dir=tmp_path / "models",
+        local_research_min_free_bytes=0,
         platforms=["youtube"],
         topics=["ai automation"],
         adaptive_topics_enabled=False,
@@ -214,7 +233,7 @@ def market_config(tmp_path):
 def test_append_only_observations_motion_and_raw_archive(market_config):
     store = MarketTapeStore(market_config)
     store.start_run("run-1", "full")
-    observed = datetime(2026, 8, 18, 12, 10, tzinfo=timezone.utc)
+    observed = datetime.now(timezone.utc) - timedelta(minutes=10)
     first = _content(observed, views=100)
     second = _content(observed + timedelta(minutes=5), views=250)
 
@@ -236,6 +255,62 @@ def test_append_only_observations_motion_and_raw_archive(market_config):
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         with store.connect() as connection:
             connection.execute("UPDATE mt_market_observations SET views = 0")
+
+
+def test_trend_activity_excludes_lifetime_views_from_old_posts_discovered_now(market_config):
+    store = MarketTapeStore(market_config)
+    observed = datetime.now(timezone.utc)
+    store.start_run("crawler-expansion-run", "discovery")
+    for index, views in enumerate((5_000_000, 3_000_000), start=1):
+        store.ingest(
+            _content_for_keyword(
+                f"old-discovery-{index}",
+                "Frank Beard memorial coverage",
+                observed,
+                views,
+            ),
+            "crawler-expansion-run",
+        )
+    store.aggregate_trends(run_id="crawler-expansion-run", observed_at=observed)
+
+    with store.connect() as connection:
+        first = connection.execute(
+            """SELECT observation.* FROM mt_trend_observations observation
+               JOIN mt_trends trend USING(trend_id)
+               WHERE trend.canonical_key = 'frank beard memorial'
+               ORDER BY observation.trend_observation_id DESC LIMIT 1"""
+        ).fetchone()
+    assert first["views_total"] == 8_000_000
+    assert first["views_new_1h"] == 0
+    assert first["counter_delta_videos"] == 0
+    assert first["activity_coverage"] == 0
+    assert first["momentum"] == 0
+    assert first["state"] != "breakout"
+
+    store.start_run("counter-growth-run", "recheck")
+    later = observed + timedelta(minutes=10)
+    for index, views in enumerate((5_010_000, 3_005_000), start=1):
+        store.ingest(
+            _content_for_keyword(
+                f"old-discovery-{index}",
+                "Frank Beard memorial coverage",
+                later,
+                views,
+            ),
+            "counter-growth-run",
+        )
+    store.aggregate_trends(run_id="counter-growth-run", observed_at=later)
+    with store.connect() as connection:
+        second = connection.execute(
+            """SELECT observation.* FROM mt_trend_observations observation
+               JOIN mt_trends trend USING(trend_id)
+               WHERE trend.canonical_key = 'frank beard memorial'
+               ORDER BY observation.trend_observation_id DESC LIMIT 1"""
+        ).fetchone()
+    assert second["views_new_1h"] == 15_000
+    assert second["counter_delta_videos"] == 2
+    assert second["activity_coverage"] == 1
+    assert second["momentum"] > 0
 
 
 def test_store_context_releases_sqlite_connection(market_config):
@@ -292,6 +367,32 @@ def test_youtube_http_adapter_and_collector_receipts(provider_server, market_con
     assert result["central_sync"]["state"] == "disabled"
     assert result["status"]["central_sync"]["pending"] > 0
     assert result["status"]["daemon"]["state"] in {"starting", "healthy"}
+
+
+def test_source_receipts_count_only_requests_from_each_operation(
+    provider_server,
+    market_config,
+    monkeypatch,
+):
+    monkeypatch.setenv("YOUTUBE_API_KEY", "integration-test-key")
+    source = YouTubeSource(
+        market_config,
+        "sequential-source-run",
+        20,
+        base_url=provider_server,
+    )
+    try:
+        discovery = source.discover(2)
+        refresh = source.refresh([{"external_id": "video-search"}])
+        total_requests = source.request_count
+    finally:
+        source.close()
+
+    assert discovery.receipt.request_count > 0
+    assert refresh.receipt.request_count == 1
+    assert discovery.receipt.request_count + refresh.receipt.request_count == (
+        total_requests
+    )
 
 
 def test_youtube_broad_charts_span_categories_and_regions_without_search(
@@ -491,7 +592,7 @@ def test_market_tape_migration_contract_matches_outbox_tables():
     sink_tables = {definition[0] for definition in ENTITY_TABLES.values()}
 
     assert validation["state"] == "ready"
-    assert validation["tables_expected"] == 12
+    assert validation["tables_expected"] == len(MARKET_TAPE_TABLES)
     assert set(MARKET_TAPE_TABLES) == sink_tables
     assert set(ENTITY_SYNC_ORDER) == set(ENTITY_TABLES)
     assert project_ref_from_url("https://ivhfuhxorppptyuofbgq.supabase.co") == "ivhfuhxorppptyuofbgq"
@@ -517,7 +618,7 @@ def test_market_tape_migration_applies_and_verifies_over_real_http(provider_serv
     posts = ProviderTestHandler.received_posts[posts_before:]
     gets = ProviderTestHandler.received_gets[gets_before:]
     assert result["state"] == "applied", result
-    assert result["inspection"]["tables_ready"] == 12
+    assert result["inspection"]["tables_ready"] == len(MARKET_TAPE_TABLES)
     assert posts[0]["path"] == f"/v1/projects/{project_ref}/database/query"
     assert "create table if not exists public.actp_market_observations" in posts[0]["body"]["query"]
     assert posts[0]["body"]["read_only"] is False
@@ -558,7 +659,7 @@ def test_market_tape_migration_verifies_security_invariants_over_real_http(provi
 
     posts = ProviderTestHandler.received_posts[posts_before:]
     assert result["state"] == "ready", result
-    assert result["tables_verified"] == 12
+    assert result["tables_verified"] == len(MARKET_TAPE_TABLES)
     assert result["missing_tables"] == []
     assert result["rls_disabled"] == []
     assert result["unexpected_rls_policies"] == {}
@@ -567,8 +668,8 @@ def test_market_tape_migration_verifies_security_invariants_over_real_http(provi
     assert posts[0]["body"]["read_only"] is True
     assert "pg_catalog.pg_policies" in posts[0]["body"]["query"]
     assert counts["state"] == "ready", counts
-    assert counts["tables_counted"] == 12
-    assert counts["total_rows"] == 78
+    assert counts["tables_counted"] == len(MARKET_TAPE_TABLES)
+    assert counts["total_rows"] == sum(range(1, len(MARKET_TAPE_TABLES) + 1))
     assert posts[1]["body"]["read_only"] is True
     assert "count(*)::bigint" in posts[1]["body"]["query"]
 
@@ -932,7 +1033,362 @@ def test_local_research_archive_source_normalizes_and_schedules(provider_server,
         "policy": "niche-token-overlap-v1",
     }
     assert batch.receipt.metadata["scheduler"]["state"] == "triggered"
+    assert len(batch.query_attempts) == 1
+    assert batch.query_attempts[0].query == "ai agents"
+    assert batch.query_attempts[0].result_count == 2
     assert any(post["path"] == "/api/research/twitter/full" for post in ProviderTestHandler.received_posts)
+
+
+def test_local_research_dispatch_blocks_before_browser_when_disk_is_low(
+    provider_server,
+    market_config,
+    tmp_path,
+):
+    archive = tmp_path / "research" / "twitter"
+    archive.mkdir(parents=True)
+    config = replace(
+        market_config,
+        platforms=["x"],
+        local_research_dir=tmp_path / "research",
+        local_research_trigger_enabled=True,
+        local_research_min_free_bytes=2**63 - 1,
+    )
+    source = LocalResearchSource(
+        config,
+        "disk-pressure-run",
+        10,
+        platform="x",
+        api_platform="twitter",
+        base_url=provider_server,
+        archive_root=tmp_path / "research",
+    )
+    try:
+        batch = source.discover(10)
+    finally:
+        source.close()
+
+    scheduler = batch.receipt.metadata["scheduler"]
+    assert scheduler["state"] == "blocked_disk_pressure"
+    assert scheduler["free_bytes"] < scheduler["minimum_free_bytes"]
+    assert batch.receipt.state == SourceState.DEGRADED
+    assert batch.receipt.error_code == "insufficient_temporary_disk"
+    assert ProviderTestHandler.received_posts == []
+
+
+def test_failed_cross_platform_job_cools_down_then_retries_only_failed_lanes(
+    provider_server,
+    market_config,
+    tmp_path,
+):
+    archive = tmp_path / "research" / "tiktok"
+    archive.mkdir(parents=True)
+    now = datetime.now(timezone.utc)
+    state_path = tmp_path / "local-research-state.json"
+    state_path.write_text(json.dumps({
+        "requested_at": now.isoformat(),
+        "job_id": "failed-job",
+        "query_hash": stable_hash(["superseded frontier topic"]),
+        "query_count": 1,
+        "platforms": ["tiktok", "twitter"],
+    }), encoding="utf-8")
+    ProviderTestHandler.research_jobs["failed-job"] = {
+        "id": "failed-job",
+        "status": "failed",
+        "completedAt": now.isoformat(),
+        "platformReceipts": [
+            {"platform": "tiktok", "status": "completed"},
+            {"platform": "twitter", "status": "failed"},
+        ],
+    }
+    cooling_config = replace(
+        market_config,
+        platforms=["tiktok", "x"],
+        topics=["live sports"],
+        local_research_dir=tmp_path / "research",
+        local_research_state_path=state_path,
+        local_research_trigger_enabled=True,
+        local_research_refresh_seconds=86400,
+        local_research_failure_retry_seconds=3600,
+    )
+
+    cooling_source = LocalResearchSource(
+        cooling_config,
+        "cooling-run",
+        10,
+        platform="tiktok",
+        base_url=provider_server,
+        archive_root=tmp_path / "research",
+    )
+    try:
+        cooling = cooling_source.discover(10)
+    finally:
+        cooling_source.close()
+    assert cooling.receipt.metadata["scheduler"]["state"] == "failed_cooldown"
+    assert ProviderTestHandler.received_posts == []
+
+    retry_config = replace(cooling_config, local_research_failure_retry_seconds=0)
+    retry_source = LocalResearchSource(
+        retry_config,
+        "retry-run",
+        10,
+        platform="tiktok",
+        base_url=provider_server,
+        archive_root=tmp_path / "research",
+    )
+    try:
+        retry = retry_source.discover(10)
+    finally:
+        retry_source.close()
+
+    scheduler = retry.receipt.metadata["scheduler"]
+    assert scheduler["state"] == "triggered_all"
+    assert scheduler["platforms"] == ["twitter"]
+    assert scheduler["retry_of_job_id"] == "failed-job"
+    assert ProviderTestHandler.received_posts[-1]["path"] == "/api/research/all/full"
+    assert ProviderTestHandler.received_posts[-1]["body"]["platforms"] == ["twitter"]
+
+
+def test_provider_restart_persists_missing_job_cooldown_then_retries_recorded_lanes(
+    provider_server,
+    market_config,
+    tmp_path,
+):
+    archive = tmp_path / "research" / "tiktok"
+    archive.mkdir(parents=True)
+    now = datetime.now(timezone.utc)
+    state_path = tmp_path / "local-research-state.json"
+    state_path.write_text(json.dumps({
+        "requested_at": (now - timedelta(hours=2)).isoformat(),
+        "job_id": "forgotten-after-restart",
+        "query_hash": stable_hash(["live sports"]),
+        "query_count": 1,
+        "platforms": ["tiktok", "twitter"],
+    }), encoding="utf-8")
+    cooling_config = replace(
+        market_config,
+        platforms=["tiktok", "x"],
+        topics=["live sports"],
+        local_research_dir=tmp_path / "research",
+        local_research_state_path=state_path,
+        local_research_trigger_enabled=True,
+        local_research_refresh_seconds=86400,
+        local_research_failure_retry_seconds=3600,
+    )
+
+    cooling_source = LocalResearchSource(
+        cooling_config,
+        "missing-job-cooling-run",
+        10,
+        platform="tiktok",
+        base_url=provider_server,
+        archive_root=tmp_path / "research",
+    )
+    try:
+        cooling = cooling_source.discover(10)
+    finally:
+        cooling_source.close()
+    scheduler = cooling.receipt.metadata["scheduler"]
+    assert scheduler["state"] == "missing_job_cooldown"
+    assert scheduler["job_status"] == "not_found"
+    assert 3590 <= scheduler["retry_in_seconds"] <= 3600
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["missing_reason"] == "provider_job_not_found"
+    assert persisted["missing_since"]
+    assert ProviderTestHandler.received_posts == []
+
+    retry_config = replace(cooling_config, local_research_failure_retry_seconds=0)
+    retry_source = LocalResearchSource(
+        retry_config,
+        "missing-job-retry-run",
+        10,
+        platform="tiktok",
+        base_url=provider_server,
+        archive_root=tmp_path / "research",
+    )
+    try:
+        retry = retry_source.discover(10)
+    finally:
+        retry_source.close()
+    retried = retry.receipt.metadata["scheduler"]
+    assert retried["state"] == "triggered_all"
+    assert retried["platforms"] == ["tiktok", "twitter"]
+    assert retried["retry_of_job_id"] == "forgotten-after-restart"
+    assert ProviderTestHandler.received_posts[-1]["body"]["platforms"] == [
+        "tiktok", "twitter",
+    ]
+
+
+def test_cumulative_browser_intermediates_preserve_partial_attempts_without_duplicates(
+    market_config,
+    tmp_path,
+):
+    archive = tmp_path / "research" / "tiktok"
+    archive.mkdir(parents=True)
+    live_sports = {
+        "niche": "live sports",
+        "query": "live sports",
+        "videos": [{"id": "sports-1"}],
+        "collectionStarted": "2026-08-20T04:41:05Z",
+        "collectionFinished": "2026-08-20T04:51:30Z",
+    }
+    music = {
+        "niche": "music releases",
+        "query": "music releases",
+        "videos": [],
+        "collectionStarted": "2026-08-20T04:51:35Z",
+        "collectionFinished": "2026-08-20T04:56:10Z",
+    }
+    (archive / "tiktok-research-intermediate-1.json").write_text(json.dumps({
+        "metadata": {"generatedAt": "2026-08-20T04:51:30Z"},
+        "results": [live_sports],
+    }), encoding="utf-8")
+    (archive / "tiktok-research-intermediate-2.json").write_text(json.dumps({
+        "metadata": {"generatedAt": "2026-08-20T04:56:10Z"},
+        "results": [live_sports, music],
+    }), encoding="utf-8")
+    config = replace(
+        market_config,
+        local_research_dir=tmp_path / "research",
+        local_research_trigger_enabled=False,
+    )
+    source = LocalResearchSource(
+        config,
+        "partial-receipt-run",
+        10,
+        platform="tiktok",
+        archive_root=tmp_path / "research",
+    )
+    try:
+        attempts = source.archived_query_attempts()
+    finally:
+        source.close()
+
+    assert [attempt.query for attempt in attempts] == [
+        "live sports",
+        "music releases",
+    ]
+    assert [attempt.state for attempt in attempts] == ["completed", "empty"]
+    assert attempts[0].result_count == 1
+    assert attempts[0].metadata["source_file"] == (
+        "tiktok-research-intermediate-2.json"
+    )
+
+
+def test_query_attempt_backfill_verifies_youtube_and_deduplicates_safari_receipts(
+    market_config,
+    tmp_path,
+):
+    safari_dir = tmp_path / "research" / "twitter"
+    safari_dir.mkdir(parents=True)
+    safari_payload = {
+        "metadata": {"generatedAt": "2026-08-19T12:00:00Z"},
+        "results": [{"query": "summer recipes", "tweets": []}],
+    }
+    (safari_dir / "twitter-final.json").write_text(
+        json.dumps(safari_payload),
+        encoding="utf-8",
+    )
+
+    youtube_dir = tmp_path / "trend-frontier" / "2026-08-19" / "iteration-1"
+    youtube_dir.mkdir(parents=True)
+    artifact = youtube_dir / "movie-trailers.jsonl"
+    artifact.write_text('{"id":"video-1"}\n', encoding="utf-8")
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest = {
+        "contract": "youtube_query_research_receipt_v1",
+        "started_at": "2026-08-19T12:00:00Z",
+        "finished_at": "2026-08-19T12:00:05Z",
+        "receipts": [{
+            "query": "movie trailers",
+            "output_path": str(artifact),
+            "output_sha256": artifact_sha,
+            "records": 1,
+            "state": "completed",
+            "error": "",
+        }],
+    }
+    (youtube_dir / "research-manifest.json").write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+    config = replace(
+        market_config,
+        local_research_dir=tmp_path / "research",
+        youtube_research_dir=tmp_path / "trend-frontier",
+    )
+    store = MarketTapeStore(config)
+    collector = MarketTapeCollector(config, store)
+
+    first = collector.backfill_query_attempts()
+    second = collector.backfill_query_attempts()
+
+    assert first["state"] == "completed"
+    assert first["attempts_inserted"] == 2
+    assert second["attempts_inserted"] == 0
+    first_run = next(run for run in store.list_runs(10) if run["run_id"] == first["run_id"])
+    assert first_run["observations_added"] == 0
+    attempts = store.list_query_attempts(10)
+    assert {(attempt["platform"], attempt["query"]) for attempt in attempts} == {
+        ("x", "summer recipes"),
+        ("youtube", "movie trailers"),
+    }
+    youtube = next(attempt for attempt in attempts if attempt["platform"] == "youtube")
+    assert youtube["metadata"]["artifact_verified"] is True
+    assert youtube["artifact_sha256"] == artifact_sha
+
+
+def test_discovery_context_trend_backfill_is_idempotent_and_provider_free(market_config):
+    store = MarketTapeStore(market_config)
+    observed = datetime.now(timezone.utc) - timedelta(hours=1)
+    store.start_run("historical-context-run", "archive_bootstrap")
+    item = _content_for_keyword(
+        "historical-context-video",
+        "A measured result from the field",
+        observed,
+        25_000,
+    )
+    store.ingest(item, "historical-context-run")
+    store.finish_run("historical-context-run")
+    context = {"niche": "live sports", "query": "live sports latest"}
+    with store.connect() as connection:
+        connection.execute(
+            """INSERT INTO mt_discovery_attributions(
+                   attribution_key, run_id, video_id, source_id, discovered_at,
+                   surface, query, context_json
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "historical-live-sports-attribution",
+                "historical-context-run",
+                item.video_id,
+                item.source_id,
+                observed.isoformat(),
+                "historical_archive",
+                "live sports latest",
+                json.dumps(context),
+            ),
+        )
+
+    first = store.backfill_context_trends()
+    second = store.backfill_context_trends()
+
+    assert first["attributions_scanned"] == 1
+    assert first["trends_inserted"] == 1
+    assert first["memberships_inserted"] == 1
+    assert len(first["affected_trend_ids"]) == 1
+    assert second["trends_inserted"] == 0
+    assert second["memberships_inserted"] == 0
+    with store.connect() as connection:
+        membership = connection.execute(
+            """SELECT trend.display_name, membership.evidence_json
+               FROM mt_trend_memberships membership
+               JOIN mt_trends trend USING(trend_id)
+               WHERE membership.video_id = ? AND trend.canonical_key = 'live sports'""",
+            (item.video_id,),
+        ).fetchone()
+    assert membership["display_name"] == "Live Sports"
+    assert json.loads(membership["evidence_json"])["contract"] == (
+        "discovery-context-trend-backfill-v1"
+    )
 
 
 def test_recheck_cycle_promotes_new_safari_archive_without_external_calls(market_config, tmp_path):
@@ -965,6 +1421,47 @@ def test_recheck_cycle_promotes_new_safari_archive_without_external_calls(market
     assert result["status"]["totals"]["videos"] == 1
     assert result["receipts"][0]["source_id"] == "safari-local-research-x"
     assert result["receipts"][0]["request_count"] == 0
+
+
+def test_due_poll_selection_is_platform_fair_and_unchanged_snapshots_advance(market_config):
+    config = replace(market_config, platforms=["youtube", "x"])
+    store = MarketTapeStore(config)
+    observed = datetime.now(timezone.utc) - timedelta(hours=2)
+    store.start_run("fair-poll-run", "archive_bootstrap")
+    for platform in config.platforms:
+        for index in range(5):
+            store.ingest(MarketContent(
+                platform=platform,
+                external_id=f"{platform}-fair-{index}",
+                creator_external_id=f"{platform}-creator-{index}",
+                published_at=observed - timedelta(hours=2),
+                observed_at=observed,
+                source_id=f"{platform}-source",
+                metrics=MetricCounters(views=100 + index),
+                title=f"Fair queue item {platform} {index}",
+                raw_payload={"platform": platform, "index": index},
+            ), "fair-poll-run")
+
+    due = store.due_polls(4)
+
+    assert {platform: len(rows) for platform, rows in due.items()} == {
+        "youtube": 2,
+        "x": 2,
+    }
+    deferred_id = due["youtube"][0]["video_id"]
+    assert store.defer_unchanged_polls([deferred_id]) == 1
+    remaining = {
+        row["video_id"]
+        for rows in store.due_polls(20).values()
+        for row in rows
+    }
+    assert deferred_id not in remaining
+    with store.connect() as connection:
+        queue_row = connection.execute(
+            "SELECT last_error_code FROM mt_poll_queue WHERE video_id = ?",
+            (deferred_id,),
+        ).fetchone()
+    assert queue_row["last_error_code"] == "unchanged_source_snapshot"
 
 
 def test_local_archive_ingest_bypasses_prior_scheduler_cooldown(market_config, tmp_path):
@@ -1023,6 +1520,11 @@ def test_market_tape_api_is_readable_and_write_control_is_local(market_config):
     assert client.get("/api/market-tape/keywords").status_code == 200
     assert client.get("/api/market-tape/query-frontier").status_code == 200
     assert client.get("/api/market-tape/predictions").status_code == 200
+    assert client.get("/api/market-tape/prediction-backtest").status_code == 200
+    assert client.get("/api/market-tape/predictions/model").status_code == 200
+    assert client.get("/api/market-tape/opportunities").status_code == 200
+    assert client.get("/api/market-tape/query-attempts").status_code == 200
+    assert client.get("/api/market-tape/datasets/status").status_code == 200
     assert client.get("/api/market-tape/candles?window_minutes=15").status_code == 200
     denied = client.post(
         "/api/market-tape/cycles",
@@ -1042,6 +1544,12 @@ def test_dedicated_market_tape_app_health_and_security_headers(market_config):
     assert response.get_json()["service"] == "content-intelligence-market-tape"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert client.get("/api/market-tape/query-frontier").status_code == 200
+    reindex = client.post(
+        "/api/market-tape/trends/reindex",
+        json={"forecast_limit": 100},
+    )
+    assert reindex.status_code == 200
+    assert reindex.get_json()["provider_calls_made"] == 0
 
 
 def test_market_tape_tick_selects_due_mode_without_external_calls(market_config):

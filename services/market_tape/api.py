@@ -12,6 +12,8 @@ from flask import Flask, jsonify, request
 
 from .collector import MarketTapeCollector
 from .config import MarketTapeConfig
+from .dataset import MarketTapeDatasetManager
+from .predictor import MarketTapePredictor
 from .store import MarketTapeStore
 from .sinks import SupabaseSink
 
@@ -81,6 +83,44 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
         limit = _limit(request.args.get("limit"), 100)
         return jsonify({"predictions": store.list_predictions(limit, request.args.get("subject_type"))})
 
+    @app.get("/api/market-tape/prediction-backtest")
+    def market_tape_prediction_backtest():
+        return jsonify(store.prediction_backtest())
+
+    @app.get("/api/market-tape/opportunities")
+    def market_tape_opportunities():
+        limit = _limit(request.args.get("limit"), 100, maximum=500)
+        max_saturation = _bounded_float(
+            request.args.get("max_saturation"), 0.75, minimum=0.0, maximum=1.0
+        )
+        min_videos = _limit(request.args.get("min_videos"), 2, maximum=10000)
+        min_measured_videos = _limit(
+            request.args.get("min_measured_videos"),
+            2,
+            maximum=10000,
+        )
+        return jsonify(store.trend_opportunities(
+            limit=limit,
+            max_saturation=max_saturation,
+            min_videos=min_videos,
+            min_measured_videos=min_measured_videos,
+        ))
+
+    @app.get("/api/market-tape/predictions/model")
+    def market_tape_predictor_status():
+        return jsonify(MarketTapePredictor(resolved, store).status())
+
+    @app.get("/api/market-tape/query-attempts")
+    def market_tape_query_attempts():
+        limit = _limit(request.args.get("limit"), 100, maximum=5000)
+        return jsonify({
+            "attempts": store.list_query_attempts(limit, request.args.get("platform")),
+        })
+
+    @app.get("/api/market-tape/datasets/status")
+    def market_tape_dataset_status():
+        return jsonify(MarketTapeDatasetManager(resolved, store).status())
+
     @app.get("/api/market-tape/candles")
     def market_tape_candles():
         limit = _limit(request.args.get("limit"), 96)
@@ -122,6 +162,24 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             lambda: MarketTapeCollector(resolved, store).bootstrap_local_archive(limit)
         )
 
+    @app.post("/api/market-tape/query-attempts/backfill")
+    def market_tape_backfill_query_attempts():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        return run_exclusive(
+            lambda: MarketTapeCollector(resolved, store).backfill_query_attempts()
+        )
+
+    @app.post("/api/market-tape/trends/reindex")
+    def market_tape_reindex_trends():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        limit = _limit(body.get("forecast_limit"), 50000, maximum=100000)
+        return run_exclusive(
+            lambda: MarketTapeCollector(resolved, store).reindex_trends(limit)
+        )
+
     @app.post("/api/market-tape/sync")
     def market_tape_sync():
         if not _authorized():
@@ -145,6 +203,38 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
 
         return run_exclusive(flush)
 
+    @app.post("/api/market-tape/predictions/evaluate")
+    def market_tape_evaluate_predictions():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        return run_exclusive(store.evaluate_predictions)
+
+    @app.post("/api/market-tape/predictions/train")
+    def market_tape_train_predictor():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        return run_exclusive(
+            lambda: MarketTapePredictor(resolved, store).train()
+        )
+
+    @app.post("/api/market-tape/predictions/forecast")
+    def market_tape_forecast_trends():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        limit = _limit(body.get("limit"), 5000, maximum=20000)
+        return run_exclusive(lambda: store.forecast_active_trends(limit=limit))
+
+    @app.post("/api/market-tape/datasets/certify")
+    def market_tape_certify_dataset():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        target_date = body.get("date")
+        return run_exclusive(
+            lambda: MarketTapeDatasetManager(resolved, store).certify(target_date)
+        )
+
 
 def _authorized() -> bool:
     configured = os.getenv("MARKET_TAPE_CONTROL_TOKEN", "").strip()
@@ -157,5 +247,17 @@ def _authorized() -> bool:
 def _limit(value: Any, default: int, maximum: int = 1000) -> int:
     try:
         return min(maximum, max(1, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_float(
+    value: Any,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        return min(maximum, max(minimum, float(value)))
     except (TypeError, ValueError):
         return default

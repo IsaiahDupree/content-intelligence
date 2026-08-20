@@ -1,10 +1,11 @@
--- Read-only post-deployment verification for Market Tape V2.
+-- Read-only post-deployment verification for Market Tape V4.
 
 with target_tables(table_name) as (
   values
     ('actp_market_creators'),
     ('actp_market_videos'),
     ('actp_market_discovery_attributions'),
+    ('actp_market_query_attempts'),
     ('actp_market_observations'),
     ('actp_content_genomes'),
     ('actp_trends'),

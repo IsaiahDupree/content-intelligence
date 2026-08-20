@@ -17,10 +17,12 @@ from .config import REPO_ROOT, load_runtime_environment
 from .sources.base import sanitize
 
 
-MIGRATION_NAME = "market_tape_v2"
+MIGRATION_NAME = "market_tape_v4"
 MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v1.sql",
     REPO_ROOT / "migrations" / "market_tape_v2_discovery_attributions.sql",
+    REPO_ROOT / "migrations" / "market_tape_v3_query_attempts.sql",
+    REPO_ROOT / "migrations" / "market_tape_v4_trend_activity.sql",
 )
 MIGRATION_PATH = MIGRATION_PATHS[-1]
 VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v2.sql"
@@ -31,11 +33,15 @@ MARKET_TAPE_TABLES: Dict[str, str] = {
     "actp_market_creators": "creator_id",
     "actp_market_videos": "video_id",
     "actp_market_discovery_attributions": "attribution_key",
+    "actp_market_query_attempts": "attempt_key",
     "actp_market_observations": "observation_key",
     "actp_content_genomes": "video_id",
     "actp_trends": "trend_id",
     "actp_trend_memberships": "trend_id,video_id",
-    "actp_trend_observations": "trend_observation_key",
+    "actp_trend_observations": (
+        "trend_observation_key,views_new_1h,likes_new_1h,comments_new_1h,"
+        "shares_new_1h,counter_delta_videos,activity_coverage"
+    ),
     "actp_market_collection_runs": "run_id",
     "actp_market_source_receipts": "receipt_key",
     "actp_market_source_health": "source_id",
@@ -45,12 +51,14 @@ MARKET_TAPE_TABLES: Dict[str, str] = {
 APPEND_ONLY_TABLES = {
     "actp_market_observations",
     "actp_market_discovery_attributions",
+    "actp_market_query_attempts",
     "actp_trend_observations",
 }
 
 APPEND_ONLY_TRIGGERS = {
     "actp_market_observations": "actp_market_observations_no_update",
     "actp_market_discovery_attributions": "actp_market_discovery_attributions_no_update",
+    "actp_market_query_attempts": "actp_market_query_attempts_no_update",
     "actp_trend_observations": "actp_trend_observations_no_update",
 }
 

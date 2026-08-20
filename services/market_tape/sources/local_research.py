@@ -3,15 +3,28 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from .base import MarketSource, sanitize
-from ..models import MarketContent, MetricCounters, ProviderBatch, SourceState, parse_datetime, stable_hash, utc_now
+from ..models import (
+    MarketContent,
+    MetricCounters,
+    ProviderBatch,
+    QueryAttempt,
+    SourceState,
+    isoformat,
+    parse_datetime,
+    stable_hash,
+    utc_now,
+)
 
 
 ID_PATTERNS = {
@@ -78,10 +91,13 @@ class LocalResearchSource(MarketSource):
                     "provider_cost_usd": 0.0,
                 },
             )
-            if scheduler.get("state") == "unavailable" and items:
+            if scheduler.get("state") in {"unavailable", "blocked_disk_pressure"}:
                 batch.receipt.state = SourceState.DEGRADED
-                batch.receipt.error_code = "scheduler_unavailable"
+                batch.receipt.error_code = str(
+                    scheduler.get("error_code") or "scheduler_unavailable"
+                )
                 batch.receipt.error_detail = str(scheduler.get("error", ""))[:1000]
+            batch.query_attempts = self._load_query_attempts()
             return batch
         except Exception as error:
             return self.blocked_batch(started, error)
@@ -105,6 +121,10 @@ class LocalResearchSource(MarketSource):
             )
         except Exception as error:
             return self.blocked_batch(started, error)
+
+    def archived_query_attempts(self) -> List[QueryAttempt]:
+        """Return immutable coverage receipts without scheduling or ingesting content."""
+        return self._load_query_attempts()
 
     def _load_archive(self, max_items: int, wanted: Optional[Set[str]] = None) -> List[MarketContent]:
         if not self.platform_archive_dir.is_dir() or max_items <= 0:
@@ -222,16 +242,228 @@ class LocalResearchSource(MarketSource):
             "policy": "niche-token-overlap-v1",
         }
 
+    def _load_query_attempts(self) -> List[QueryAttempt]:
+        if not self.platform_archive_dir.is_dir():
+            return []
+        files = sorted(
+            self.platform_archive_dir.glob("*.json"),
+            key=lambda path: (path.stat().st_mtime, path.name),
+        )
+        attempts: Dict[str, QueryAttempt] = {}
+        for path in files:
+            try:
+                encoded = path.read_bytes()
+                payload = json.loads(encoded)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+                continue
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            generated = parse_datetime(metadata.get("generatedAt")) or datetime.fromtimestamp(
+                path.stat().st_mtime, tz=timezone.utc
+            )
+            artifact_sha256 = hashlib.sha256(encoded).hexdigest()
+            for result in payload["results"]:
+                if not isinstance(result, dict):
+                    continue
+                query = str(result.get("query") or result.get("niche") or "").strip()
+                if not query:
+                    continue
+                query_family = str(result.get("niche") or query).strip()
+                result_count = sum(
+                    len(result.get(key, []))
+                    for key in ("videos", "posts", "tweets")
+                    if isinstance(result.get(key), list)
+                )
+                error_detail = sanitize(result.get("error") or "")[:1000]
+                state = "failed" if error_detail else ("completed" if result_count else "empty")
+                attempted_at = parse_datetime(
+                    result.get("collectionStarted")
+                    or result.get("collection_started")
+                    or result.get("startedAt")
+                ) or generated
+                finished_at = parse_datetime(
+                    result.get("collectionFinished")
+                    or result.get("collection_finished")
+                    or result.get("finishedAt")
+                ) or attempted_at
+                attempt_identity = stable_hash({
+                    "source_id": self.source_id,
+                    "platform": self.platform,
+                    "query": " ".join(query.casefold().split()),
+                    "attempted_at": isoformat(attempted_at),
+                })
+                attempt = QueryAttempt(
+                    run_id=self.run_id,
+                    source_id=self.source_id,
+                    platform=self.platform,
+                    query=query,
+                    attempted_at=attempted_at,
+                    finished_at=finished_at,
+                    state=state,
+                    result_count=result_count,
+                    request_count=1,
+                    error_code="browser_research_failed" if error_detail else "",
+                    error_detail=error_detail,
+                    artifact_path=str(path),
+                    artifact_sha256=artifact_sha256,
+                    metadata={
+                        "contract": "safari_research_archive_v1",
+                        "source_file": path.name,
+                        "query_family": query_family,
+                        "query_mode": (metadata.get("config") or {}).get("queryMode", ""),
+                        "attempt_identity": attempt_identity,
+                    },
+                )
+                attempts[attempt.attempt_key] = attempt
+        return sorted(
+            attempts.values(),
+            key=lambda attempt: (
+                attempt.attempted_at,
+                attempt.query.casefold(),
+            ),
+        )
+
     def _schedule_if_due(self, max_items: int) -> Dict[str, Any]:
         if not self.config.local_research_trigger_enabled:
             return {"state": "disabled"}
-        latest = max(
-            (path.stat().st_mtime for path in self.platform_archive_dir.glob("*.json")),
-            default=0.0,
-        ) if self.platform_archive_dir.is_dir() else 0.0
-        age_seconds = max(0.0, utc_now().timestamp() - latest) if latest else None
-        if age_seconds is not None and age_seconds < self.config.local_research_refresh_seconds:
-            return {"state": "fresh", "latest_age_seconds": round(age_seconds, 3)}
+        coordinator = next(
+            (
+                platform for platform in ("tiktok", "instagram", "x", "facebook", "threads")
+                if platform in self.config.platforms
+            ),
+            None,
+        )
+        if self.platform != coordinator:
+            return {"state": "coordinated", "coordinator": coordinator}
+
+        now = utc_now()
+        query_hash = stable_hash([" ".join(topic.casefold().split()) for topic in self.config.topics])
+        schedule_state: Dict[str, Any] = {}
+
+        def save_schedule_state(payload: Dict[str, Any]) -> None:
+            self.config.local_research_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.config.local_research_state_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(self.config.local_research_state_path)
+
+        try:
+            if self.config.local_research_state_path.is_file():
+                schedule_state = json.loads(
+                    self.config.local_research_state_path.read_text(encoding="utf-8")
+                )
+        except (OSError, ValueError):
+            schedule_state = {}
+        requested_at = parse_datetime(schedule_state.get("requested_at"))
+        age_seconds = (now - requested_at).total_seconds() if requested_at else None
+        retry_platforms: List[str] = []
+        if (
+            age_seconds is not None
+            and age_seconds < self.config.local_research_refresh_seconds
+        ):
+            job_id = str(schedule_state.get("job_id") or "")
+            if job_id:
+                try:
+                    prior_job = self.request_json(
+                        "GET",
+                        f"{self.base_url}/api/research/status/{job_id}",
+                        headers=_research_headers(),
+                    )
+                except Exception:
+                    prior_job = {}
+                prior_status = str(prior_job.get("status") or "").casefold()
+                if prior_status in {"queued", "running"}:
+                    return {"state": "already_running", "job_id": job_id}
+                if prior_status in {"failed", "partial"}:
+                    failed_at = parse_datetime(prior_job.get("completedAt")) or requested_at
+                    failure_age = (now - failed_at).total_seconds() if failed_at else 0.0
+                    if failure_age < self.config.local_research_failure_retry_seconds:
+                        return {
+                            "state": "failed_cooldown",
+                            "job_id": job_id,
+                            "job_status": prior_status,
+                            "retry_in_seconds": round(
+                                self.config.local_research_failure_retry_seconds
+                                - max(0.0, failure_age),
+                                3,
+                            ),
+                        }
+                    retry_platforms = [
+                        str(receipt.get("platform"))
+                        for receipt in prior_job.get("platformReceipts", [])
+                        if isinstance(receipt, dict)
+                        and receipt.get("status") == "failed"
+                        and receipt.get("platform")
+                    ]
+                elif prior_status == "completed":
+                    return {
+                        "state": "recently_completed",
+                        "job_id": job_id,
+                        "latest_age_seconds": round(max(0.0, age_seconds), 3),
+                        "query_count": len(self.config.topics),
+                        "query_hash": query_hash,
+                    }
+                elif not prior_status:
+                    missing_since = parse_datetime(schedule_state.get("missing_since"))
+                    if missing_since is None:
+                        missing_since = now
+                        schedule_state["missing_since"] = isoformat(now)
+                        schedule_state["missing_reason"] = "provider_job_not_found"
+                        save_schedule_state(schedule_state)
+                    missing_age = max(0.0, (now - missing_since).total_seconds())
+                    if missing_age < self.config.local_research_failure_retry_seconds:
+                        return {
+                            "state": "missing_job_cooldown",
+                            "job_id": job_id,
+                            "job_status": "not_found",
+                            "retry_in_seconds": round(
+                                self.config.local_research_failure_retry_seconds
+                                - missing_age,
+                                3,
+                            ),
+                            "query_count": len(self.config.topics),
+                            "query_hash": query_hash,
+                        }
+                    retry_platforms = [
+                        str(platform)
+                        for platform in schedule_state.get("platforms", [])
+                        if str(platform) in {
+                            "tiktok", "instagram", "twitter", "facebook", "threads"
+                        }
+                    ]
+            else:
+                return {
+                    "state": "recently_requested",
+                    "job_id": None,
+                    "latest_age_seconds": round(max(0.0, age_seconds), 3),
+                    "query_count": len(self.config.topics),
+                    "query_hash": query_hash,
+                }
+        temporary_root = Path(tempfile.gettempdir())
+        try:
+            free_bytes = shutil.disk_usage(temporary_root).free
+        except OSError as error:
+            return {
+                "state": "unavailable",
+                "error_code": "disk_preflight_failed",
+                "error": sanitize(error),
+            }
+        minimum_free = max(0, self.config.local_research_min_free_bytes)
+        if free_bytes < minimum_free:
+            return {
+                "state": "blocked_disk_pressure",
+                "error_code": "insufficient_temporary_disk",
+                "error": (
+                    f"browser research requires {minimum_free} free bytes in "
+                    f"{temporary_root}; observed {free_bytes}"
+                ),
+                "temporary_root": str(temporary_root),
+                "free_bytes": free_bytes,
+                "minimum_free_bytes": minimum_free,
+            }
         try:
             headers = _research_headers()
             self.request_json("GET", f"{self.base_url}/health", headers=headers)
@@ -252,17 +484,33 @@ class LocalResearchSource(MarketSource):
                 },
             }
             if cross_platform:
-                body["platforms"] = ["tiktok", "instagram", "twitter", "facebook", "threads"]
+                body["platforms"] = retry_platforms or [
+                    "tiktok", "instagram", "twitter", "facebook", "threads"
+                ]
             job = self.request_json(
                 "POST",
                 f"{self.base_url}{endpoint}",
                 headers=headers,
                 json_body=body,
             )
+            job_id = job.get("jobId") or job.get("job_id") or (job.get("job") or {}).get("id")
+            state_payload = {
+                "requested_at": isoformat(now),
+                "job_id": job_id,
+                "query_hash": query_hash,
+                "query_count": len(niches),
+                "platforms": body.get("platforms", [self.platform]),
+                "retry_of_job_id": schedule_state.get("job_id") if retry_platforms else None,
+            }
+            save_schedule_state(state_payload)
             return {
                 "state": "triggered_all" if cross_platform else "triggered",
-                "job_id": job.get("jobId") or job.get("job_id") or (job.get("job") or {}).get("id"),
+                "job_id": job_id,
                 "posts_per_niche": posts_per_niche,
+                "query_count": len(niches),
+                "query_hash": query_hash,
+                "platforms": body.get("platforms", [self.platform]),
+                "retry_of_job_id": schedule_state.get("job_id") if retry_platforms else None,
             }
         except Exception as error:
             return {"state": "unavailable", "error": sanitize(error)}

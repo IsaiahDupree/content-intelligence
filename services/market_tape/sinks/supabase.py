@@ -20,6 +20,7 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
     "discovery_attribution": (
         "actp_market_discovery_attributions", "attribution_key", False,
     ),
+    "query_attempt": ("actp_market_query_attempts", "attempt_key", False),
     "observation": ("actp_market_observations", "observation_key", False),
     "genome": ("actp_content_genomes", "video_id", True),
     "trend": ("actp_trends", "trend_id", True),
@@ -28,7 +29,7 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
     "run": ("actp_market_collection_runs", "run_id", True),
     "receipt": ("actp_market_source_receipts", "receipt_key", False),
     "source_health": ("actp_market_source_health", "source_id", True),
-    "prediction": ("actp_market_predictions", "prediction_key", False),
+    "prediction": ("actp_market_predictions", "prediction_key", True),
 }
 
 # A batch can begin in the middle of a run's outbox records. Always process parent
@@ -38,6 +39,7 @@ ENTITY_SYNC_ORDER = (
     "trend",
     "run",
     "video",
+    "query_attempt",
     "discovery_attribution",
     "observation",
     "genome",

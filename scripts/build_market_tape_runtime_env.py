@@ -74,9 +74,19 @@ def main() -> int:
         "MARKET_TAPE_OBJECT_DIR": str(data_dir / "market-tape-objects"),
         "MARKET_TAPE_HEARTBEAT_PATH": str(data_dir / "market-tape-heartbeat.json"),
         "MARKET_TAPE_LOCK_PATH": str(data_dir / "market-tape.lock"),
+        "MARKET_TAPE_LOCAL_RESEARCH_STATE_PATH": str(
+            data_dir / "market-tape-local-research-state.json"
+        ),
+        "MARKET_TAPE_PREDICTION_MODEL_DIR": str(data_dir / "market-tape-models"),
         "MARKET_TAPE_LOCAL_RESEARCH_DIR": str(
             Path.home() / "Library" / "Application Support" / "SafariAutomation" / "market-research-data"
         ),
+        "MARKET_TAPE_PASSPORT_MOUNT": "/Volumes/My Passport",
+        "MARKET_TAPE_DATASET_ROOT": "/Volumes/My Passport/MarketTape/datasets",
+        "MARKET_TAPE_YOUTUBE_RESEARCH_DIR": "/Volumes/My Passport/MarketTape/trend-frontier",
+        "MARKET_TAPE_DATASET_EXPORT_ENABLED": "true",
+        "MARKET_TAPE_DATASET_REQUIRE_MOUNTED_VOLUME": "true",
+        "MARKET_TAPE_DATASET_STORAGE_PREFLIGHT_TIMEOUT_SECONDS": "30",
     })
 
     lines = [

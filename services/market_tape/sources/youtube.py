@@ -8,7 +8,15 @@ from datetime import timedelta, timezone
 from typing import Any, Dict, List, Sequence
 
 from .base import MarketSource, SourceHTTPError
-from ..models import MarketContent, MetricCounters, ProviderBatch, SourceState, parse_datetime, utc_now
+from ..models import (
+    MarketContent,
+    MetricCounters,
+    ProviderBatch,
+    QueryAttempt,
+    SourceState,
+    parse_datetime,
+    utc_now,
+)
 
 
 ISO_DURATION_RE = re.compile(
@@ -103,7 +111,7 @@ class YouTubeSource(MarketSource):
                 for item in details.get("items", [])
                 if isinstance(item, dict) and item.get("id")
             ]
-            return self.success_batch(
+            batch = self.success_batch(
                 started,
                 items,
                 operation="discover_performance",
@@ -116,6 +124,23 @@ class YouTubeSource(MarketSource):
                     "search_result_count": len(ids),
                 },
             )
+            batch.query_attempts = [QueryAttempt(
+                run_id=self.run_id,
+                source_id=self.source_id,
+                platform=self.platform,
+                query=query,
+                attempted_at=started,
+                finished_at=batch.receipt.finished_at,
+                state="completed" if ids else "empty",
+                result_count=len(ids),
+                request_count=batch.receipt.request_count,
+                metadata={
+                    "lane": "performance_search",
+                    "order": "viewCount",
+                    "query_family": query,
+                },
+            )]
+            return batch
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -127,6 +152,8 @@ class YouTubeSource(MarketSource):
             details: Dict[str, Dict[str, Any]] = {}
             contexts: Dict[str, Dict[str, Any]] = {}
             search_requests = 0
+            query_request_counts: Dict[str, int] = {}
+            query_result_counts: Dict[str, int] = {}
             chart_requests = 0
             chart_category_errors: List[Dict[str, Any]] = []
             known_skipped = 0
@@ -210,6 +237,7 @@ class YouTubeSource(MarketSource):
                     if page_token:
                         params["pageToken"] = page_token
                     search_requests += 1
+                    query_request_counts[topic] = query_request_counts.get(topic, 0) + 1
                     try:
                         search = self.request_json("GET", f"{self.base_url}/search", params=params)
                     except SourceHTTPError as error:
@@ -223,6 +251,7 @@ class YouTubeSource(MarketSource):
                         for item in search.get("items", []) if isinstance(item, dict)
                     ]
                     ids = [video_id for video_id in ids if video_id and video_id not in details]
+                    query_result_counts[topic] = query_result_counts.get(topic, 0) + len(ids)
                     known = self.known_external_ids(ids)
                     known_skipped += len(known)
                     ids = [video_id for video_id in ids if video_id not in known]
@@ -280,6 +309,25 @@ class YouTubeSource(MarketSource):
                 batch.receipt.metadata["search_lane_state"] = SourceState.BLOCKED_QUOTA.value
                 batch.receipt.metadata["search_lane_error_code"] = termination_error.code
                 batch.receipt.metadata["search_lane_error_detail"] = str(termination_error)
+            batch.query_attempts = [
+                QueryAttempt(
+                    run_id=self.run_id,
+                    source_id=self.source_id,
+                    platform=self.platform,
+                    query=topic,
+                    attempted_at=started,
+                    finished_at=batch.receipt.finished_at,
+                    state="completed" if query_result_counts.get(topic, 0) else "empty",
+                    result_count=query_result_counts.get(topic, 0),
+                    request_count=request_count,
+                    metadata={
+                        "lane": "recent_search",
+                        "order": "date",
+                        "query_family": topic,
+                    },
+                )
+                for topic, request_count in query_request_counts.items()
+            ]
             return batch
         except Exception as error:
             return self.blocked_batch(started, error)

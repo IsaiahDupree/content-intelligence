@@ -173,10 +173,50 @@ class SourceReceipt:
         return data
 
 
+@dataclass(frozen=True)
+class QueryAttempt:
+    """Immutable proof that one source actually attempted one query."""
+
+    run_id: str
+    source_id: str
+    platform: str
+    query: str
+    attempted_at: datetime
+    finished_at: datetime
+    state: str
+    result_count: int = 0
+    request_count: int = 1
+    error_code: str = ""
+    error_detail: str = ""
+    artifact_path: str = ""
+    artifact_sha256: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def attempt_key(self) -> str:
+        artifact_identity = str(self.metadata.get("attempt_identity") or "").strip()
+        if not artifact_identity:
+            artifact_identity = self.artifact_sha256 or isoformat(self.attempted_at)
+        return stable_hash({
+            "source_id": self.source_id,
+            "platform": self.platform.casefold(),
+            "query": " ".join(self.query.casefold().split()),
+            "artifact_identity": artifact_identity,
+        })
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["attempt_key"] = self.attempt_key
+        data["attempted_at"] = isoformat(self.attempted_at)
+        data["finished_at"] = isoformat(self.finished_at)
+        return data
+
+
 @dataclass
 class ProviderBatch:
     items: List[MarketContent]
     receipt: SourceReceipt
+    query_attempts: List[QueryAttempt] = field(default_factory=list)
 
 
 def new_run_id() -> str:

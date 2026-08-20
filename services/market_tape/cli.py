@@ -9,6 +9,8 @@ from typing import Any
 from .collector import MarketTapeCollector
 from .config import MarketTapeConfig
 from .daemon import MarketTapeDaemon
+from .dataset import MarketTapeDatasetManager
+from .predictor import MarketTapePredictor
 from .sources import build_sources
 from .sinks import SupabaseSink
 from .store import MarketTapeStore
@@ -22,6 +24,9 @@ def main() -> int:
     cycle.add_argument("--mode", choices=["full", "discovery", "recheck"], default="full")
     bootstrap = subparsers.add_parser("bootstrap-local")
     bootstrap.add_argument("--limit-per-platform", type=int, default=10000)
+    subparsers.add_parser("backfill-query-attempts")
+    reindex = subparsers.add_parser("reindex-trends")
+    reindex.add_argument("--forecast-limit", type=int, default=50000)
     daemon = subparsers.add_parser("daemon")
     daemon.add_argument("--once", action="store_true")
     subparsers.add_parser("status")
@@ -48,6 +53,23 @@ def main() -> int:
     predictions = subparsers.add_parser("predictions")
     predictions.add_argument("--subject-type", choices=["video", "trend"])
     predictions.add_argument("--limit", type=int, default=100)
+    query_attempts = subparsers.add_parser("query-attempts")
+    query_attempts.add_argument("--platform")
+    query_attempts.add_argument("--limit", type=int, default=100)
+    subparsers.add_parser("prediction-backtest")
+    subparsers.add_parser("evaluate-predictions")
+    subparsers.add_parser("train-predictor")
+    subparsers.add_parser("predictor-status")
+    forecast = subparsers.add_parser("forecast-trends")
+    forecast.add_argument("--limit", type=int, default=5000)
+    opportunities = subparsers.add_parser("opportunities")
+    opportunities.add_argument("--limit", type=int, default=100)
+    opportunities.add_argument("--max-saturation", type=float, default=0.75)
+    opportunities.add_argument("--min-videos", type=int, default=2)
+    opportunities.add_argument("--min-measured-videos", type=int, default=2)
+    certify = subparsers.add_parser("certify-dataset")
+    certify.add_argument("--date")
+    subparsers.add_parser("dataset-status")
     candles = subparsers.add_parser("candles")
     candles.add_argument("--platform")
     candles.add_argument("--window-minutes", type=int, default=15)
@@ -62,6 +84,10 @@ def main() -> int:
         return _print(MarketTapeCollector(config, store).run_cycle(args.mode))
     if args.command == "bootstrap-local":
         return _print(MarketTapeCollector(config, store).bootstrap_local_archive(args.limit_per_platform))
+    if args.command == "backfill-query-attempts":
+        return _print(MarketTapeCollector(config, store).backfill_query_attempts())
+    if args.command == "reindex-trends":
+        return _print(MarketTapeCollector(config, store).reindex_trends(args.forecast_limit))
     if args.command == "daemon":
         MarketTapeDaemon(config).run(once=args.once)
         return 0
@@ -100,6 +126,29 @@ def main() -> int:
         })
     if args.command == "predictions":
         return _print({"predictions": store.list_predictions(args.limit, args.subject_type)})
+    if args.command == "query-attempts":
+        return _print({"attempts": store.list_query_attempts(args.limit, args.platform)})
+    if args.command == "prediction-backtest":
+        return _print(store.prediction_backtest())
+    if args.command == "evaluate-predictions":
+        return _print(store.evaluate_predictions())
+    if args.command == "train-predictor":
+        return _print(MarketTapePredictor(config, store).train())
+    if args.command == "predictor-status":
+        return _print(MarketTapePredictor(config, store).status())
+    if args.command == "forecast-trends":
+        return _print(store.forecast_active_trends(limit=args.limit))
+    if args.command == "opportunities":
+        return _print(store.trend_opportunities(
+            limit=args.limit,
+            max_saturation=args.max_saturation,
+            min_videos=args.min_videos,
+            min_measured_videos=args.min_measured_videos,
+        ))
+    if args.command == "certify-dataset":
+        return _print(MarketTapeDatasetManager(config, store).certify(args.date))
+    if args.command == "dataset-status":
+        return _print(MarketTapeDatasetManager(config, store).status())
     if args.command == "candles":
         return _print({"candles": store.social_candles(args.window_minutes, args.limit, args.platform)})
     if args.command == "doctor":

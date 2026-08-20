@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .base import MarketSource, SourceCredentialError
-from ..models import MarketContent, MetricCounters, ProviderBatch, parse_datetime, utc_now
+from ..models import MarketContent, MetricCounters, ProviderBatch, QueryAttempt, parse_datetime, utc_now
 
 
 HASHTAG_RE = re.compile(r"#([\w-]+)", re.UNICODE)
@@ -77,6 +77,7 @@ class TikTokResearchSource(MarketSource):
             end = (observed - timedelta(days=2)).date()
             start = end - timedelta(days=1)
             output: Dict[str, MarketContent] = {}
+            query_counts: Dict[str, int] = {}
             cursor = ""
             for topic in self.config.topics:
                 if len(output) >= max_items or self.request_count >= self.request_budget:
@@ -97,11 +98,18 @@ class TikTokResearchSource(MarketSource):
                 )
                 result = _first_dict(data.get("data"))
                 cursor = str(result.get("cursor", ""))
-                for raw in result.get("videos", []):
+                videos = result.get("videos", [])
+                query_counts[topic] = len(videos) if isinstance(videos, list) else 0
+                for raw in videos:
                     if isinstance(raw, dict) and raw.get("id"):
                         item = self._normalize(raw, observed, {"topic": topic})
                         output[item.external_id] = item
-            return self.success_batch(started, list(output.values()), operation="discover", cursor=cursor, metadata={"data_lag_days": 2})
+            batch = self.success_batch(started, list(output.values()), operation="discover", cursor=cursor, metadata={"data_lag_days": 2})
+            batch.query_attempts = _query_attempts(
+                self, started, batch.receipt.finished_at, query_counts,
+                metadata={"data_lag_days": 2},
+            )
+            return batch
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -173,6 +181,7 @@ class TikTokRapidSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: Dict[str, MarketContent] = {}
+            query_counts: Dict[str, int] = {}
             for region in self.config.regions[:2]:
                 if len(output) >= max_items:
                     break
@@ -183,8 +192,15 @@ class TikTokRapidSource(MarketSource):
                     break
                 tag = re.sub(r"[^a-z0-9]", "", topic.lower())
                 data = self.request_json("GET", f"{self.base_url}/challenge/posts", headers=self._headers(), params={"challenge_name": tag, "count": "30"})
-                self._add_payload(output, data, observed, {"surface": "hashtag", "topic": topic})
-            return self.success_batch(started, list(output.values())[:max_items], operation="discover", metadata={"billing": "external_rapidapi_plan"})
+                query_counts[topic] = self._add_payload(
+                    output, data, observed, {"surface": "hashtag", "topic": topic}
+                )
+            batch = self.success_batch(started, list(output.values())[:max_items], operation="discover", metadata={"billing": "external_rapidapi_plan"})
+            batch.query_attempts = _query_attempts(
+                self, started, batch.receipt.finished_at, query_counts,
+                metadata={"surface": "hashtag"},
+            )
+            return batch
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -205,15 +221,18 @@ class TikTokRapidSource(MarketSource):
         except Exception as error:
             return self.blocked_batch(started, error)
 
-    def _add_payload(self, output: Dict[str, MarketContent], data: Dict[str, Any], observed: Any, context: Dict[str, Any]) -> None:
+    def _add_payload(self, output: Dict[str, MarketContent], data: Dict[str, Any], observed: Any, context: Dict[str, Any]) -> int:
         payload = data.get("data", [])
         if isinstance(payload, dict):
             payload = payload.get("videos", payload.get("items", []))
+        count = 0
         for raw in payload if isinstance(payload, list) else []:
             if isinstance(raw, dict):
                 item = self._normalize(raw, observed, context)
                 if item.external_id:
                     output[item.external_id] = item
+                    count += 1
+        return count
 
     def _normalize(self, raw: Dict[str, Any], observed: Any, prior: Dict[str, Any]) -> MarketContent:
         external_id = str(raw.get("video_id") or raw.get("aweme_id") or raw.get("id") or "")
@@ -266,6 +285,7 @@ class InstagramRapidSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: Dict[str, MarketContent] = {}
+            query_counts: Dict[str, int] = {}
             for topic in self.config.topics:
                 if len(output) >= max_items or self.request_count >= self.request_budget:
                     break
@@ -274,13 +294,19 @@ class InstagramRapidSource(MarketSource):
                 payload = data.get("items", data.get("data", []))
                 if isinstance(payload, dict):
                     payload = payload.get("top_posts", []) + payload.get("recent_posts", [])
+                query_counts[topic] = len(payload) if isinstance(payload, list) else 0
                 for raw in payload if isinstance(payload, list) else []:
                     if isinstance(raw, dict) and isinstance(raw.get("node"), dict):
                         raw = raw["node"]
                     if isinstance(raw, dict):
                         item = self._normalize(raw, observed, {"topic": topic})
                         output[item.external_id] = item
-            return self.success_batch(started, list(output.values())[:max_items], operation="discover", metadata={"billing": "external_rapidapi_plan"})
+            batch = self.success_batch(started, list(output.values())[:max_items], operation="discover", metadata={"billing": "external_rapidapi_plan"})
+            batch.query_attempts = _query_attempts(
+                self, started, batch.receipt.finished_at, query_counts,
+                metadata={"surface": "hashtag"},
+            )
+            return batch
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -356,10 +382,12 @@ class XRecentSearchSource(MarketSource):
             observed = utc_now()
             output: Dict[str, MarketContent] = {}
             topics = self.config.topics
+            query_counts: Dict[str, int] = {}
             for offset in range(0, len(topics), 3):
                 if len(output) >= max_items or self.request_count >= self.request_budget:
                     break
-                terms = " OR ".join(f'"{topic}"' if " " in topic else topic for topic in topics[offset:offset + 3])
+                query_group = topics[offset:offset + 3]
+                terms = " OR ".join(f'"{topic}"' if " " in topic else topic for topic in query_group)
                 data = self.request_json("GET", f"{self.base_url}/tweets/search/recent", headers={"Authorization": f"Bearer {self.token}"}, params={
                     "query": f"({terms}) has:media -is:retweet",
                     "max_results": min(100, max(10, max_items - len(output))),
@@ -368,11 +396,19 @@ class XRecentSearchSource(MarketSource):
                     "user.fields": "id,name,username,public_metrics",
                 })
                 users = {str(user.get("id")): user for user in _first_dict(data.get("includes")).get("users", []) if isinstance(user, dict)}
-                for raw in data.get("data", []):
+                records = data.get("data", [])
+                for topic in query_group:
+                    query_counts[topic] = len(records) if isinstance(records, list) else 0
+                for raw in records:
                     if isinstance(raw, dict) and raw.get("id"):
                         item = self._normalize(raw, users.get(str(raw.get("author_id")), {}), observed)
                         output[item.external_id] = item
-            return self.success_batch(started, list(output.values())[:max_items], operation="discover", metadata={"billing": "x_api_plan"})
+            batch = self.success_batch(started, list(output.values())[:max_items], operation="discover", metadata={"billing": "x_api_plan"})
+            batch.query_attempts = _query_attempts(
+                self, started, batch.receipt.finished_at, query_counts,
+                metadata={"surface": "recent_search_or_group"},
+            )
+            return batch
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -517,3 +553,28 @@ class MetaGraphSource(MarketSource):
             thumbnail_url=str(raw.get("thumbnail_url") or ""), media_type=str(raw.get("media_type") or "video").lower(),
             hashtags=_hashtags(text), raw_payload=raw,
         )
+
+
+def _query_attempts(
+    source: MarketSource,
+    started_at: Any,
+    finished_at: Any,
+    query_counts: Dict[str, int],
+    *,
+    metadata: Dict[str, Any] | None = None,
+) -> List[QueryAttempt]:
+    return [
+        QueryAttempt(
+            run_id=source.run_id,
+            source_id=source.source_id,
+            platform=source.platform,
+            query=query,
+            attempted_at=started_at,
+            finished_at=finished_at,
+            state="completed" if count else "empty",
+            result_count=max(0, int(count)),
+            request_count=1,
+            metadata={"query_family": query, **(metadata or {})},
+        )
+        for query, count in query_counts.items()
+    ]

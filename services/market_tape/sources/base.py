@@ -71,6 +71,7 @@ class MarketSource(ABC):
         self.run_id = run_id
         self.request_budget = max(0, request_budget)
         self.request_count = 0
+        self._receipted_request_count = 0
         self.client = client or httpx.Client(timeout=config.request_timeout_seconds, follow_redirects=True)
         self._owns_client = client is None
         self.known_external_ids: Callable[[Sequence[str]], Set[str]] = lambda _: set()
@@ -137,6 +138,7 @@ class MarketSource(ABC):
         return body
 
     def blocked_batch(self, started_at: datetime, error: Exception) -> ProviderBatch:
+        operation_requests = self._operation_request_count()
         if isinstance(error, SourceCredentialError) or getattr(error, "code", "") == "provider_authentication_failed":
             state = SourceState.BLOCKED_CREDENTIAL
         elif isinstance(error, SourceApprovalError):
@@ -154,8 +156,8 @@ class MarketSource(ABC):
             state=state,
             started_at=started_at,
             finished_at=utc_now(),
-            request_count=self.request_count,
-            estimated_cost_usd=self.request_count * self.config.request_cost_for(self.platform),
+            request_count=operation_requests,
+            estimated_cost_usd=operation_requests * self.config.request_cost_for(self.platform),
             quota_remaining=max(0, self.request_budget - self.request_count),
             error_code=getattr(error, "code", "source_error"),
             error_detail=sanitize(error),
@@ -171,6 +173,7 @@ class MarketSource(ABC):
         cursor: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ProviderBatch:
+        operation_requests = self._operation_request_count()
         return ProviderBatch(items, SourceReceipt(
             run_id=self.run_id,
             source_id=self.source_id,
@@ -178,14 +181,19 @@ class MarketSource(ABC):
             state=SourceState.READY,
             started_at=started_at,
             finished_at=utc_now(),
-            request_count=self.request_count,
-            estimated_cost_usd=self.request_count * self.config.request_cost_for(self.platform),
+            request_count=operation_requests,
+            estimated_cost_usd=operation_requests * self.config.request_cost_for(self.platform),
             discovered_count=len(items) if operation == "discover" else 0,
             refreshed_count=len(items) if operation == "refresh" else 0,
             quota_remaining=max(0, self.request_budget - self.request_count),
             cursor=cursor,
             metadata={"metered": self.metered, "operation": operation, **(metadata or {})},
         ))
+
+    def _operation_request_count(self) -> int:
+        count = max(0, self.request_count - self._receipted_request_count)
+        self._receipted_request_count = self.request_count
+        return count
 
     @abstractmethod
     def discover(self, max_items: int) -> ProviderBatch:

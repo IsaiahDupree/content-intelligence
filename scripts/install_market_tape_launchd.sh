@@ -14,7 +14,11 @@ cp "$ROOT/app.py" "$RUNTIME_ROOT/app.py"
 cp "$ROOT/market_tape_app.py" "$RUNTIME_ROOT/market_tape_app.py"
 cp "$ROOT/scripts/run_market_tape_api.sh" "$RUNTIME_ROOT/scripts/run_market_tape_api.sh"
 cp "$ROOT/scripts/run_market_tape_scheduler.sh" "$RUNTIME_ROOT/scripts/run_market_tape_scheduler.sh"
-chmod +x "$RUNTIME_ROOT/scripts/run_market_tape_api.sh" "$RUNTIME_ROOT/scripts/run_market_tape_scheduler.sh"
+cp "$ROOT/scripts/run_market_tape_certifier.sh" "$RUNTIME_ROOT/scripts/run_market_tape_certifier.sh"
+chmod +x \
+  "$RUNTIME_ROOT/scripts/run_market_tape_api.sh" \
+  "$RUNTIME_ROOT/scripts/run_market_tape_scheduler.sh" \
+  "$RUNTIME_ROOT/scripts/run_market_tape_certifier.sh"
 
 PYTHON_BIN="${MARKET_TAPE_PYTHON_BIN:-/opt/homebrew/bin/python3}"
 "$PYTHON_BIN" "$ROOT/scripts/build_market_tape_runtime_env.py" \
@@ -40,6 +44,7 @@ fi
 labels=(
   com.isaiah.content-intelligence.api
   com.isaiah.content-intelligence.market-tape
+  com.isaiah.content-intelligence.market-tape-dataset
 )
 
 for label in "${labels[@]}"; do
@@ -55,9 +60,10 @@ done
 # launchd can briefly retain a just-removed label and return EIO on immediate bootstrap.
 sleep 1
 
-for label in "${labels[@]}"; do
-  destination="$AGENTS/$label.plist"
-  registered=false
+bootstrap_agent() {
+  local label="$1"
+  local destination="$AGENTS/$label.plist"
+  local registered=false
   for attempt in 1 2 3 4 5; do
     if launchctl bootstrap "gui/$(id -u)" "$destination"; then
       registered=true
@@ -71,8 +77,26 @@ for label in "${labels[@]}"; do
   fi
   launchctl enable "gui/$(id -u)/$label"
   launchctl kickstart "gui/$(id -u)/$label"
-done
+}
 
-echo "Market Tape scheduler and local API installed."
+bootstrap_agent com.isaiah.content-intelligence.api
+api_ready=false
+for _attempt in {1..30}; do
+  if /usr/bin/curl --fail --silent --max-time 2 \
+    http://127.0.0.1:6006/health >/dev/null; then
+    api_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$api_ready" != "true" ]]; then
+  echo "Market Tape API did not become healthy before dependent agents started." >&2
+  exit 1
+fi
+
+bootstrap_agent com.isaiah.content-intelligence.market-tape
+bootstrap_agent com.isaiah.content-intelligence.market-tape-dataset
+
+echo "Market Tape scheduler, daily dataset certifier, and local API installed."
 echo "Runtime: $RUNTIME_ROOT"
 echo "Data: $RUNTIME_DATA"

@@ -82,6 +82,39 @@ class MarketTapeConfig:
         "MARKET_TAPE_LOCAL_RESEARCH_DIR",
         "~/Library/Application Support/SafariAutomation/market-research-data",
     )).expanduser())
+    local_research_state_path: Path = field(default_factory=lambda: Path(os.getenv(
+        "MARKET_TAPE_LOCAL_RESEARCH_STATE_PATH",
+        str(REPO_ROOT / "data" / "market-tape-local-research-state.json"),
+    )).expanduser())
+    passport_mount: Path = field(default_factory=lambda: Path(os.getenv(
+        "MARKET_TAPE_PASSPORT_MOUNT", "/Volumes/My Passport"
+    )).expanduser())
+    dataset_root: Path = field(default_factory=lambda: Path(os.getenv(
+        "MARKET_TAPE_DATASET_ROOT", "/Volumes/My Passport/MarketTape/datasets"
+    )).expanduser())
+    youtube_research_dir: Path = field(default_factory=lambda: Path(os.getenv(
+        "MARKET_TAPE_YOUTUBE_RESEARCH_DIR",
+        "/Volumes/My Passport/MarketTape/trend-frontier",
+    )).expanduser())
+    dataset_export_enabled: bool = field(default_factory=lambda: _bool(
+        "MARKET_TAPE_DATASET_EXPORT_ENABLED", False
+    ))
+    dataset_require_mounted_volume: bool = field(default_factory=lambda: _bool(
+        "MARKET_TAPE_DATASET_REQUIRE_MOUNTED_VOLUME", True
+    ))
+    dataset_storage_preflight_timeout_seconds: float = field(default_factory=lambda: _float(
+        "MARKET_TAPE_DATASET_STORAGE_PREFLIGHT_TIMEOUT_SECONDS", 30.0
+    ))
+    prediction_min_backtest_labels: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_PREDICTION_MIN_BACKTEST_LABELS", 100
+    ))
+    prediction_min_positive_labels: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_PREDICTION_MIN_POSITIVE_LABELS", 10
+    ))
+    prediction_model_dir: Path = field(default_factory=lambda: Path(os.getenv(
+        "MARKET_TAPE_PREDICTION_MODEL_DIR",
+        str(REPO_ROOT / "data" / "market-tape-models"),
+    )).expanduser())
     platforms: List[str] = field(default_factory=lambda: _csv(
         "MARKET_TAPE_PLATFORMS", "youtube,tiktok,instagram,x,facebook,threads"
     ))
@@ -179,6 +212,12 @@ class MarketTapeConfig:
     ))
     local_research_refresh_seconds: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_LOCAL_RESEARCH_REFRESH_SECONDS", 86400
+    ))
+    local_research_failure_retry_seconds: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_LOCAL_RESEARCH_FAILURE_RETRY_SECONDS", 3600
+    ))
+    local_research_min_free_bytes: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_LOCAL_RESEARCH_MIN_FREE_BYTES", 5 * 1024 * 1024 * 1024
     ))
     source_failure_backoff_seconds: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_SOURCE_FAILURE_BACKOFF_SECONDS", 3600

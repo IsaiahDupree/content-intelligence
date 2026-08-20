@@ -45,6 +45,8 @@ data/market-tape.sqlite3*
 data/market-tape-objects/
 data/market-tape-heartbeat.json
 data/market-tape.lock
+data/market-tape-local-research-state.json
+data/market-tape-models/
 .env.market-tape
 
 # Testing

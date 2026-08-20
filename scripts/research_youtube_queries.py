@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -18,6 +19,21 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 INGEST_SCRIPT = REPOSITORY_ROOT / "scripts/ingest_yt_dlp_search.py"
+DEFAULT_ENV = (
+    Path.home()
+    / "Library/Application Support/ContentIntelligence/runtime/.env.market-tape"
+)
+sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from services.market_tape.config import MarketTapeConfig  # noqa: E402
+from services.market_tape.models import (  # noqa: E402
+    QueryAttempt,
+    SourceReceipt,
+    SourceState,
+    new_run_id,
+)
+from services.market_tape.sinks import SupabaseSink  # noqa: E402
+from services.market_tape.store import MarketTapeStore  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -140,6 +156,7 @@ def main() -> int:
     parser.add_argument("--cookies-from-browser", default="chrome")
     parser.add_argument("--timeout-seconds", type=int, default=180)
     parser.add_argument("--no-ingest", action="store_true")
+    parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV)
     args = parser.parse_args()
 
     queries = load_queries(args.query, args.query_file)
@@ -183,7 +200,12 @@ def main() -> int:
     ]
     ingest_result: dict[str, object] | None = None
     if ingestable and not args.no_ingest:
-        command = [sys.executable, str(INGEST_SCRIPT)]
+        command = [
+            sys.executable,
+            str(INGEST_SCRIPT),
+            "--env-file",
+            str(args.env_file.expanduser()),
+        ]
         for receipt in ingestable:
             command.extend(["--input", f"{receipt.query}={receipt.output_path}"])
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -196,10 +218,11 @@ def main() -> int:
                 "error": (result.stderr or result.stdout)[-1000:],
             }
 
+    finished_at = datetime.now(timezone.utc)
     payload = {
         "contract": "youtube_query_research_receipt_v1",
         "started_at": started_at.isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": finished_at.isoformat(),
         "query_count": len(queries),
         "completed_query_count": len(successful),
         "empty_query_count": len(successful) - len(completed),
@@ -217,12 +240,99 @@ def main() -> int:
         json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    coverage = record_query_coverage(
+        receipts,
+        started_at,
+        finished_at,
+        args.env_file,
+    )
+    payload["coverage"] = coverage
+    manifest.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps({**payload, "manifest_path": str(manifest)}, indent=2))
     return 0 if len(successful) == len(queries) and (
         args.no_ingest
         or not ingestable
         or (ingest_result or {}).get("state") == "completed"
     ) else 1
+
+
+def record_query_coverage(
+    receipts: list[QueryReceipt],
+    started_at: datetime,
+    finished_at: datetime,
+    env_file: Path,
+) -> dict[str, object]:
+    os.environ["MARKET_TAPE_ENV_FILES"] = str(env_file.expanduser())
+    config = MarketTapeConfig.from_environment()
+    store = MarketTapeStore(config)
+    run_id = new_run_id()
+    store.start_run(run_id, "youtube_query_research")
+    attempts = [
+        QueryAttempt(
+            run_id=run_id,
+            source_id="youtube-yt-dlp-signed-search",
+            platform="youtube",
+            query=receipt.query,
+            attempted_at=started_at,
+            finished_at=finished_at,
+            state=receipt.state,
+            result_count=receipt.records,
+            request_count=1,
+            error_code="youtube_query_failed"
+            if receipt.state in {"failed", "timed_out"}
+            else "",
+            error_detail=receipt.error,
+            artifact_path=receipt.output_path if receipt.output_sha256 else "",
+            artifact_sha256=receipt.output_sha256,
+            metadata={
+                "contract": "youtube_query_research_receipt_v1",
+                "query_family": receipt.query,
+            },
+        )
+        for receipt in receipts
+    ]
+    inserted = store.save_query_attempts(attempts)
+    failed = sum(receipt.state in {"failed", "timed_out"} for receipt in receipts)
+    source_receipt = SourceReceipt(
+        run_id=run_id,
+        source_id="youtube-yt-dlp-signed-search",
+        platform="youtube",
+        state=SourceState.DEGRADED if failed else SourceState.READY,
+        started_at=started_at,
+        finished_at=finished_at,
+        request_count=len(receipts),
+        discovered_count=sum(receipt.records for receipt in receipts),
+        failed_count=failed,
+        error_code="partial_query_research_failure" if failed else "",
+        error_detail=f"{failed} query attempts failed" if failed else "",
+        metadata={
+            "contract": "youtube_query_coverage_v1",
+            "query_count": len(receipts),
+            "attempts_inserted": inserted,
+            "empty_query_count": sum(receipt.state == "empty" for receipt in receipts),
+        },
+    )
+    store.save_receipt(source_receipt)
+    store.finish_run(
+        run_id,
+        "degraded" if failed else "completed",
+        source_receipt.error_detail,
+    )
+    outbox_records = store.enqueue_run_for_sync(run_id)
+    sink = SupabaseSink(config, store)
+    try:
+        central_sync = sink.flush()
+    finally:
+        sink.close()
+    return {
+        "run_id": run_id,
+        "attempts_inserted": inserted,
+        "outbox_records": outbox_records,
+        "central_sync": central_sync,
+    }
 
 
 if __name__ == "__main__":

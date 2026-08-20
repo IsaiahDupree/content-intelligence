@@ -1,9 +1,9 @@
-# Social Market Tape V2
+# Social Market Tape V4
 
 Status: autonomous local production runtime installed
 Service: `content-intelligence`
 Loopback API: `http://127.0.0.1:6006`
-Schema version: `5`
+Schema version: `7`
 Daily unique target: `5,000` UTC-day items
 
 ## Purpose
@@ -15,6 +15,7 @@ The permanent asset is the historical trajectory:
 ```text
 provider response
   -> immutable compressed raw object
+  -> immutable query-attempt receipt, including zero-result searches
   -> versioned canonical creator and content IDs
   -> append-only market observation
   -> adaptive next poll
@@ -23,6 +24,7 @@ provider response
   -> append-only trend observation
   -> social candle and versioned prediction
   -> transactional central outbox
+  -> daily verified Passport snapshot and prediction backtest
 ```
 
 No AI assistant is required for configuration or execution. Environment configuration, source adapters, scheduler policy, storage, status, and receipts are deterministic software contracts.
@@ -199,6 +201,73 @@ The V2 verifier certified all 12 relations, RLS on every table, zero unexpected 
 
 Launchd retry run `mt-run-888fabdb-514e-49d7-a61a-aedb59dff50f` completed a real unattended recheck after the API startup race, synchronized 751 changed entities with zero failures, refreshed the heartbeat under the deployed API PID, and left local/central parity intact.
 
+### Supervised V4 state: 2026-08-20 06:40 UTC
+
+This is an intraday operating receipt, not a claim that the current UTC day is
+complete or fully certified:
+
+| Record | Live count |
+|---|---:|
+| Canonical content items | 11,391 |
+| Market observations | 12,228 |
+| Canonical creators | 8,860 |
+| Trend objects | 32,575 |
+| Trend observations | 101,098 |
+| Versioned predictions | 132,116 |
+| Immutable query attempts | 425 |
+| Due trajectory polls | 4,627 |
+
+The day currently contains 3,939 newly acquired YouTube items at `$0.00`
+configured direct provider cost, or 78.78% of the 5,000-item global target.
+TikTok, Instagram, X, Facebook, and Threads remain at zero newly acquired items
+for this UTC day; historical archive evidence from those platforms remains on
+tape, but it is not relabeled as today's collection. Controlled-browser job
+`job_1787204984974_j3ttqd` is actively researching 30 market-led topics across
+five platform lanes. Its artifacts are promoted incrementally by scheduled
+rechecks, so the collector does not need to wait for the complete cross-platform
+job.
+
+At 07:00 UTC the external research service restarted after a Safari AppleEvent
+timeout and lost that in-memory job registry. Ten completed TikTok/Instagram
+intermediate artifacts remained durable. Market Tape now persists the first
+`provider_job_not_found` detection, enforces a one-hour cooldown from that
+detection, then retries the recorded lanes rather than waiting the full 24-hour
+refresh interval or immediately duplicating browser work.
+
+Fair recheck run `mt-run-6087441b-84b7-4d34-8b72-a51426cbc348` advanced 1,000
+cross-platform queue positions, used five actual YouTube API requests, and
+created 201 true second observations plus 851 V2 trend ticks. Repeated scheduler
+passes have since reduced the due queue without manufacturing observations from
+unchanged archive snapshots. Provider-free reindex runs
+`mt-run-c631b006-0f8f-4a89-aa06-0d8b22b48e87` and
+`mt-run-60605d1c-40db-435b-b75b-97c2974501c2` rebuilt the full 32,575-trend
+activity layer under `trend-strength-v2`.
+
+The highest actionable V5 signals with at least three measured videos are:
+
+| Rank | Trend | New views in measured hour | Measured videos | Evidence |
+|---:|---|---:|---:|---|
+| 1 | Nobody Wants / US home-buying demand | 8,319 | 3 | medium |
+| 2 | Yankees vs. Orioles | 8,161 | 3 | medium |
+| 14 | Indiana Fever | 13,349 | 3 | medium, recurring |
+
+The V4 Supabase audit verified all 13 RLS-protected relations and append-only
+triggers. A 23-batch drain synchronized 110,074 queued records with zero
+failures, leaving central pending at zero and 485,472 total rows across the
+Market Tape relations. The existing promoted progression model remains retained
+and re-testable, but it is marked incompatible with V2 index inputs. A fresh V2
+early-entry candidate correctly remains `collecting_labels` with zero matured
+six-hour labels rather than receiving an unsupported promotion.
+
+At 07:15 UTC an explicit Passport recertification returned `blocked_storage`
+after the bounded 30-second write probe. It did not hold the scheduler open.
+The latest successful package remains the partial 2026-08-19 receipt at
+`/Volumes/My Passport/MarketTape/datasets/2026-08-19/mt-dataset-2026-08-19-20260820T053505Z-989997e5/certification.json`;
+the next scheduled certification can replace it once the external filesystem is
+responsive. The following unattended recheck used zero provider calls, imported
+nine additional Instagram query-attempt receipts, reduced due polls to 1,539,
+and left central sync at zero pending records.
+
 ## Source Registry
 
 Every lane implements the same `MarketSource` contract and returns a `SourceReceipt`. A lane is never deleted because it is temporarily unavailable.
@@ -253,6 +322,11 @@ cursor
 operation metadata
 ```
 
+`request_count` is the number of provider operations represented by that
+specific receipt, not the source adapter's cumulative process count. Sequential
+discovery and refresh receipts therefore sum exactly to the provider calls that
+were made. Quota remaining stays cumulative and is reported separately.
+
 Secrets are sanitized before entering error details, receipts, generated reports, or commits.
 
 ## Storage
@@ -265,21 +339,26 @@ The installed production runtime uses:
 ~/Library/Application Support/ContentIntelligence/data/market-tape-objects
 ~/Library/Application Support/ContentIntelligence/data/market-tape-heartbeat.json
 ~/Library/Application Support/SafariAutomation/market-research-data
+/Volumes/My Passport/MarketTape/datasets/YYYY-MM-DD/<certification-id>
+/Volumes/My Passport/MarketTape/raw-objects
 ```
 
 Source remains in this Git repository. The installers deploy both collector and browser-research runtime snapshots outside `~/Documents` because macOS can suspend process file access to protected Documents paths while the screen is locked. Runtime secrets are allowlisted from existing private env files into mode-`600` environment files. Secret values are not printed. The five-platform browser service writes directly to the Application Support archive consumed by Market Tape.
 
 The local SQLite spool is authoritative while disconnected. Database triggers reject updates and deletes to market and trend observations. Raw payloads are gzip-compressed and content-addressed by SHA-256.
 
+The live spool stays on internal storage so a disconnected external drive cannot stop collection. The daily certifier uses SQLite's online backup API, gzip-compresses a recovery snapshot, exports every canonical `mt_*` research table as deterministic JSONL, and writes the package atomically to the Passport. Local raw objects are hash-verified every run. New Passport copies are written atomically and hash-verified after copying; unchanged content-addressed copies are discovered in one directory inventory and reuse their successful copy-time provenance receipt instead of reopening thousands of external-drive files. The manifest reports deep-versus-provenance verification counts under `content-addressed-copy-once-v2`. A Passport write probe is bounded to 30 seconds; timeout returns `blocked_storage`, releases collection, and retains the last successful certification receipt separately. `certification.json` reports storage integrity, collection SLA, query/platform coverage, trajectory coverage, and prediction validation. A package is `partial`, never `certified`, when any gate is missing.
+
 The Supabase sink uses a transactional outbox. Central sync failure does not discard or stop local collection. The shared target schema is live and verified. Sink batches use a fixed dependency order so creators precede videos, trends precede memberships and trend observations, and collection runs precede source receipts even when a batch begins in the middle of a run's outbox records.
 
 ## Autonomous Scheduling
 
-Two user LaunchAgents are installed:
+Three user LaunchAgents are installed:
 
 ```text
 com.isaiah.content-intelligence.api
 com.isaiah.content-intelligence.market-tape
+com.isaiah.content-intelligence.market-tape-dataset
 ```
 
 The scheduler calls `POST /api/market-tape/tick` every 900 seconds. Policy remains in Python:
@@ -292,6 +371,13 @@ The scheduler calls `POST /api/market-tape/tick` every 900 seconds. Policy remai
 - Save the latest scheduler response to `/tmp/content-intelligence-market-tape-last-tick.json`.
 - Write heartbeat only after a complete collector receipt.
 - Retry a failed local API/tick connection after 30 seconds; keep the configured 15-minute cadence after success.
+- At 01:10 local time, snapshot and certify the prior UTC day to the Passport. `RunAtLoad` also closes an uncaptured prior day after deployment or reboot.
+- Reuse a valid same-day Passport receipt written within the prior six hours when launchd is reinstalled; permit explicit force and later recertification so late-arriving evidence can still close a partial day.
+- Publish `checking_storage`, prediction, raw-mirror, snapshot, table-export, and manifest phases through dataset status; raw-mirror status includes processed, total, verified, missing, and corrupt counts.
+- Refuse a browser-research dispatch when the temporary volume has less than 5 GiB free, while continuing to ingest already archived evidence.
+- Inspect the previous browser job before honoring the 24-hour refresh cooldown. Running jobs are not duplicated, completed jobs remain cooled down, failed jobs retry after one hour using only provider lanes whose receipts failed, and provider restarts that forget an in-memory job receive a persisted one-hour missing-job cooldown before recorded lanes retry.
+- Select due trajectory polls with cross-platform round-robin fairness so a large stale archive cannot starve fresh YouTube or another provider lane.
+- Defer a provider row that returns an unchanged cumulative snapshot for one hour with `unchanged_source_snapshot`; do not replay the same non-tick on every scheduler cycle.
 
 Young videos poll most frequently. Positive acceleration or relative strength at least 2 sigma enables hot mode. Poll frequency decays with video age.
 
@@ -331,7 +417,7 @@ broad category charts
 
 Defaults use a seven-day window, require at least two independent videos and two independent creators for automatic querying, select at most 30 terms, and reserve 20% of slots for rotating broad-sector exploration. Query priority combines performance with evidence confidence and a specificity bonus, so an exact measured event query can outrank a generic word. Generic navigation terms such as `live`, `news`, `trailer`, `breakdown`, and `highlights` remain visible for analysis but cannot consume autonomous query slots. Canonical spelling overlap and shared top-video evidence suppress variants from consuming multiple frontier slots. Single-video and single-creator terms remain visible with lower confidence but are never query-ready.
 
-Every provider or signed-in search can attach `query`, `queries`, `topic`, or `niche` discovery context. Market Tape writes one immutable `mt_discovery_attributions` record per query/video/run, mirrors it to `actp_market_discovery_attributions`, and computes an exact-query frontier independently from title fragments. This closes the loop: a broad chart or external trend yields a named query; that query yields videos; their measured performance determines whether the same query expands on the next cycle.
+Every provider or signed-in search can attach `query`, `queries`, `topic`, or `niche` discovery context. Market Tape writes one semantic immutable `mt_discovery_attributions` record per query/video/source, mirrors it to `actp_market_discovery_attributions`, and computes an exact-query frontier independently from title fragments. Rereading an unchanged browser archive cannot multiply that evidence. `mt_query_attempts` separately records every source/query execution, including empty, partial, failed, and timed-out searches, with artifact path and SHA-256 where available. Exact provider queries remain auditable, while `metadata.query_family` maps provider-specific expansions back to the configured cross-platform topic used by the daily coverage gate. This closes the loop without hiding zero-result research or making one provider's expansion syntax a false coverage failure.
 
 Browser expansion uses the research service's explicit `trend` query mode. That mode searches the measured term, exact phrase, and platform-native hashtag or current-event variants; it does not append business-niche suffixes such as `tips`, `strategy`, or `community`. On archive ingest, `niche-token-overlap-v1` independently rejects carryover from a prior browser query. Each source receipt reports evaluated, accepted, rejected, unscoped, and precision counts under `metadata.archive_qc`, so raw browser output cannot silently become validated trend evidence.
 
@@ -369,7 +455,18 @@ python3 -m services.market_tape.cli videos --platform youtube --limit 100
 python3 -m services.market_tape.cli trends --limit 100
 python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli query-frontier --limit 100 --window-hours 168 --min-videos 2
+python3 -m services.market_tape.cli query-attempts --limit 5000
+python3 -m services.market_tape.cli backfill-query-attempts
+python3 -m services.market_tape.cli reindex-trends --forecast-limit 50000
 python3 -m services.market_tape.cli predictions --subject-type trend --limit 100
+python3 -m services.market_tape.cli evaluate-predictions
+python3 -m services.market_tape.cli train-predictor
+python3 -m services.market_tape.cli predictor-status
+python3 -m services.market_tape.cli forecast-trends --limit 5000
+python3 -m services.market_tape.cli opportunities --limit 100 --max-saturation 0.75 --min-videos 2 --min-measured-videos 2
+python3 -m services.market_tape.cli prediction-backtest
+python3 -m services.market_tape.cli certify-dataset --date 2026-08-19
+python3 -m services.market_tape.cli dataset-status
 python3 -m services.market_tape.cli candles --window-minutes 15 --limit 96
 ```
 
@@ -402,14 +499,16 @@ python3 scripts/market_tape_migration.py counts --project-ref ivhfuhxorppptyuofb
 `SUPABASE_ACCESS_TOKEN` with `database_write` permission. It refuses to run if
 the explicit project ref differs from the project encoded in `SUPABASE_URL`.
 The migration manager applies the idempotent V1 base schema followed by
-`migrations/market_tape_v2_discovery_attributions.sql`; print the exact
+`migrations/market_tape_v2_discovery_attributions.sql` and
+`migrations/market_tape_v3_query_attempts.sql`, followed by
+`migrations/market_tape_v4_trend_activity.sql`; print the exact
 combined checked-in SQL for an authorized SQL Editor session with:
 
 ```bash
 python3 scripts/market_tape_migration.py sql
 ```
 
-`status` probes all 12 PostgREST table contracts with the service-role
+`status` probes all 13 PostgREST table contracts with the service-role
 credential. `verify` uses a read-only Management API query to certify relation,
 RLS, policy, and append-only trigger state. `counts` uses the same read-only
 path to return an authoritative row-count receipt. None print credentials. The
@@ -434,9 +533,9 @@ production operation.
 Database owners can additionally run the checked-in read-only catalog audit at
 `migrations/verify_market_tape_v2.sql`. It reports relation existence, RLS,
 policy count, and trigger names for every Market Tape table. The expected state
-is 12 existing relations with RLS enabled, zero anon/authenticated policies,
-and append-only triggers on observations, trend observations, and discovery
-attributions.
+is 13 existing relations with RLS enabled, zero anon/authenticated policies,
+and append-only triggers on observations, trend observations, discovery
+attributions, and query attempts.
 
 Install or update the private runtime and LaunchAgents:
 
@@ -449,6 +548,7 @@ Check supervision:
 ```bash
 launchctl print gui/$(id -u)/com.isaiah.content-intelligence.api
 launchctl print gui/$(id -u)/com.isaiah.content-intelligence.market-tape
+launchctl print gui/$(id -u)/com.isaiah.content-intelligence.market-tape-dataset
 curl -fsS http://127.0.0.1:6006/health
 curl -fsS http://127.0.0.1:6006/api/market-tape/status
 ```
@@ -461,6 +561,7 @@ Logs and latest tick:
 /tmp/content-intelligence-market-tape.log
 /tmp/content-intelligence-market-tape.error.log
 /tmp/content-intelligence-market-tape-last-tick.json
+/tmp/content-intelligence-market-tape-dataset.json
 ```
 
 ## HTTP API
@@ -476,8 +577,13 @@ Read-only routes:
 | GET | `/api/market-tape/trends` | Current trend objects and strengths |
 | GET | `/api/market-tape/keywords` | Evidence-ranked title, hashtag, phrase, and exact-query terms |
 | GET | `/api/market-tape/query-frontier` | Exact discovery queries ranked independently from text fragments |
+| GET | `/api/market-tape/query-attempts` | Query/platform execution ledger, including zero-result attempts |
 | GET | `/api/market-tape/runs` | Collection receipts |
 | GET | `/api/market-tape/predictions` | Versioned video and trend predictions |
+| GET | `/api/market-tape/prediction-backtest` | Brier, calibration, AUC, and model-readiness receipts |
+| GET | `/api/market-tape/predictions/model` | Active predictor and immutable candidate/rejection registry |
+| GET | `/api/market-tape/opportunities` | Specific, evidenced, unsaturated opportunities with transparent score components |
+| GET | `/api/market-tape/datasets/status` | Latest Passport certification state and manifest path |
 | GET | `/api/market-tape/candles` | Delta-based social candles |
 
 Control routes are loopback-only unless `MARKET_TAPE_CONTROL_TOKEN` is configured:
@@ -487,42 +593,68 @@ Control routes are loopback-only unless `MARKET_TAPE_CONTROL_TOKEN` is configure
 | POST | `/api/market-tape/tick` | Select and run the next due autonomous cycle |
 | POST | `/api/market-tape/cycles` | Run explicit full, discovery, or recheck mode |
 | POST | `/api/market-tape/bootstrap-local` | Promote existing browser archives |
+| POST | `/api/market-tape/query-attempts/backfill` | Verify and import historical Safari and signed-in YouTube keyword receipts without provider calls |
+| POST | `/api/market-tape/trends/reindex` | Recompute V2 trend activity and deterministic forecasts from existing observations without provider calls |
 | POST | `/api/market-tape/sync` | Flush or force-retry the central outbox |
+| POST | `/api/market-tape/predictions/evaluate` | Label forecasts whose horizons have measurable follow-up |
+| POST | `/api/market-tape/predictions/train` | Train, grouped-cross-validate, and promote or reject a versioned trend predictor |
+| POST | `/api/market-tape/predictions/forecast` | Apply the promoted model to current non-dead trend states and queue receipts for central sync |
+| POST | `/api/market-tape/datasets/certify` | Build and verify a daily Passport dataset |
 
 ## Trend And Prediction Semantics
 
+Every daily certification evaluates due forecast horizons, trains a dependency-free regularized logistic candidate from scored trend labels, and applies the promoted model to current eligible trend states. Cross-validation is deterministic and grouped by `trend_id`, so repeated forecasts for one trend cannot leak across training and validation folds. Promotion requires the configured label and positive-label minimums, positive Brier skill over fold-specific prevalence, and ROC-AUC of at least `0.65`. Promoted, rejected, and still-collecting artifacts remain re-testable in the model registry; only the hashed `active.json` pointer can enable a candidate for new predictions.
+
+Prediction contracts are deliberately distinct:
+
+- `is_or_reaches_breakout_within_6h` describes the deployed V2 market-state progression model. It may rank a trend that is already hot. Its artifact was trained on `trend-strength-v1`, so it is explicitly incompatible with current `trend-strength-v2` observations and receives zero weight until retrained on the new index.
+- `enters_breakout_within_6h` describes the V3 early-entry candidate. Training and inference exclude trends already in `breakout`, `expanding`, or `saturating`, and trends already at strength 70 or above.
+- `actionable-opportunity-v5` is a deterministic derived rank, not a probability. It combines measured one-hour activity volume, activity-coverage-adjusted momentum and acceleration, relative strength, breadth, unsaturation, and evidence reliability. An incompatible model receives exactly zero rank weight. The feed requires at least two independently ticking videos by default and excludes format aggregates, generic distribution tags, incomplete phrases, declining/dead/saturating states, insufficient evidence, and near-duplicates measured by both label and shared-video overlap. Portfolio caps stop one trend type or lifecycle class from crowding out the rest. Each result carries `high`, `medium`, or `provisional` evidence grade plus every weight, score component, suppression count, platform distribution, and representative source-content receipt.
+
 Each observation stores cumulative counters plus their derivatives. Relative strength is a z-score against recent observations in the same platform and video-age bucket.
 
-Trend aggregation tracks video and creator totals, new adoption, counter deltas, median and p90 velocity, creator and platform breadth, top-1 and top-10 concentration, momentum, acceleration, relative strength, saturation, trend strength, index version, and lifecycle state.
+`trend-strength-v2` derives recent activity only from measured per-video counter
+deltas. A lifetime total first observed on an old post contributes zero recent
+views; a first observation contributes only when the post was actually published
+inside the measured window. Long-gap deltas are scaled to their one-hour overlap.
+Every trend observation stores `views_new_1h`, `likes_new_1h`,
+`comments_new_1h`, `shares_new_1h`, `counter_delta_videos`, and
+`activity_coverage`, making sparse evidence visible instead of projecting one
+tick across a broad trend. Creator adoption likewise uses provider publication
+time rather than crawler first-seen time.
 
-V1 prediction models are transparent scored baselines. They store model version and input features for:
+Trend aggregation also tracks video and creator totals, new adoption, median and p90 velocity, creator and platform breadth, top-1 and top-10 concentration, momentum, acceleration, relative strength, saturation, trend strength, index version, and lifecycle state. Reindexing is deterministic and provider-free; it rebuilds this layer from the immutable tape while preserving prior index observations and model artifacts for audit and retest.
+
+Transparent controls store model version and input features for:
 
 - Video exceeds 10x creator baseline within 24 hours.
-- Trend reaches breakout within six hours.
+- Trend enters breakout within six hours from a genuinely pre-breakout baseline.
 - Expected peak time.
 - Expected remaining useful life.
 
-They are not yet outcome-calibrated learned temporal models. Outcome evaluation and model training remain next-stage work.
+The evaluator labels only horizons with adequate future tape, marks missing creator baselines as unscorable, and explicitly rejects an early-entry label when the baseline was already hot. It reports Brier score, baseline skill, log loss, AUC, accuracy, ten-bin calibration error, label sufficiency, and `validated` versus `measured_not_validated`. Dataset certification fails the prediction gate until a model has enough two-class outcomes and positive Brier skill from live future outcomes.
 
 ## Verification
 
 ```bash
 python3 -m pytest \
   tests/test_market_tape.py \
+  tests/test_market_tape_dataset.py \
+  tests/test_market_tape_predictor.py \
   tests/test_youtube_query_research.py \
   tests/test_health.py \
   tests/test_api_e2e.py -q
 python3 -m json.tool Sources/OpsConsole/Resources/content-intelligence-contract.json
 ```
 
-The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, adaptive polling, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, partial-batch preservation, provider receipts, spend accounting, circuit breakers, local archive normalization and relevance QC, exact-query lineage, dependency-ordered transactional outbox behavior, central parity reconciliation, Management API verification, API authorization, and automatic tick selection. The focused production suite currently passes all 52 tests.
+The Market Tape integration suite uses real temporary SQLite databases and real loopback HTTP servers. It verifies append-only enforcement, raw archiving, derivative math, lifetime-counter exclusion, adaptive and fair polling, unchanged-snapshot deferral, YouTube pagination and known-ID skipping, healthy-provider overflow, persistent search quota accounting, per-operation request receipts, partial-batch preservation, spend accounting, circuit breakers, browser disk-pressure gates, failed-lane and missing-job retry, local archive normalization and relevance QC, exact-query lineage, provider-free context backfill and trend reindexing, idempotent daily certification, dependency-ordered transactional outbox behavior, grouped predictor validation, index/model compatibility, early-entry label semantics, actionable-opportunity filtering, central parity reconciliation, Management API verification, API authorization, and automatic tick selection. The repository suite currently passes all 127 tests.
 
 ## Remaining Work
 
 1. Certify one complete 5,000-unique UTC production day and tune per-platform targets from observed capacity.
 2. Restore or obtain valid authorized TikTok, Instagram, X, Facebook, and Threads provider access where platform policy permits.
 3. Add transcript, visual, audio, and embedding workers to populate the existing content-genome contract.
-4. Add outcome labels, backtesting, calibration, and learned temporal predictors.
+4. Accumulate enough independent trajectory outcomes to validate or replace the transparent baseline with a learned temporal predictor.
 5. Add ClickHouse and vector storage when local observation volume justifies separation from the control-plane spool.
 6. Feed qualified emerging and breakout trends into the experiment planner without authorizing generation or publishing automatically.
 
