@@ -15,7 +15,10 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from services.content_quality.engine import QualityStore  # noqa: E402
-from services.content_quality.transcript_bank import TranscriptBank  # noqa: E402
+from services.content_quality.transcript_bank import (  # noqa: E402
+    TranscriptBank,
+    file_sha256,
+)
 
 
 DEFAULT_TAPE = Path.home() / "Library/Application Support/ContentIntelligence/data/market-tape.sqlite3"
@@ -63,11 +66,18 @@ def main() -> int:
         "PASS" if evidence_audit["decision"] == "PASS_PREDICTED_RELATABILITY"
         else "REJECT_NOT_RELATABLE"
     )
+    # Downstream consumers re-verify these two artifacts by their bytes on disk,
+    # so publish the file hashes here. The canonical-JSON hash inside the receipt
+    # answers a different question and cannot stand in for them.
+    manifest_path = args.cohort_manifest.expanduser().resolve()
+    receipt_path = Path(evidence_audit["receipt_path"]).expanduser().resolve()
     findings = {
         **evidence_audit["findings"],
         "evidence_audit_id": evidence_audit["audit_id"],
-        "evidence_receipt_path": evidence_audit["receipt_path"],
-        "cohort_manifest_path": str(args.cohort_manifest.expanduser().resolve()),
+        "evidence_receipt_path": str(receipt_path),
+        "evidence_receipt_sha256": file_sha256(receipt_path),
+        "cohort_manifest_path": str(manifest_path),
+        "cohort_manifest_sha256": file_sha256(manifest_path),
         "supersedes_audit_id": previous_audit_id,
         "supersession_reason": (
             "Prior token/beat-label audit did not validate source transcript performance, "
