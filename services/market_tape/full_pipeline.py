@@ -12,6 +12,7 @@ as a single unit, on demand.
 
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,6 +21,31 @@ from .config import MarketTapeConfig
 from .store import MarketTapeStore
 
 DEFAULT_TRANSCRIPT_STORAGE_ROOT = Path("/Volumes/My Passport/MarketTape/transcript-bank")
+
+
+def matching_trend_ids(
+    store: MarketTapeStore,
+    topic: str,
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Resolve a requested topic to exact Market Tape trend objects."""
+
+    normalized = str(topic or "").strip().lower()
+    if not normalized:
+        return []
+    with closing(store.connect()) as connection:
+        rows = connection.execute(
+            """
+            SELECT trend_id
+            FROM mt_trends
+            WHERE LOWER(display_name) LIKE ? OR LOWER(canonical_key) LIKE ?
+            ORDER BY last_seen_at DESC
+            LIMIT ?
+            """,
+            (f"%{normalized}%", f"%{normalized}%", max(1, min(100, int(limit)))),
+        ).fetchall()
+    return [str(row["trend_id"]) for row in rows]
 
 
 def run_full_pipeline(
@@ -32,6 +58,7 @@ def run_full_pipeline(
     transcript_platforms: Sequence[str] = ("youtube", "tiktok", "instagram", "facebook"),
     transcript_model: str = "base",
     topic: str = "",
+    transcript_trend_ids: Sequence[str] = (),
     transcript_storage_root: Path | None = None,
     cookies_from_browser: str | None = None,
     bank_factory: Any = None,
@@ -54,11 +81,17 @@ def run_full_pipeline(
 
     storage_root = transcript_storage_root or DEFAULT_TRANSCRIPT_STORAGE_ROOT
     bank = bank_factory(resolved_config.db_path, storage_root)
+    target_trend_ids = list(dict.fromkeys(
+        str(value) for value in transcript_trend_ids if str(value)
+    ))
+    if not target_trend_ids and topic:
+        target_trend_ids = matching_trend_ids(resolved_store, topic)
     backfill = bank.run_backfill(
         limit=transcript_limit,
         platforms=transcript_platforms,
         model_name=transcript_model,
         topic=topic,
+        trend_ids=target_trend_ids,
         cookies_from_browser=cookies_from_browser,
     )
 
@@ -93,6 +126,10 @@ def run_full_pipeline(
             "failure_count": backfill["failure_count"],
             "failures": backfill["failures"],
             "manifest_path": backfill["manifest_path"],
+            "trend_ids": target_trend_ids,
         },
         "fully_vetted_transcript_ids": vetted_transcript_ids,
     }
+
+
+__all__ = ["matching_trend_ids", "run_full_pipeline"]

@@ -178,6 +178,12 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
         limit = _limit(body.get("limit"), 5, maximum=200)
         topic = str(body.get("topic", ""))
         model = str(body.get("model", "base"))
+        trend_ids = body.get("trend_ids") or []
+        if not isinstance(trend_ids, list) or any(
+            not isinstance(value, str) or not value.strip()
+            for value in trend_ids
+        ) or len(trend_ids) > 25:
+            return jsonify({"error": "trend_ids must be an array of at most 25 non-empty strings"}), 400
         return run_exclusive(lambda: run_full_pipeline(
             config=resolved,
             store=store,
@@ -187,6 +193,7 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             transcript_platforms=platforms,
             transcript_model=model,
             topic=topic,
+            transcript_trend_ids=trend_ids,
         ))
 
     @app.post("/api/market-tape/bootstrap-local")

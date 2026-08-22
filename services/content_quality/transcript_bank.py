@@ -337,11 +337,23 @@ class TranscriptBank:
         limit: int,
         platforms: Sequence[str] = ("youtube", "tiktok", "instagram", "facebook"),
         topic: str = "",
+        trend_ids: Sequence[str] = (),
     ) -> list[Candidate]:
         """Select highest-performing untranscribed videos for a resumable bank fill."""
 
         platform_values = tuple(dict.fromkeys(value.lower() for value in platforms))
         marks = ",".join("?" for _ in platform_values)
+        trend_values = tuple(dict.fromkeys(str(value) for value in trend_ids if str(value)))
+        trend_clause = ""
+        if trend_values:
+            trend_marks = ",".join("?" for _ in trend_values)
+            trend_clause = f"""
+                AND EXISTS (
+                    SELECT 1 FROM mt_trend_memberships target
+                    WHERE target.video_id = v.video_id
+                      AND target.trend_id IN ({trend_marks})
+                )
+            """
         query = f"""
             WITH latest AS (
                 SELECT o.*
@@ -359,11 +371,15 @@ class TranscriptBank:
             JOIN latest o ON o.video_id=v.video_id
             LEFT JOIN mt_transcript_artifacts artifact ON artifact.video_id=v.video_id
             WHERE v.platform IN ({marks}) AND artifact.video_id IS NULL
+            {trend_clause}
             ORDER BY o.views DESC, o.relative_strength DESC
             LIMIT ?
         """
         with closing(self.connect()) as connection:
-            rows = connection.execute(query, (*platform_values, max(limit * 20, 500))).fetchall()
+            rows = connection.execute(
+                query,
+                (*platform_values, *trend_values, max(limit * 20, 500)),
+            ).fetchall()
 
         filter_terms = tuple(topic_terms(topic))
         candidates: list[Candidate] = []
@@ -392,7 +408,7 @@ class TranscriptBank:
             )
             metadata_vocabulary = {token.lower() for token in words(metadata_text)}
             filter_matches = tuple(term for term in filter_terms if term in metadata_vocabulary)
-            if filter_terms and len(filter_matches) < 2:
+            if filter_terms and len(filter_matches) < 2 and not trend_values:
                 continue
             terms = filter_terms or tuple(topic_terms(metadata_text)[:40])
             if len(terms) < 2:
@@ -416,7 +432,7 @@ class TranscriptBank:
                 saves=int(row["saves"] or 0),
                 relative_strength=float(row["relative_strength"] or 0.0),
                 topic_terms=terms,
-                topic_matches=filter_matches or terms,
+                topic_matches=filter_matches or (filter_terms if trend_values else terms),
             ))
             if len(candidates) >= limit:
                 break
@@ -429,12 +445,16 @@ class TranscriptBank:
         platforms: Sequence[str],
         model_name: str,
         topic: str = "",
+        trend_ids: Sequence[str] = (),
         cookies_from_browser: str | None = None,
     ) -> dict[str, Any]:
         started_at = utc_now()
         run_id = f"transcript_run_{uuid.uuid4().hex}"
         candidates = self.select_backfill_candidates(
-            limit=limit, platforms=platforms, topic=topic
+            limit=limit,
+            platforms=platforms,
+            topic=topic,
+            trend_ids=trend_ids,
         )
         model = load_whisper_model(model_name) if candidates else None
         artifacts: list[dict[str, Any]] = []
@@ -476,6 +496,7 @@ class TranscriptBank:
                 "platforms": list(platforms),
                 "model": model_name,
                 "topic": topic,
+                "trend_ids": list(trend_ids),
                 "platform_policies": {
                     platform: asdict(DEFAULT_POLICIES[platform])
                     for platform in platforms if platform in DEFAULT_POLICIES

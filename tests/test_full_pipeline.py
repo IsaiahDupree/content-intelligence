@@ -46,19 +46,27 @@ def market_config(tmp_path):
     )
 
 
-def seed_real_candidate(store: MarketTapeStore, run_id: str, *, unreachable_url: str) -> str:
+def seed_real_candidate(
+    store: MarketTapeStore,
+    run_id: str,
+    *,
+    unreachable_url: str,
+    external_id: str = "unreachable000",
+    views: int = 50_000,
+    title: str = "Automating invoicing workflows for busy startup founders",
+) -> str:
     """Insert one real, policy-qualifying video via the real ingest() path --
     same code every live discovery cycle uses -- so the transcript stage has
     a genuine untranscribed candidate to select."""
     item = MarketContent(
         platform="youtube",
-        external_id="unreachable000",
-        creator_external_id="creator-unreachable",
+        external_id=external_id,
+        creator_external_id=f"creator-{external_id}",
         published_at=None,
         observed_at=utc_now(),
         source_id="test-seed",
-        metrics=MetricCounters(views=50_000, likes=1_000, comments=200, shares=50, saves=10),
-        title="Automating invoicing workflows for busy startup founders",
+        metrics=MetricCounters(views=views, likes=max(1_000, views // 20), comments=200, shares=50, saves=10),
+        title=title,
         caption="",
         description="A walkthrough of automating invoicing workflows for founders.",
         url=unreachable_url,
@@ -100,9 +108,49 @@ class TestFullPipeline:
         and the failure must show up in the receipt -- never a fabricated
         transcript, never a silently dropped candidate."""
         store = MarketTapeStore(market_config)
-        seed_real_candidate(
-            store, "seed-run", unreachable_url="http://127.0.0.1:1/does-not-exist.mp4"
+        target_video_id = seed_real_candidate(
+            store,
+            "seed-run",
+            unreachable_url="http://127.0.0.1:1/target-does-not-exist.mp4",
+            external_id="target000",
+            views=50_000,
         )
+        seed_real_candidate(
+            store,
+            "seed-run",
+            unreachable_url="http://127.0.0.1:1/higher-does-not-exist.mp4",
+            external_id="higher000",
+            views=500_000,
+            title="A higher-ranked unrelated creator story",
+        )
+        now = utc_now().isoformat()
+        with store.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO mt_trends(
+                    trend_id, trend_type, canonical_key, display_name,
+                    status, first_seen_at, last_seen_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "trend:test:explicit-target",
+                    "topic",
+                    "explicit target",
+                    "Explicit Target",
+                    "active",
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO mt_trend_memberships(
+                    trend_id, video_id, confidence, evidence_json, first_seen_at
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                ("trend:test:explicit-target", target_video_id, 1.0, "{}", now),
+            )
+            connection.commit()
         collector = MarketTapeCollector(market_config, store, source_builder=lambda *_: [])
 
         result = run_full_pipeline(
@@ -112,14 +160,16 @@ class TestFullPipeline:
             transcript_platforms=("youtube",),
             transcript_storage_root=tmp_path / "transcript-bank",
             transcript_limit=5,
+            topic="explicit target",
         )
 
         assert result["transcription"]["candidate_count"] == 1
         assert result["transcription"]["artifact_count"] == 0
         assert result["transcription"]["failure_count"] == 1
         failure = result["transcription"]["failures"][0]
-        assert failure["video_id"]
+        assert failure["video_id"] == target_video_id
         assert failure["error"]
+        assert result["transcription"]["trend_ids"] == ["trend:test:explicit-target"]
         assert result["fully_vetted_transcript_ids"] == []
         assert result["state"] == "failed"
 
@@ -137,14 +187,21 @@ class TestFullPipeline:
         )
         assert bad_mode.status_code == 400
 
+        bad_trends = client.post(
+            "/api/market-tape/full-pipeline", json={"trend_ids": "not-an-array"}
+        )
+        assert bad_trends.status_code == 400
+
         ok = client.post(
             "/api/market-tape/full-pipeline",
             json={"discovery_mode": "discovery", "platforms": ["youtube"], "limit": 1,
-                  "topic": "a topic phrase nothing in the tape will ever match"},
+                  "topic": "a topic phrase nothing in the tape will ever match",
+                  "trend_ids": ["trend:does-not-exist"]},
         )
         assert ok.status_code == 200
         body = ok.get_json()
         assert "discovery" in body and "transcription" in body
+        assert body["transcription"]["trend_ids"] == ["trend:does-not-exist"]
         assert body["state"] == "completed"
 
         monkeypatch.setenv("MARKET_TAPE_CONTROL_TOKEN", "secret-token")
