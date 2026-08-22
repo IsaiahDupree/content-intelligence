@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+import fcntl
 import gzip
+import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+from flask import Flask
+
+from services.market_tape.api import register_market_tape_routes
 from services.market_tape.config import MarketTapeConfig
-from services.market_tape.dataset import MarketTapeDatasetManager
+from services.market_tape.dataset import (
+    DatasetSnapshotIntegrityError,
+    MarketTapeDatasetManager,
+)
 from services.market_tape.models import MarketContent, MetricCounters, QueryAttempt
 from services.market_tape.store import MarketTapeStore
 
@@ -236,6 +246,162 @@ def test_daily_passport_dataset_is_recoverable_and_prediction_scored(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM mt_query_attempts").fetchone()[0] == 2
     finally:
         connection.close()
+
+
+def test_long_export_releases_operation_lock_and_uses_one_snapshot(tmp_path):
+    """A real WAL writer advances while Passport-like JSONL export is active."""
+    config = _config(tmp_path)
+    store = MarketTapeStore(config)
+    initial_rows = 12_000
+    with store.connect() as connection:
+        connection.execute(
+            "CREATE TABLE mt_concurrency_probe (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO mt_concurrency_probe(id, payload) VALUES (?, ?)",
+            (
+                (
+                    index,
+                    hashlib.shake_256(str(index).encode("utf-8")).hexdigest(1024),
+                )
+                for index in range(initial_rows)
+            ),
+        )
+
+    manager = MarketTapeDatasetManager(config, store)
+    operation_lock = threading.Lock()
+    result_box = {}
+
+    def certify() -> None:
+        result_box["result"] = manager.certify(
+            datetime.now(timezone.utc).date(),
+            operation_lock=operation_lock,
+        )
+
+    worker = threading.Thread(target=certify, name="real-dataset-certification")
+    worker.start()
+    deadline = time.monotonic() + 30
+    observed_unlocked_export = False
+    while worker.is_alive() and time.monotonic() < deadline:
+        if manager.local_status_path.is_file():
+            status = json.loads(manager.local_status_path.read_text(encoding="utf-8"))
+            if status.get("phase") in {
+                "mirroring_raw_objects",
+                "exporting_tables",
+                "finalizing_manifest",
+            }:
+                assert operation_lock.acquire(blocking=False) is True
+                operation_lock.release()
+                with store.connect() as connection:
+                    connection.execute(
+                        "INSERT INTO mt_concurrency_probe(id, payload) VALUES (?, ?)",
+                        (initial_rows, "arrived-after-snapshot-pin"),
+                    )
+                observed_unlocked_export = True
+                break
+        time.sleep(0.005)
+    worker.join(timeout=30)
+
+    assert worker.is_alive() is False
+    assert observed_unlocked_export is True
+    result = result_box["result"]
+    assert result["state"] in {"partial", "certified"}
+    assert result["consistency"] == {
+        "contract": "market_tape_dataset_snapshot_consistency_v1",
+        "snapshot_captured_at": result["artifacts"]["sqlite_snapshot"]["captured_at"],
+        "sqlite_capture": "pinned_wal_read_transaction_online_backup",
+        "destination_pragmas": {
+            "journal_mode": "OFF",
+            "synchronous": "OFF",
+            "temp_store": "MEMORY",
+        },
+        "table_exports_source": "captured_sqlite_snapshot",
+        "quality_report_source": "captured_sqlite_snapshot",
+        "raw_registry_source": "captured_sqlite_snapshot",
+        "model_files_captured_before_snapshot_pin": True,
+        "long_exports_hold_live_operation_lock": False,
+    }
+
+    snapshot_path = Path(result["artifacts"]["sqlite_snapshot"]["path"])
+    restored = tmp_path / "concurrency-restored.sqlite3"
+    with gzip.open(snapshot_path, "rb") as source, restored.open("wb") as output:
+        output.write(source.read())
+    snapshot_connection = sqlite3.connect(restored)
+    try:
+        assert snapshot_connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert snapshot_connection.execute(
+            "SELECT COUNT(*) FROM mt_concurrency_probe"
+        ).fetchone()[0] == initial_rows
+    finally:
+        snapshot_connection.close()
+
+    export_path = snapshot_path.parent / "tables" / "mt_concurrency_probe.jsonl.gz"
+    with gzip.open(export_path, "rt", encoding="utf-8") as handle:
+        assert sum(1 for _ in handle) == initial_rows
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_concurrency_probe"
+        ).fetchone()[0] == initial_rows + 1
+
+
+def test_certification_lock_returns_http_409_without_clobbering_status(tmp_path):
+    config = _config(tmp_path)
+    manager = MarketTapeDatasetManager(config, MarketTapeStore(config))
+    manager.local_status_path.write_text(json.dumps({
+        "contract": "market_tape_daily_dataset_v1",
+        "state": "running",
+        "phase": "exporting_tables",
+    }), encoding="utf-8")
+    manager.certification_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = manager.certification_lock_path.open("a+", encoding="utf-8")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        app = Flask(__name__)
+        register_market_tape_routes(app, config)
+        response = app.test_client().post(
+            "/api/market-tape/datasets/certify",
+            json={"date": datetime.now(timezone.utc).date().isoformat()},
+        )
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+    assert response.status_code == 409
+    assert response.get_json()["state"] == "busy"
+    assert response.get_json()["busy_scope"] == "dataset_certification"
+    assert json.loads(manager.local_status_path.read_text(encoding="utf-8"))["phase"] == (
+        "exporting_tables"
+    )
+
+
+def test_unsafe_staging_pragmas_require_a_recoverable_snapshot(tmp_path):
+    config = _config(tmp_path)
+    store = MarketTapeStore(config)
+    manager = MarketTapeDatasetManager(config, store)
+    staging = config.dataset_root / ".staging" / "pragma-integrity-test"
+    staging.mkdir(parents=True)
+    source, captured_at = manager._pin_source_snapshot()
+    try:
+        capture = manager._copy_pinned_snapshot(staging, source, captured_at)
+    finally:
+        source.rollback()
+        source.close()
+
+    assert capture["destination_pragmas"] == {
+        "journal_mode": "OFF",
+        "synchronous": "OFF",
+        "temp_store": "MEMORY",
+    }
+    assert manager._validate_snapshot(Path(capture["source_path"])) == {
+        "quick_check": "ok",
+        "foreign_key_errors": 0,
+    }
+    assert not Path(str(capture["source_path"]) + "-journal").exists()
+
+    corrupt = staging / "corrupt.sqlite3"
+    corrupt.write_bytes(b"not a sqlite database")
+    with pytest.raises(DatasetSnapshotIntegrityError):
+        manager._validate_snapshot(corrupt)
 
 
 def _config(tmp_path):

@@ -289,9 +289,11 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             return jsonify({"error": "local control token required"}), 401
         body: Any = request.get_json(silent=True) or {}
         target_date = body.get("date")
-        return run_exclusive(
-            lambda: MarketTapeDatasetManager(resolved, store).certify(target_date)
+        result = MarketTapeDatasetManager(resolved, store).certify(
+            target_date,
+            operation_lock=operation_lock,
         )
+        return jsonify(result), (409 if result.get("state") == "busy" else 200)
 
 
 def _authorized() -> bool:

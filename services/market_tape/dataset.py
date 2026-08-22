@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import gzip
 import hashlib
 import json
@@ -10,18 +11,45 @@ import queue
 import shutil
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, TextIO
 
 from .config import MarketTapeConfig
 from .models import isoformat, stable_hash, utc_now
 from .predictor import MarketTapePredictor
-from .store import MarketTapeStore
+from .store import ClosingSQLiteConnection, MarketTapeStore
 
 
 DATASET_CONTRACT = "market_tape_daily_dataset_v1"
+SNAPSHOT_CONSISTENCY_CONTRACT = "market_tape_dataset_snapshot_consistency_v1"
 EXCLUDED_EXPORT_TABLES = {"mt_sync_outbox"}
+
+
+class DatasetSnapshotIntegrityError(RuntimeError):
+    """The staged SQLite backup is not safe to promote."""
+
+
+class _SnapshotMarketTapeStore(MarketTapeStore):
+    """Read-only MarketTapeStore surface pinned to one staged SQLite backup."""
+
+    def __init__(self, config: MarketTapeConfig, snapshot_path: Path):
+        self.config = config
+        self._snapshot_path = snapshot_path
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"{self._snapshot_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=30.0,
+            factory=ClosingSQLiteConnection,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
 
 
 class MarketTapeDatasetManager:
@@ -40,8 +68,16 @@ class MarketTapeDatasetManager:
         self.latest_success_path = config.heartbeat_path.with_name(
             "market-tape-dataset-latest-success.json"
         )
+        self.certification_lock_path = config.heartbeat_path.with_name(
+            "market-tape-dataset-certification.lock"
+        )
 
-    def certify(self, dataset_date: str | date | None = None) -> Dict[str, Any]:
+    def certify(
+        self,
+        dataset_date: str | date | None = None,
+        *,
+        operation_lock: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         target_date = _target_date(dataset_date)
         checked_at = utc_now()
         if not self.config.dataset_export_enabled:
@@ -53,6 +89,35 @@ class MarketTapeDatasetManager:
             }
             self._record_local_status(result)
             return result
+
+        certification_lock = self._acquire_certification_lock()
+        if certification_lock is None:
+            return {
+                "contract": DATASET_CONTRACT,
+                "state": "busy",
+                "busy_scope": "dataset_certification",
+                "dataset_date": target_date.isoformat(),
+                "checked_at": isoformat(checked_at),
+                "error": "another dataset certification already owns the certification lock",
+                "status_path": str(self.local_status_path),
+            }
+        try:
+            return self._certify_owned(
+                target_date,
+                checked_at,
+                operation_lock=operation_lock,
+            )
+        finally:
+            fcntl.flock(certification_lock.fileno(), fcntl.LOCK_UN)
+            certification_lock.close()
+
+    def _certify_owned(
+        self,
+        target_date: date,
+        checked_at: datetime,
+        *,
+        operation_lock: Optional[Any],
+    ) -> Dict[str, Any]:
 
         self._record_progress(target_date, checked_at, "checking_storage")
         storage = self._storage_preflight()
@@ -67,10 +132,6 @@ class MarketTapeDatasetManager:
             self._record_local_status(result)
             return result
 
-        self._record_progress(target_date, checked_at, "preparing_predictions", storage=storage)
-        prediction_evaluation = self.store.evaluate_predictions(checked_at)
-        prediction_training = MarketTapePredictor(self.config, self.store).train()
-        prediction_forecast = self.store.forecast_active_trends(checked_at)
         certification_id = (
             f"mt-dataset-{target_date.isoformat()}-"
             f"{checked_at.strftime('%Y%m%dT%H%M%S%fZ')}-"
@@ -78,8 +139,76 @@ class MarketTapeDatasetManager:
         )
         staging = self.config.dataset_root / ".staging" / certification_id
         final = self.config.dataset_root / target_date.isoformat() / certification_id
+        pinned_source: Optional[sqlite3.Connection] = None
         try:
             staging.mkdir(parents=True, exist_ok=False)
+            self._record_progress(
+                target_date,
+                checked_at,
+                "preparing_predictions",
+                certification_id=certification_id,
+                storage=storage,
+            )
+
+            owns_operation_lock = operation_lock is None
+            if operation_lock is not None:
+                owns_operation_lock = operation_lock.acquire(blocking=False)
+            if not owns_operation_lock:
+                shutil.rmtree(staging, ignore_errors=True)
+                result = {
+                    "contract": DATASET_CONTRACT,
+                    "state": "busy",
+                    "busy_scope": "market_tape_operation",
+                    "dataset_date": target_date.isoformat(),
+                    "checked_at": isoformat(utc_now()),
+                    "certification_id": certification_id,
+                    "error": "a market tape mutation is active; snapshot pin was not attempted",
+                }
+                self._record_local_status(result)
+                return result
+            try:
+                prediction_evaluation = self.store.evaluate_predictions(checked_at)
+                prediction_training = MarketTapePredictor(self.config, self.store).train()
+                prediction_forecast = self.store.forecast_active_trends(checked_at)
+                captured_models = self._capture_models()
+                pinned_source, snapshot_captured_at = self._pin_source_snapshot()
+            finally:
+                if operation_lock is not None:
+                    operation_lock.release()
+
+            self._record_progress(
+                target_date,
+                checked_at,
+                "writing_sqlite_snapshot",
+                certification_id=certification_id,
+                storage=storage,
+            )
+            try:
+                snapshot_capture = self._copy_pinned_snapshot(
+                    staging,
+                    pinned_source,
+                    snapshot_captured_at,
+                )
+            finally:
+                pinned_source.rollback()
+                pinned_source.close()
+                pinned_source = None
+            snapshot_capture.update(
+                self._validate_snapshot(Path(snapshot_capture["source_path"]))
+            )
+            model_artifacts = self._write_captured_models(
+                staging / "models",
+                captured_models,
+            )
+
+            snapshot_store = _SnapshotMarketTapeStore(
+                replace(
+                    self.config,
+                    db_path=Path(snapshot_capture["source_path"]),
+                    prediction_model_dir=staging / "models",
+                ),
+                Path(snapshot_capture["source_path"]),
+            )
             self._record_progress(
                 target_date,
                 checked_at,
@@ -89,6 +218,7 @@ class MarketTapeDatasetManager:
                 progress={"processed": 0},
             )
             raw_archive = self._mirror_raw_objects(
+                snapshot_store,
                 lambda progress: self._record_progress(
                     target_date,
                     checked_at,
@@ -101,19 +231,14 @@ class MarketTapeDatasetManager:
             self._record_progress(
                 target_date,
                 checked_at,
-                "writing_sqlite_snapshot",
-                certification_id=certification_id,
-                storage=storage,
-            )
-            snapshot = self._write_snapshot(staging)
-            self._record_progress(
-                target_date,
-                checked_at,
                 "exporting_tables",
                 certification_id=certification_id,
                 storage=storage,
             )
-            table_exports = self._export_tables(staging / "tables")
+            table_exports = self._export_tables(
+                staging / "tables",
+                snapshot_store,
+            )
             self._record_progress(
                 target_date,
                 checked_at,
@@ -121,7 +246,17 @@ class MarketTapeDatasetManager:
                 certification_id=certification_id,
                 storage=storage,
             )
-            model_artifacts = self._export_models(staging / "models")
+            quality = self._quality_report(
+                target_date,
+                prediction_evaluation,
+                prediction_training,
+                prediction_forecast,
+                raw_archive,
+                snapshot_capture,
+                snapshot_store,
+            )
+            database_schema_version = self._snapshot_schema_version(snapshot_store)
+            snapshot = self._compress_snapshot(snapshot_capture)
             snapshot["path"] = str(final / Path(snapshot["path"]).relative_to(staging))
             for artifact in table_exports:
                 artifact["path"] = str(
@@ -131,16 +266,19 @@ class MarketTapeDatasetManager:
                 artifact["path"] = str(
                     final / Path(artifact["path"]).relative_to(staging)
                 )
-            quality = self._quality_report(
-                target_date,
-                prediction_evaluation,
-                prediction_training,
-                prediction_forecast,
-                raw_archive,
-                snapshot,
-            )
             gates = self._certification_gates(quality)
             state = "certified" if all(gates.values()) else "partial"
+            consistency = {
+                "contract": SNAPSHOT_CONSISTENCY_CONTRACT,
+                "snapshot_captured_at": snapshot["captured_at"],
+                "sqlite_capture": "pinned_wal_read_transaction_online_backup",
+                "destination_pragmas": snapshot["destination_pragmas"],
+                "table_exports_source": "captured_sqlite_snapshot",
+                "quality_report_source": "captured_sqlite_snapshot",
+                "raw_registry_source": "captured_sqlite_snapshot",
+                "model_files_captured_before_snapshot_pin": True,
+                "long_exports_hold_live_operation_lock": False,
+            }
             manifest = {
                 "contract": DATASET_CONTRACT,
                 "schema_version": 1,
@@ -148,10 +286,11 @@ class MarketTapeDatasetManager:
                 "state": state,
                 "dataset_date": target_date.isoformat(),
                 "created_at": isoformat(checked_at),
-                "database_schema_version": self.store.status()["schema_version"],
+                "database_schema_version": database_schema_version,
                 "source_database_path": str(self.config.db_path),
                 "dataset_path": str(final),
                 "storage": storage,
+                "consistency": consistency,
                 "gates": gates,
                 "quality": quality,
                 "artifacts": {
@@ -180,6 +319,11 @@ class MarketTapeDatasetManager:
             self._record_local_status(manifest)
             return manifest
         except Exception as error:
+            if pinned_source is not None:
+                try:
+                    pinned_source.rollback()
+                finally:
+                    pinned_source.close()
             shutil.rmtree(staging, ignore_errors=True)
             result = {
                 "contract": DATASET_CONTRACT,
@@ -222,6 +366,28 @@ class MarketTapeDatasetManager:
             if latest_success:
                 status["latest_success"] = latest_success
         return status
+
+    def _acquire_certification_lock(self) -> Optional[TextIO]:
+        """Own one certification across API threads and local CLI processes.
+
+        ``flock`` is released by the kernel if the process exits, so a failed
+        export cannot leave a stale lock that blocks the next scheduled run.
+        """
+        self.certification_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.certification_lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return None
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({
+            "pid": os.getpid(),
+            "acquired_at": isoformat(utc_now()),
+        }, sort_keys=True))
+        handle.flush()
+        return handle
 
     def _storage_preflight(self) -> Dict[str, Any]:
         result_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=1)
@@ -302,17 +468,114 @@ class MarketTapeDatasetManager:
             "available_bytes": int(available),
         }
 
-    def _write_snapshot(self, output_dir: Path) -> Dict[str, Any]:
+    def _capture_models(self) -> List[Dict[str, Any]]:
+        """Read the small model artifacts while live mutations are excluded."""
+        if not self.config.prediction_model_dir.is_dir():
+            return []
+        artifacts = []
+        for source in sorted(self.config.prediction_model_dir.glob("*.json")):
+            payload = source.read_bytes()
+            artifacts.append({
+                "model_file": source.name,
+                "payload": payload,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+        return artifacts
+
+    def _pin_source_snapshot(self) -> tuple[sqlite3.Connection, datetime]:
+        """Pin a WAL read view without holding a write transaction.
+
+        The caller releases the shared API operation lock immediately after
+        this returns. WAL writers can then continue while SQLite's online
+        backup reads this exact view.
+        """
+        source = self.store.connect()
+        try:
+            source.execute("PRAGMA query_only = ON")
+            source.execute("BEGIN")
+            source.execute(
+                "SELECT value FROM mt_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            return source, utc_now()
+        except Exception:
+            source.close()
+            raise
+
+    def _copy_pinned_snapshot(
+        self,
+        output_dir: Path,
+        source: sqlite3.Connection,
+        captured_at: datetime,
+    ) -> Dict[str, Any]:
         plain = output_dir / "market-tape.sqlite3"
-        compressed = output_dir / "market-tape.sqlite3.gz"
         destination = sqlite3.connect(plain)
         try:
-            with self.store.connect() as source:
-                source.backup(destination)
-            quick_check = destination.execute("PRAGMA quick_check").fetchone()[0]
-            foreign_key_errors = len(destination.execute("PRAGMA foreign_key_check").fetchall())
+            # The destination is disposable staging, never a live database.
+            # Avoid DELETE/FULL pager churn on the Passport: a failed or
+            # interrupted copy is integrity-checked and discarded before any
+            # atomic promotion.
+            journal_mode = str(
+                destination.execute("PRAGMA journal_mode = OFF").fetchone()[0]
+            ).lower()
+            destination.execute("PRAGMA synchronous = OFF")
+            destination.execute("PRAGMA temp_store = MEMORY")
+            synchronous = int(
+                destination.execute("PRAGMA synchronous").fetchone()[0]
+            )
+            temp_store = int(
+                destination.execute("PRAGMA temp_store").fetchone()[0]
+            )
+            if journal_mode != "off" or synchronous != 0 or temp_store != 2:
+                raise RuntimeError(
+                    "staged snapshot refused disposable-write PRAGMAs: "
+                    f"journal_mode={journal_mode}, synchronous={synchronous}, "
+                    f"temp_store={temp_store}"
+                )
+            source.backup(destination)
         finally:
             destination.close()
+        return {
+            "source_path": str(plain),
+            "captured_at": isoformat(captured_at),
+            "capture_method": "pinned_wal_read_transaction_online_backup",
+            "destination_pragmas": {
+                "journal_mode": "OFF",
+                "synchronous": "OFF",
+                "temp_store": "MEMORY",
+            },
+        }
+
+    def _validate_snapshot(self, plain: Path) -> Dict[str, Any]:
+        try:
+            connection = sqlite3.connect(
+                f"{plain.resolve().as_uri()}?mode=ro",
+                uri=True,
+            )
+            try:
+                quick_check = str(
+                    connection.execute("PRAGMA quick_check").fetchone()[0]
+                )
+                foreign_key_errors = len(
+                    connection.execute("PRAGMA foreign_key_check").fetchall()
+                )
+            finally:
+                connection.close()
+        except (OSError, sqlite3.DatabaseError) as error:
+            raise DatasetSnapshotIntegrityError(
+                f"staged SQLite snapshot is unreadable: {error}"
+            ) from error
+        if quick_check != "ok":
+            raise DatasetSnapshotIntegrityError(
+                f"staged SQLite snapshot failed quick_check: {quick_check}"
+            )
+        return {
+            "quick_check": quick_check,
+            "foreign_key_errors": foreign_key_errors,
+        }
+
+    def _compress_snapshot(self, capture: Dict[str, Any]) -> Dict[str, Any]:
+        plain = Path(str(capture["source_path"]))
+        compressed = plain.with_suffix(plain.suffix + ".gz")
         with plain.open("rb") as source, compressed.open("wb") as raw_output:
             with gzip.GzipFile(fileobj=raw_output, mode="wb", compresslevel=6, mtime=0) as output:
                 shutil.copyfileobj(source, output, length=1024 * 1024)
@@ -321,14 +584,21 @@ class MarketTapeDatasetManager:
             "path": str(compressed),
             "bytes": compressed.stat().st_size,
             "sha256": _file_sha256(compressed),
-            "quick_check": quick_check,
-            "foreign_key_errors": foreign_key_errors,
+            "quick_check": capture["quick_check"],
+            "foreign_key_errors": capture["foreign_key_errors"],
+            "captured_at": capture["captured_at"],
+            "capture_method": capture["capture_method"],
+            "destination_pragmas": capture["destination_pragmas"],
         }
 
-    def _export_tables(self, output_dir: Path) -> List[Dict[str, Any]]:
+    def _export_tables(
+        self,
+        output_dir: Path,
+        source_store: MarketTapeStore,
+    ) -> List[Dict[str, Any]]:
         output_dir.mkdir(parents=True, exist_ok=True)
         artifacts: List[Dict[str, Any]] = []
-        with self.store.connect() as connection:
+        with source_store.connect() as connection:
             tables = [
                 str(row[0]) for row in connection.execute(
                     """SELECT name FROM sqlite_master
@@ -370,24 +640,29 @@ class MarketTapeDatasetManager:
                 })
         return artifacts
 
-    def _export_models(self, output_dir: Path) -> List[Dict[str, Any]]:
-        if not self.config.prediction_model_dir.is_dir():
+    def _write_captured_models(
+        self,
+        output_dir: Path,
+        captured_models: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not captured_models:
             return []
         output_dir.mkdir(parents=True, exist_ok=True)
         artifacts = []
-        for source in sorted(self.config.prediction_model_dir.glob("*.json")):
-            destination = output_dir / source.name
-            shutil.copy2(source, destination)
+        for captured in captured_models:
+            destination = output_dir / str(captured["model_file"])
+            destination.write_bytes(bytes(captured["payload"]))
             artifacts.append({
-                "model_file": source.name,
+                "model_file": str(captured["model_file"]),
                 "path": str(destination),
                 "bytes": destination.stat().st_size,
-                "sha256": _file_sha256(destination),
+                "sha256": str(captured["sha256"]),
             })
         return artifacts
 
     def _mirror_raw_objects(
         self,
+        source_store: MarketTapeStore,
         on_progress: Optional[Callable[[Dict[str, int]], None]] = None,
     ) -> Dict[str, Any]:
         destination_root = self.config.dataset_root.parent / "raw-objects"
@@ -399,7 +674,7 @@ class MarketTapeDatasetManager:
         destination_provenance_verified = 0
         missing: List[str] = []
         corrupt: List[str] = []
-        with self.store.connect() as connection:
+        with source_store.connect() as connection:
             rows = [dict(row) for row in connection.execute(
                 "SELECT * FROM mt_raw_objects ORDER BY raw_sha256"
             ).fetchall()]
@@ -492,9 +767,10 @@ class MarketTapeDatasetManager:
         prediction_forecast: Dict[str, Any],
         raw_archive: Dict[str, Any],
         snapshot: Dict[str, Any],
+        source_store: MarketTapeStore,
     ) -> Dict[str, Any]:
         day = target_date.isoformat()
-        with self.store.connect() as connection:
+        with source_store.connect() as connection:
             acquired_rows = {
                 str(row["platform"]): int(row["videos"])
                 for row in connection.execute(
@@ -688,8 +964,20 @@ class MarketTapeDatasetManager:
             "prediction_training": prediction_training,
             "prediction_forecast": prediction_forecast,
             "current_forecasts": forecasts,
-            "current_opportunities": self.store.trend_opportunities(limit=100),
+            "current_opportunities": source_store.trend_opportunities(limit=100),
         }
+
+    @staticmethod
+    def _snapshot_schema_version(source_store: MarketTapeStore) -> int:
+        with source_store.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM mt_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        if row is None:
+            raise DatasetSnapshotIntegrityError(
+                "captured snapshot has no schema_version receipt"
+            )
+        return int(row[0])
 
     def _certification_gates(self, quality: Dict[str, Any]) -> Dict[str, bool]:
         integrity = quality["integrity"]

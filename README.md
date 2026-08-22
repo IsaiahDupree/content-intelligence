@@ -12,7 +12,9 @@ The lock-safe local runtime is installed under `~/Library/Application Support/Co
 
 Full architecture, commands, source states, APIs, safety controls, and current production evidence: [docs/MARKET-TAPE-V1.md](docs/MARKET-TAPE-V1.md). The current topic-neutral market snapshot is [docs/MARKET-TREND-RESEARCH-2026-08-19.md](docs/MARKET-TREND-RESEARCH-2026-08-19.md).
 
-The local transcript bank turns performance-qualified Market Tape observations into auditable evidence. It downloads source audio to the configured external storage volume, transcribes locally with OpenAI Whisper, saves timestamped transcript JSON, and binds the audio/transcript SHA-256 hashes to the exact append-only metric observation. Cohorts fail closed below five videos, three creators, or 100,000 observed views; script relatability remains explicitly predictive until the published script has real audience outcomes.
+The local transcript bank turns performance-qualified Market Tape observations into auditable evidence. It downloads source audio to the configured external storage volume, transcribes locally with OpenAI Whisper, saves timestamped transcript JSON, and binds the audio/transcript SHA-256 hashes to the exact append-only metric observation. TikTok provider identities are structurally normalized before URL construction, and legacy object-shaped or video-ID-mismatched URLs are rejected before any downloader runs. Cohorts fail closed below five videos, three creators, or 100,000 observed views; script relatability remains explicitly predictive until the published script has real audience outcomes.
+
+The unified intelligence endpoint is bounded and live-scale: it uses indexed latest-row seeks instead of materialized prediction/observation cross-products, reuses one time-windowed keyword rowset, and reports component latency plus whether its candidate scan was exhaustive or truncated. Unvalidated model probabilities cannot influence candidate preselection.
 
 Install or update unattended operation:
 
