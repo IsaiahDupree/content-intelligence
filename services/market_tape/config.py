@@ -141,6 +141,18 @@ class MarketTapeConfig:
     adaptive_topic_exploration_fraction: float = field(default_factory=lambda: _float(
         "MARKET_TAPE_ADAPTIVE_TOPIC_EXPLORATION_FRACTION", 0.2
     ))
+    adaptive_topic_direct_query_fraction: float = field(default_factory=lambda: _float(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_DIRECT_QUERY_FRACTION", 0.25
+    ))
+    adaptive_topic_cooldown_hours: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_COOLDOWN_HOURS", 24
+    ))
+    adaptive_topic_daily_feedback_limit: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_DAILY_FEEDBACK_LIMIT", 20
+    ))
+    adaptive_topic_family_daily_limit: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_ADAPTIVE_TOPIC_FAMILY_DAILY_LIMIT", 1
+    ))
     overflow_platforms: List[str] = field(default_factory=lambda: _csv(
         "MARKET_TAPE_OVERFLOW_PLATFORMS", "youtube"
     ))

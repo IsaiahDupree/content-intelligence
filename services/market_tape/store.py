@@ -29,7 +29,7 @@ from .predictor import (
 )
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+-]*", re.IGNORECASE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how",
@@ -207,6 +207,8 @@ class MarketTapeStore:
                     ON mt_query_attempts(query, attempted_at DESC);
                 CREATE INDEX IF NOT EXISTS mt_query_attempts_platform_time_idx
                     ON mt_query_attempts(platform, attempted_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_query_attempts_time_idx
+                    ON mt_query_attempts(attempted_at DESC);
 
                 CREATE TRIGGER IF NOT EXISTS mt_query_attempts_no_update
                 BEFORE UPDATE ON mt_query_attempts
@@ -218,6 +220,39 @@ class MarketTapeStore:
                 BEFORE DELETE ON mt_query_attempts
                 BEGIN
                     SELECT RAISE(ABORT, 'query attempts are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_adaptive_query_admissions (
+                    admission_key TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    utc_day TEXT NOT NULL,
+                    query_family TEXT NOT NULL,
+                    keyword TEXT NOT NULL,
+                    selection_lane TEXT NOT NULL,
+                    admitted_at TEXT NOT NULL,
+                    proposal_sha256 TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(run_id, query_family),
+                    FOREIGN KEY(run_id) REFERENCES mt_collection_runs(run_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_adaptive_query_admissions_day_family_idx
+                    ON mt_adaptive_query_admissions(utc_day, query_family, admitted_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_adaptive_query_admissions_run_idx
+                    ON mt_adaptive_query_admissions(run_id, admitted_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_adaptive_query_admissions_time_idx
+                    ON mt_adaptive_query_admissions(admitted_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_adaptive_query_admissions_no_update
+                BEFORE UPDATE ON mt_adaptive_query_admissions
+                BEGIN
+                    SELECT RAISE(ABORT, 'adaptive query admissions are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_adaptive_query_admissions_no_delete
+                BEFORE DELETE ON mt_adaptive_query_admissions
+                BEGIN
+                    SELECT RAISE(ABORT, 'adaptive query admissions are append-only');
                 END;
 
                 CREATE TABLE IF NOT EXISTS mt_raw_objects (
@@ -496,6 +531,9 @@ class MarketTapeStore:
                     metadata_json TEXT NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES mt_collection_runs(run_id)
                 );
+
+                CREATE INDEX IF NOT EXISTS mt_source_receipts_source_time_idx
+                    ON mt_source_receipts(source_id, finished_at DESC);
 
                 CREATE TABLE IF NOT EXISTS mt_source_health (
                     source_id TEXT PRIMARY KEY,
@@ -1374,6 +1412,7 @@ class MarketTapeStore:
         *,
         as_of: Optional[datetime] = None,
         forecast_capable_platforms: Optional[Iterable[str]] = None,
+        phase: str = "all",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Return the bounded refresh queue while retaining the legacy shape.
 
@@ -1386,6 +1425,7 @@ class MarketTapeStore:
             limit,
             as_of=as_of,
             forecast_capable_platforms=forecast_capable_platforms,
+            phase=phase,
         )["polls"]
 
     def due_poll_plan(
@@ -1394,6 +1434,7 @@ class MarketTapeStore:
         *,
         as_of: Optional[datetime] = None,
         forecast_capable_platforms: Optional[Iterable[str]] = None,
+        phase: str = "all",
     ) -> Dict[str, Any]:
         """Plan rechecks needed to preserve prospective forecast labels.
 
@@ -1403,6 +1444,11 @@ class MarketTapeStore:
         admits one real member refresh for each uncovered exact-active-model trend
         when that window is open, even if its ordinary ``due_at`` is later.
 
+        ``phase=forecast_terminal`` selects only active-model label coverage;
+        ``phase=scheduled`` selects only ordinary due polls without claiming to
+        evaluate forecast coverage; and the default ``phase=all`` preserves the
+        combined recheck-mode behavior.
+
         Forecast work remains inside the existing per-cycle limit.  Candidate
         rows are restricted to platforms for which the collector reports a
         refresh-capable source; provider request ceilings are still enforced by
@@ -1411,6 +1457,12 @@ class MarketTapeStore:
         fabricating observations or changing outcome semantics.
         """
 
+        if phase not in {"all", "forecast_terminal", "scheduled"}:
+            raise ValueError(
+                "phase must be all, forecast_terminal, or scheduled"
+            )
+        coverage_evaluated = phase in {"all", "forecast_terminal"}
+        scheduled_evaluated = phase in {"all", "scheduled"}
         maximum = max(1, int(limit))
         selected_at = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
         selected_at_iso = isoformat(selected_at)
@@ -1427,7 +1479,7 @@ class MarketTapeStore:
                 if str(platform).strip()
             })
 
-        active_model = load_active_model(self.config)
+        active_model = load_active_model(self.config) if coverage_evaluated else None
         coverage_obligations: List[Dict[str, Any]] = []
         coverage_candidates: List[Dict[str, Any]] = []
         active_model_version = ""
@@ -1459,11 +1511,11 @@ class MarketTapeStore:
                    WHERE platform_rank <= ?
                    ORDER BY due_at, platform, video_id""",
                 (selected_at_iso, maximum),
-            ).fetchall()]
+            ).fetchall()] if scheduled_evaluated else []
             for row in normal_rows:
                 row.pop("platform_rank", None)
 
-            if active_model is not None:
+            if coverage_evaluated and active_model is not None:
                 active_model_version = str(active_model["model_version"])
                 active_horizon = model_prediction_horizon(active_model)
                 horizon_seconds = max(
@@ -1588,11 +1640,15 @@ class MarketTapeStore:
             obligations_by_trend.setdefault(
                 str(obligation["trend_id"]), []
             ).append(obligation)
-        forecast_rows, covered_trend_ids = _select_forecast_rechecks(
-            coverage_candidates,
-            obligations_by_trend,
-            maximum,
-            selected_at_iso,
+        forecast_rows, covered_trend_ids = (
+            _select_forecast_rechecks(
+                coverage_candidates,
+                obligations_by_trend,
+                maximum,
+                selected_at_iso,
+            )
+            if coverage_evaluated
+            else ([], set())
         )
         selected: List[Dict[str, Any]] = list(forecast_rows)
         selected_video_ids = {str(row["video_id"]) for row in selected}
@@ -1619,7 +1675,7 @@ class MarketTapeStore:
                 platform,
             ),
         )
-        while len(selected) < maximum:
+        while scheduled_evaluated and len(selected) < maximum:
             advanced = False
             for platform in platforms:
                 if normal_by_platform[platform]:
@@ -1652,7 +1708,9 @@ class MarketTapeStore:
         }
         due_trend_ids = set(obligations_by_trend)
         selected_assignments = [_poll_assignment_receipt(row) for row in selected]
-        if active_model is None:
+        if not coverage_evaluated:
+            coverage_state = "not_evaluated_in_scheduled_phase"
+        elif active_model is None:
             coverage_state = "no_active_model"
         elif not coverage_obligations:
             coverage_state = "no_open_coverage_window"
@@ -1671,13 +1729,30 @@ class MarketTapeStore:
             coverage_state = "cycle_capacity_limited"
         else:
             coverage_state = "queued"
-        receipt = {
-            "contract": "market_tape_forecast_recheck_plan_v1",
-            "selected_at": selected_at_iso,
-            "queue_limit": maximum,
-            "selection_policy": (
+        selection_policy = {
+            "all": (
                 "active_model_terminal_coverage_set_cover_then_platform_fair_due"
             ),
+            "forecast_terminal": "active_model_terminal_coverage_set_cover_only",
+            "scheduled": "platform_fair_scheduled_due_only",
+        }[phase]
+        receipt = {
+            "contract": (
+                "market_tape_forecast_recheck_plan_v1"
+                if phase == "all"
+                else "market_tape_recheck_phase_plan_v1"
+            ),
+            "selected_at": selected_at_iso,
+            "phase": phase,
+            "selection_lane": (
+                "combined"
+                if phase == "all"
+                else phase
+            ),
+            "coverage_evaluated": coverage_evaluated,
+            "scheduled_due_evaluated": scheduled_evaluated,
+            "queue_limit": maximum,
+            "selection_policy": selection_policy,
             "deduplication_key": "video_id",
             "provider_budget_policy": (
                 "selection_never_exceeds_cycle_limit_and_sources_enforce_remaining_budget"
@@ -1686,7 +1761,9 @@ class MarketTapeStore:
             "selected_forecast_coverage": len(forecast_rows),
             "selected_scheduled_due": len(selected) - len(forecast_rows),
             "normal_due_candidates_loaded": len(normal_rows),
-            "forecast_capable_platforms": capable_platforms,
+            "forecast_capable_platforms": (
+                capable_platforms if coverage_evaluated else []
+            ),
             "active_model_version": active_model_version,
             "active_horizon": active_horizon,
             "coverage_state": coverage_state,
@@ -1719,6 +1796,7 @@ class MarketTapeStore:
         }
         return {
             "contract": "market_tape_recheck_plan_v1",
+            "phase": phase,
             "polls": grouped,
             "receipt": receipt,
         }
@@ -1730,6 +1808,336 @@ class MarketTapeStore:
                 (datetime.now(timezone.utc).date().isoformat(), source_id),
             ).fetchone()
         return max(0, daily_limit - (int(row[0]) if row else 0))
+
+    def reserve_adaptive_query_admissions(
+        self,
+        *,
+        run_id: str,
+        admitted_at: datetime,
+        candidates: Sequence[Dict[str, Any]],
+        daily_limit: int,
+        family_daily_limit: int,
+        cooldown_boundary: datetime,
+        cooldown_hours: int,
+        proposal_sha256: str,
+    ) -> Dict[str, Any]:
+        """Atomically reserve measured query families across all processes.
+
+        ``BEGIN IMMEDIATE`` serializes the count-and-insert transaction at the
+        SQLite database boundary. Cooldown evidence and UTC-day ceilings are
+        both read only after that lock is held, so separate daemons and manual
+        invocations observe one durable admission decision instead of relying
+        on the collector's earlier advisory preflight.
+        """
+
+        if admitted_at.tzinfo is None:
+            admitted_at = admitted_at.replace(tzinfo=timezone.utc)
+        admitted_at = admitted_at.astimezone(timezone.utc)
+        if cooldown_boundary.tzinfo is None:
+            cooldown_boundary = cooldown_boundary.replace(tzinfo=timezone.utc)
+        requested_cooldown_boundary = cooldown_boundary.astimezone(timezone.utc)
+        utc_day = admitted_at.date().isoformat()
+        bounded_daily = max(0, min(1000, int(daily_limit)))
+        bounded_family = max(0, min(100, int(family_daily_limit)))
+        bounded_cooldown = max(0, min(24 * 30, int(cooldown_hours)))
+        required_cooldown_boundary = admitted_at - timedelta(hours=bounded_cooldown)
+        effective_cooldown_boundary = min(
+            requested_cooldown_boundary,
+            required_cooldown_boundary,
+        )
+        normalized: List[Tuple[str, Dict[str, Any]]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            family = _query_family_key(candidate.get("keyword"))
+            if not family or family in seen:
+                continue
+            seen.add(family)
+            normalized.append((family, candidate))
+
+        admitted: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+        new_admissions = 0
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cooldown_activity: Dict[str, Dict[str, Any]] = {}
+
+            def record_cooldown(
+                family: str,
+                activity_at: str,
+                source: str,
+            ) -> None:
+                if not family:
+                    return
+                activity = cooldown_activity.setdefault(family, {
+                    "latest_activity_at": "",
+                    "sources": set(),
+                })
+                activity["latest_activity_at"] = max(
+                    str(activity["latest_activity_at"] or ""),
+                    str(activity_at or ""),
+                )
+                activity["sources"].add(source)
+
+            if bounded_cooldown > 0:
+                cooldown_cutoff = isoformat(effective_cooldown_boundary)
+                for row in connection.execute(
+                    """SELECT query_family, admitted_at
+                       FROM mt_adaptive_query_admissions
+                       WHERE admitted_at >= ?""",
+                    (cooldown_cutoff,),
+                ).fetchall():
+                    record_cooldown(
+                        _query_family_key(row["query_family"]),
+                        str(row["admitted_at"]),
+                        "adaptive_admission",
+                    )
+                for row in connection.execute(
+                    """SELECT query, attempted_at, metadata_json
+                       FROM mt_query_attempts
+                       WHERE attempted_at >= ?""",
+                    (cooldown_cutoff,),
+                ).fetchall():
+                    try:
+                        metadata = json.loads(row["metadata_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        metadata = {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    record_cooldown(
+                        _query_family_key(
+                            metadata.get("query_family") or row["query"]
+                        ),
+                        str(row["attempted_at"]),
+                        "query_attempt",
+                    )
+            existing = {
+                str(row["query_family"]): dict(row)
+                for row in connection.execute(
+                    """SELECT * FROM mt_adaptive_query_admissions
+                       WHERE run_id = ?""",
+                    (run_id,),
+                ).fetchall()
+            }
+            daily_used_before = int(connection.execute(
+                """SELECT COUNT(*) FROM mt_adaptive_query_admissions
+                   WHERE utc_day = ?""",
+                (utc_day,),
+            ).fetchone()[0])
+            daily_used = daily_used_before
+            for family, candidate in normalized:
+                prior = existing.get(family)
+                if prior is not None:
+                    admitted.append({
+                        "admission_key": str(prior["admission_key"]),
+                        "query_family": family,
+                        "keyword": str(prior["keyword"]),
+                        "selection_lane": str(prior["selection_lane"]),
+                        "state": "already_reserved",
+                    })
+                    continue
+                family_used = int(connection.execute(
+                    """SELECT COUNT(*) FROM mt_adaptive_query_admissions
+                       WHERE utc_day = ? AND query_family = ?""",
+                    (utc_day, family),
+                ).fetchone()[0])
+                reasons: List[str] = []
+                if daily_used >= bounded_daily:
+                    reasons.append("adaptive_daily_budget_exhausted_atomic")
+                if family_used >= bounded_family:
+                    reasons.append("query_family_daily_budget_exhausted_atomic")
+                cooldown = cooldown_activity.get(family)
+                if bounded_cooldown > 0 and cooldown is not None:
+                    reasons.append("query_family_cooldown_active_atomic")
+                if reasons:
+                    rejected.append({
+                        "query_family": family,
+                        "keyword": str(candidate.get("keyword") or ""),
+                        "selection_lane": str(candidate.get("selection_lane") or ""),
+                        "reasons": reasons,
+                        "daily_used": daily_used,
+                        "family_used": family_used,
+                        "cooldown_sources": sorted(
+                            cooldown["sources"] if cooldown else []
+                        ),
+                        "latest_cooldown_activity_at": (
+                            str(cooldown["latest_activity_at"])
+                            if cooldown
+                            else None
+                        ),
+                    })
+                    continue
+                admission_key = stable_hash({
+                    "contract": "market_tape_adaptive_query_admission_v1",
+                    "run_id": run_id,
+                    "utc_day": utc_day,
+                    "query_family": family,
+                })
+                connection.execute(
+                    """INSERT INTO mt_adaptive_query_admissions(
+                           admission_key, run_id, utc_day, query_family, keyword,
+                           selection_lane, admitted_at, proposal_sha256, evidence_json
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        admission_key,
+                        run_id,
+                        utc_day,
+                        family,
+                        str(candidate.get("keyword") or ""),
+                        str(candidate.get("selection_lane") or "derived_market_term"),
+                        isoformat(admitted_at),
+                        str(proposal_sha256 or ""),
+                        json.dumps(candidate, sort_keys=True, default=str),
+                    ),
+                )
+                daily_used += 1
+                new_admissions += 1
+                admitted.append({
+                    "admission_key": admission_key,
+                    "query_family": family,
+                    "keyword": str(candidate.get("keyword") or ""),
+                    "selection_lane": str(candidate.get("selection_lane") or ""),
+                    "state": "reserved",
+                })
+        return {
+            "contract": "market_tape_adaptive_query_atomic_admission_v1",
+            "run_id": run_id,
+            "utc_day": utc_day,
+            "admitted_at": isoformat(admitted_at),
+            "proposal_sha256": str(proposal_sha256 or ""),
+            "daily_limit": bounded_daily,
+            "family_daily_limit": bounded_family,
+            "cooldown_hours": bounded_cooldown,
+            "requested_cooldown_boundary": isoformat(
+                requested_cooldown_boundary
+            ),
+            "cooldown_boundary": isoformat(effective_cooldown_boundary),
+            "daily_used_before": daily_used_before,
+            "daily_used_after": daily_used_before + new_admissions,
+            "new_admissions": new_admissions,
+            "admitted": admitted,
+            "rejected": rejected,
+        }
+
+    def adaptive_query_feedback_usage(self, since: datetime) -> Dict[str, Any]:
+        """Audit measured-query admissions and actual attempts after ``since``.
+
+        The append-only admission table is the atomic budget ledger: one selected
+        family is counted once even when several provider adapters fan it out.
+        Planner receipts mirror admission keys through the normal outbox, while
+        query attempts remain separate proof of the calls each source made.
+        """
+
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        cutoff = isoformat(since.astimezone(timezone.utc))
+        with self.connect() as connection:
+            admission_rows = connection.execute(
+                """SELECT admission_key, run_id, utc_day, query_family, keyword,
+                          selection_lane, admitted_at, proposal_sha256
+                   FROM mt_adaptive_query_admissions
+                   WHERE admitted_at >= ?
+                   ORDER BY admitted_at, admission_key""",
+                (cutoff,),
+            ).fetchall()
+            planner_rows = connection.execute(
+                """SELECT finished_at, metadata_json
+                   FROM mt_source_receipts
+                   WHERE source_id = 'market-tape-adaptive-query-planner'
+                     AND finished_at >= ?
+                   ORDER BY finished_at""",
+                (cutoff,),
+            ).fetchall()
+            attempt_rows = connection.execute(
+                """SELECT source_id, platform, query, attempted_at, request_count,
+                          result_count, metadata_json
+                   FROM mt_query_attempts
+                   WHERE attempted_at >= ?
+                   ORDER BY attempted_at""",
+                (cutoff,),
+            ).fetchall()
+
+        families: Dict[str, Dict[str, Any]] = {}
+
+        def family_record(key: str) -> Dict[str, Any]:
+            return families.setdefault(key, {
+                "query_family": key,
+                "selection_count": 0,
+                "attempt_count": 0,
+                "request_count": 0,
+                "result_count": 0,
+                "latest_selected_at": None,
+                "latest_attempted_at": None,
+                "platforms": set(),
+                "source_ids": set(),
+            })
+
+        planner_receipts = 0
+        feedback_selections = 0
+        for row in admission_rows:
+            key = _query_family_key(row["query_family"])
+            if not key:
+                continue
+            record = family_record(key)
+            record["selection_count"] += 1
+            record["latest_selected_at"] = max(
+                str(record["latest_selected_at"] or ""),
+                str(row["admitted_at"]),
+            ) or None
+            feedback_selections += 1
+        for row in planner_rows:
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            plan = metadata.get("adaptive_query_selection")
+            if not isinstance(plan, dict) or plan.get("contract") != "market_tape_adaptive_query_feedback_v1":
+                continue
+            planner_receipts += 1
+
+        query_attempts = 0
+        query_requests = 0
+        for row in attempt_rows:
+            try:
+                metadata = json.loads(row["metadata_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            key = _query_family_key(metadata.get("query_family") or row["query"])
+            if not key:
+                continue
+            record = family_record(key)
+            requests = max(0, int(row["request_count"] or 0))
+            record["attempt_count"] += 1
+            record["request_count"] += requests
+            record["result_count"] += max(0, int(row["result_count"] or 0))
+            record["latest_attempted_at"] = max(
+                str(record["latest_attempted_at"] or ""),
+                str(row["attempted_at"]),
+            ) or None
+            record["platforms"].add(str(row["platform"]))
+            record["source_ids"].add(str(row["source_id"]))
+            query_attempts += 1
+            query_requests += requests
+
+        serialized: Dict[str, Dict[str, Any]] = {}
+        for key, record in sorted(families.items()):
+            payload = dict(record)
+            payload["platforms"] = sorted(record["platforms"])
+            payload["source_ids"] = sorted(record["source_ids"])
+            payload["latest_activity_at"] = max(
+                str(record["latest_selected_at"] or ""),
+                str(record["latest_attempted_at"] or ""),
+            ) or None
+            serialized[key] = payload
+        return {
+            "contract": "market_tape_adaptive_query_usage_v1",
+            "since": cutoff,
+            "admission_rows": len(admission_rows),
+            "planner_receipts": planner_receipts,
+            "feedback_selections": feedback_selections,
+            "query_attempts": query_attempts,
+            "query_requests": query_requests,
+            "families": serialized,
+        }
 
     def daily_provider_cost(self) -> float:
         with self.connect() as connection:
@@ -2853,6 +3261,9 @@ class MarketTapeStore:
                 "trend_observations": connection.execute("SELECT COUNT(*) FROM mt_trend_observations").fetchone()[0],
                 "predictions": connection.execute("SELECT COUNT(*) FROM mt_predictions").fetchone()[0],
                 "query_attempts": connection.execute("SELECT COUNT(*) FROM mt_query_attempts").fetchone()[0],
+                "adaptive_query_admissions": connection.execute(
+                    "SELECT COUNT(*) FROM mt_adaptive_query_admissions"
+                ).fetchone()[0],
                 "due_polls": connection.execute("SELECT COUNT(*) FROM mt_poll_queue WHERE due_at <= ?", (isoformat(utc_now()),)).fetchone()[0],
             }
             platform_rows = connection.execute(
@@ -4413,6 +4824,12 @@ def _poll_assignment_receipt(row: Dict[str, Any]) -> Dict[str, Any]:
             str(obligation["coverage_deadline_at"]) for obligation in coverage
         }),
     }
+
+
+def _query_family_key(value: Any) -> str:
+    """Return the stable family key shared by planner and provider receipts."""
+
+    return " ".join(str(value or "").casefold().split())[:300]
 
 
 def _grouped_rows(

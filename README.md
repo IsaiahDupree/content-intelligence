@@ -6,7 +6,7 @@ Content Intelligence now contains two production surfaces: the original UGC form
 
 Market Tape appends real metric observations across YouTube, TikTok, Instagram, X, Facebook, and Threads; archives raw provider payloads; computes velocity, acceleration, relative strength, trends, social candles, and predictions; and records quota, cost, source health, and central-sync receipts.
 
-Discovery is market-led rather than niche-led. YouTube category charts provide a keyword-independent current universe, then the adaptive frontier ranks fresh terms by views/hour, breadth, engagement, repeat observations, freshness, and concentration. Exact external discovery queries are preserved as immutable video lineage and receive their own query-frontier ranking, so a measured Google or platform trend can be expanded without being reduced to generic title fragments. Most query capacity follows measured winners while a bounded fraction rotates across broad market sectors.
+Discovery is market-led rather than niche-led. YouTube category charts provide a keyword-independent current universe, then the adaptive frontier ranks fresh terms by views/hour, breadth, engagement, repeat observations, freshness, and concentration. Exact external discovery queries are preserved as immutable video lineage and receive their own query-frontier ranking, so a measured Google or platform trend can be expanded without being reduced to generic title fragments. Automatic feedback requires current-clock evidence from at least two videos and two creators, reserves independent configured-baseline and direct-current-query lanes, and applies an append-only SQLite UTC-day admission ledger plus per-family cooldown. Under `BEGIN IMMEDIATE`, the authoritative reservation rechecks both prior admissions and actual query attempts inside the rolling cooldown before atomically applying daily and family ceilings; the zero-request planner receipt mirrors each admission key and the complete, hashed exclusion decision into the normal audit/outbox path. Full cycles run terminal-forecast-only rechecks first, discovery second, and ordinary scheduled rechecks last, with phase-specific planner and provider receipts.
 
 The lock-safe local runtime is installed under `~/Library/Application Support/ContentIntelligence`, supervised by launchd, and available at `http://127.0.0.1:6006/api/market-tape/status`.
 
@@ -26,6 +26,7 @@ Verify the Market Tape software:
 
 ```bash
 python3 -m pytest tests/test_market_tape.py -q
+python3 -m pytest tests/test_market_tape_adaptive_feedback.py -q
 python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli intelligence --limit 25 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli query-frontier --limit 100 --window-hours 168 --min-videos 2

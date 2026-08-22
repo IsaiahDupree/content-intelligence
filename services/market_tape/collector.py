@@ -6,7 +6,7 @@ import json
 import hashlib
 import re
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -60,11 +60,25 @@ class MarketTapeCollector:
         state = "completed"
         error_detail = ""
         try:
-            if mode in {"full", "discovery"}:
+            if mode == "full":
+                # Protect narrow terminal label windows, then let discovery use
+                # the remaining provider budget before ordinary due polling.
+                # Preserve the public response's historical discovery-first
+                # receipt order; phase timestamps describe actual execution.
+                terminal_receipts = self._run_rechecks(
+                    run_id,
+                    phase="forecast_terminal",
+                )
                 receipts.extend(self._run_discovery(run_id))
-            if mode == "recheck":
+                receipts.extend(terminal_receipts)
+                receipts.extend(self._run_rechecks(
+                    run_id,
+                    phase="scheduled",
+                ))
+            elif mode == "discovery":
+                receipts.extend(self._run_discovery(run_id))
+            else:
                 receipts.extend(self._run_local_ingest(run_id))
-            if mode in {"full", "recheck"}:
                 receipts.extend(self._run_rechecks(run_id))
             trend_observations = self.store.aggregate_trends(run_id=run_id)
             predictions = self.store.create_predictions(run_id)
@@ -400,6 +414,7 @@ class MarketTapeCollector:
             key=lambda source: source.platform in self.config.overflow_platforms,
         )
         receipts: List[Dict[str, Any]] = []
+        plan_receipt = self._save_adaptive_query_plan(run_id, sources)
         try:
             for source in sources:
                 global_remaining = max(
@@ -422,11 +437,14 @@ class MarketTapeCollector:
                     remaining,
                     self.config.max_discovery_items_per_source,
                 ))
+                self._attach_adaptive_query_lineage(batch, run_id)
                 self._persist_batch(batch, run_id)
                 receipts.append(batch.receipt.to_dict())
         finally:
             for source in sources:
                 source.close()
+        if plan_receipt is not None:
+            receipts.append(plan_receipt.to_dict())
         return receipts
 
     def _run_local_ingest(self, run_id: str) -> List[Dict[str, Any]]:
@@ -463,7 +481,16 @@ class MarketTapeCollector:
                 source.close()
         return receipts
 
-    def _run_rechecks(self, run_id: str) -> List[Dict[str, Any]]:
+    def _run_rechecks(
+        self,
+        run_id: str,
+        *,
+        phase: str = "all",
+    ) -> List[Dict[str, Any]]:
+        if phase not in {"all", "forecast_terminal", "scheduled"}:
+            raise ValueError(
+                "phase must be all, forecast_terminal, or scheduled"
+            )
         sources = self._build_sources(run_id)
         source_map = {source.source_id: source for source in sources}
         receipts: List[Dict[str, Any]] = []
@@ -509,6 +536,7 @@ class MarketTapeCollector:
                     for source in sources
                     if source.source_id in capable_source_ids
                 },
+                phase=phase,
             )
             due = plan["polls"]
             queue_receipt = dict(plan["receipt"])
@@ -521,9 +549,16 @@ class MarketTapeCollector:
                 "cycle_capacity_limited",
             }
             planner_now = utc_now()
+            planner_source_id = {
+                "all": "market-tape-recheck-planner",
+                "forecast_terminal": (
+                    "market-tape-recheck-planner-terminal"
+                ),
+                "scheduled": "market-tape-recheck-planner-scheduled",
+            }[phase]
             planner_receipt = SourceReceipt(
                 run_id=run_id,
-                source_id="market-tape-recheck-planner",
+                source_id=planner_source_id,
                 platform="all",
                 state=(
                     SourceState.DEGRADED
@@ -545,7 +580,11 @@ class MarketTapeCollector:
                     if queue_receipt["coverage_state"] in degraded_planner_states
                     else ""
                 ),
-                metadata={"recheck_plan": queue_receipt},
+                metadata={
+                    "recheck_phase": phase,
+                    "selection_lane": queue_receipt["selection_lane"],
+                    "recheck_plan": queue_receipt,
+                },
             )
             self.store.save_receipt(planner_receipt)
             receipts.append(planner_receipt.to_dict())
@@ -633,7 +672,12 @@ class MarketTapeCollector:
                             (row["video_id"] for row in tracked), "source_circuit_open"
                         )
                         circuit_batch.receipt.metadata["recheck_queue"] = (
-                            _recheck_batch_receipt(tracked, source.source_id)
+                            _recheck_batch_receipt(
+                                tracked,
+                                source.source_id,
+                                planner_phase=phase,
+                                selection_lane=lane,
+                            )
                         )
                         self._persist_batch(circuit_batch, run_id)
                         receipts.append(circuit_batch.receipt.to_dict())
@@ -642,6 +686,8 @@ class MarketTapeCollector:
                     batch.receipt.metadata["recheck_queue"] = _recheck_batch_receipt(
                         tracked,
                         source.source_id,
+                        planner_phase=phase,
+                        selection_lane=lane,
                     )
                     returned = {item.video_id for item in batch.items}
                     tracked_ids = {str(row["video_id"]) for row in tracked}
@@ -688,90 +734,567 @@ class MarketTapeCollector:
         return sources
 
     def _adaptive_discovery_config(self) -> MarketTapeConfig:
+        selected_at = utc_now()
+        limit = max(1, min(100, int(self.config.adaptive_topic_limit)))
+        configured = list(dict.fromkeys(
+            topic.strip() for topic in self.config.topics if topic.strip()
+        ))
+        rotated_configured = self._rotated_configured_topics(configured, selected_at)
         if not self.config.adaptive_topics_enabled:
             self._last_discovery_topics = {
+                "contract": "market_tape_adaptive_query_feedback_v1",
                 "mode": "configured",
-                "topics": list(self.config.topics),
+                "selected_at": isoformat(selected_at),
+                "topics": configured,
                 "signals": [],
+                "admitted_feedback_signals": [],
+                "baseline_topics": configured,
+                "selection_sha256": "",
             }
             return self.config
 
-        limit = max(1, min(100, int(self.config.adaptive_topic_limit)))
+        window_hours = max(1, min(24 * 90, int(
+            self.config.adaptive_topic_window_hours
+        )))
+        minimum_videos = max(2, int(self.config.adaptive_topic_min_videos))
+        freshness_cutoff = selected_at - timedelta(hours=window_hours)
         text_signals = self.store.keyword_signals(
             limit=limit * 5,
-            window_hours=self.config.adaptive_topic_window_hours,
-            min_videos=self.config.adaptive_topic_min_videos,
+            window_hours=window_hours,
+            min_videos=minimum_videos,
         )
         query_signals = self.store.discovery_query_signals(
             limit=limit * 5,
-            window_hours=self.config.adaptive_topic_window_hours,
-            min_videos=self.config.adaptive_topic_min_videos,
+            window_hours=window_hours,
+            min_videos=minimum_videos,
         )
         by_keyword = {
-            str(signal.get("keyword") or "").casefold(): signal
+            self._query_family_key(signal.get("keyword")): signal
             for signal in text_signals
             if signal.get("keyword")
         }
         for signal in query_signals:
             if signal.get("keyword"):
-                by_keyword[str(signal["keyword"]).casefold()] = signal
+                by_keyword[self._query_family_key(signal["keyword"])] = signal
         signals = list(by_keyword.values())
-        candidates = [
-            signal for signal in signals
-            if signal.get("query_ready")
-            and int(signal.get("videos_total") or 0) >= 2
-            and int(signal.get("creators_total") or 0) >= 2
-            and str(signal.get("keyword") or "").casefold() not in AUTONOMOUS_QUERY_NOISE
-        ]
+        utc_day_start = selected_at.replace(hour=0, minute=0, second=0, microsecond=0)
+        cooldown_hours = max(0, min(24 * 30, int(
+            self.config.adaptive_topic_cooldown_hours
+        )))
+        cooldown_start = selected_at - timedelta(hours=max(1, cooldown_hours))
+        daily_usage = self.store.adaptive_query_feedback_usage(utc_day_start)
+        cooldown_usage = self.store.adaptive_query_feedback_usage(cooldown_start)
+        daily_limit = max(0, min(1000, int(
+            self.config.adaptive_topic_daily_feedback_limit
+        )))
+        family_daily_limit = max(0, min(100, int(
+            self.config.adaptive_topic_family_daily_limit
+        )))
+        daily_used = int(daily_usage.get("feedback_selections") or 0)
+        daily_remaining = max(0, daily_limit - daily_used)
+        configured_keys = {self._query_family_key(topic) for topic in configured}
+        candidates: List[Dict[str, Any]] = []
+        exclusions: List[Dict[str, Any]] = []
+        for signal in signals:
+            keyword = str(signal.get("keyword") or "").strip()
+            family = self._query_family_key(keyword)
+            reasons: List[str] = []
+            latest_observed = parse_datetime(signal.get("latest_observed_at"))
+            if not signal.get("query_ready"):
+                reasons.append("not_query_ready")
+            if int(signal.get("videos_total") or 0) < minimum_videos:
+                reasons.append("insufficient_video_breadth")
+            if int(signal.get("creators_total") or 0) < 2:
+                reasons.append("insufficient_creator_breadth")
+            if not latest_observed or latest_observed < freshness_cutoff:
+                reasons.append("outside_current_clock_window")
+            if family in AUTONOMOUS_QUERY_NOISE:
+                reasons.append("autonomous_query_noise")
+            if family in configured_keys:
+                reasons.append("reserved_configured_baseline")
+            family_daily = (daily_usage.get("families") or {}).get(family) or {}
+            if family_daily_limit <= 0 or int(family_daily.get("selection_count") or 0) >= family_daily_limit:
+                reasons.append("query_family_daily_budget_exhausted")
+            family_cooldown = (cooldown_usage.get("families") or {}).get(family) or {}
+            if cooldown_hours > 0 and family_cooldown.get("latest_activity_at"):
+                reasons.append("query_family_cooldown_active")
+            if daily_remaining <= 0:
+                reasons.append("adaptive_daily_budget_exhausted")
+            if reasons:
+                exclusions.append({
+                    "keyword": keyword,
+                    "keyword_type": str(signal.get("keyword_type") or "keyword"),
+                    "reasons": sorted(set(reasons)),
+                    "latest_activity_at": family_cooldown.get("latest_activity_at"),
+                    "daily_selection_count": int(family_daily.get("selection_count") or 0),
+                })
+                continue
+            candidates.append(signal)
         candidates.sort(key=self._discovery_priority, reverse=True)
-        if not candidates:
-            self._last_discovery_topics = {
-                "mode": "configured_fallback",
-                "topics": list(self.config.topics),
-                "signals": [],
-            }
-            return self.config
 
         exploration_fraction = max(
             0.0, min(0.5, float(self.config.adaptive_topic_exploration_fraction))
         )
-        exploration_count = min(len(self.config.topics), round(limit * exploration_fraction))
-        adaptive_count = max(1, limit - exploration_count)
-        selected_signals = self._diverse_keyword_signals(candidates, adaptive_count)
-        selected = [str(signal["keyword"]) for signal in selected_signals]
-
-        configured = list(self.config.topics)
-        if configured and exploration_count:
-            offset = utc_now().date().toordinal() % len(configured)
-            rotated = configured[offset:] + configured[:offset]
-            selected.extend(
-                topic for topic in rotated
-                if topic.casefold() not in {value.casefold() for value in selected}
-            )
-        topics = list(dict.fromkeys(selected))[:limit]
-        self._last_discovery_topics = {
-            "mode": "adaptive",
-            "topics": topics,
-            "adaptive_count": len(selected_signals),
-            "exploration_count": max(0, len(topics) - len(selected_signals)),
-            "window_hours": self.config.adaptive_topic_window_hours,
-            "signals": [
-                {
-                    key: signal[key]
-                    for key in (
-                        "keyword", "rank", "score", "confidence", "videos_total",
-                        "creators_total", "platforms_total", "views_total",
-                    )
-                }
-                for signal in selected_signals
-            ],
+        baseline_target = min(
+            len(configured),
+            max(1, round(limit * exploration_fraction)) if configured else 0,
+        )
+        feedback_capacity = min(
+            max(0, limit - baseline_target),
+            daily_remaining,
+        )
+        direct_candidates = [
+            signal for signal in candidates
+            if str(signal.get("keyword_type") or "") == "query"
+        ]
+        derived_candidates = [
+            signal for signal in candidates
+            if str(signal.get("keyword_type") or "") != "query"
+        ]
+        direct_fraction = max(0.0, min(0.75, float(
+            self.config.adaptive_topic_direct_query_fraction
+        )))
+        direct_target = min(
+            feedback_capacity,
+            len(direct_candidates),
+            max(1, round(feedback_capacity * direct_fraction))
+            if direct_candidates and feedback_capacity
+            else 0,
+        )
+        direct_selected = self._diverse_keyword_signals(
+            direct_candidates,
+            direct_target,
+        )
+        direct_keys = {
+            self._query_family_key(signal.get("keyword"))
+            for signal in direct_selected
         }
+        ordered_feedback = [
+            *direct_selected,
+            *derived_candidates,
+            *(
+                signal for signal in direct_candidates
+                if self._query_family_key(signal.get("keyword")) not in direct_keys
+            ),
+        ]
+        selected_signals = self._diverse_keyword_signals(
+            ordered_feedback,
+            feedback_capacity,
+        )
+        selected_signal_keys = {
+            self._query_family_key(signal.get("keyword"))
+            for signal in selected_signals
+        }
+        for signal in candidates:
+            family = self._query_family_key(signal.get("keyword"))
+            if family in selected_signal_keys:
+                continue
+            exclusions.append({
+                "keyword": str(signal.get("keyword") or ""),
+                "keyword_type": str(signal.get("keyword_type") or "keyword"),
+                "reasons": ["portfolio_capacity_or_diversity_dedup"],
+                "latest_activity_at": None,
+                "daily_selection_count": 0,
+            })
+        feedback_topics = [str(signal["keyword"]) for signal in selected_signals]
+        baseline_topics = [
+            topic for topic in rotated_configured
+            if self._query_family_key(topic) not in selected_signal_keys
+        ][:baseline_target]
+        topics = [*feedback_topics, *baseline_topics]
+        if len(topics) < limit:
+            existing = {self._query_family_key(topic) for topic in topics}
+            topics.extend(
+                topic for topic in rotated_configured
+                if self._query_family_key(topic) not in existing
+            )
+        topics = list(dict.fromkeys(topics))[:limit]
+        signal_receipts = [self._adaptive_signal_receipt(signal) for signal in selected_signals]
+        direct_count = sum(signal["selection_lane"] == "direct_current_query" for signal in signal_receipts)
+        mode = "adaptive" if signal_receipts else "configured_fallback"
+        plan = {
+            "contract": "market_tape_adaptive_query_feedback_v1",
+            "mode": mode,
+            "selected_at": isoformat(selected_at),
+            "freshness_cutoff": isoformat(freshness_cutoff),
+            "topics": topics,
+            "adaptive_count": len(signal_receipts),
+            "exploration_count": max(0, len(topics) - len(signal_receipts)),
+            "direct_current_count": direct_count,
+            "derived_feedback_count": len(signal_receipts) - direct_count,
+            "window_hours": window_hours,
+            "minimum_videos": minimum_videos,
+            "baseline_topics": [
+                topic for topic in topics
+                if self._query_family_key(topic) not in selected_signal_keys
+            ],
+            "signals": signal_receipts,
+            "admitted_feedback_signals": signal_receipts,
+            "budgets": {
+                "contract": "market_tape_adaptive_query_budget_v1",
+                "utc_day": selected_at.date().isoformat(),
+                "daily_feedback_limit": daily_limit,
+                "daily_feedback_used_before_selection": daily_used,
+                "daily_feedback_remaining_before_selection": daily_remaining,
+                "daily_feedback_admitted": len(signal_receipts),
+                "daily_feedback_remaining_after_selection": max(
+                    0, daily_remaining - len(signal_receipts)
+                ),
+                "query_family_daily_limit": family_daily_limit,
+                "cooldown_hours": cooldown_hours,
+                "provider_requests": (
+                    "bounded independently by each source's existing daily request "
+                    "limit and the global provider-cost ceiling"
+                ),
+            },
+            "excluded_candidates": exclusions,
+            "excluded_candidates_preview": exclusions[:100],
+            "excluded_candidates_total": len(exclusions),
+            "selection_sha256": "",
+        }
+        canonical = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        plan["selection_sha256"] = hashlib.sha256(canonical).hexdigest()
+        self._last_discovery_topics = plan
         return replace(self.config, topics=topics)
+
+    @staticmethod
+    def _rotated_configured_topics(
+        configured: Sequence[str], selected_at: datetime
+    ) -> List[str]:
+        if not configured:
+            return []
+        offset = selected_at.date().toordinal() % len(configured)
+        return [*configured[offset:], *configured[:offset]]
+
+    @staticmethod
+    def _query_family_key(value: Any) -> str:
+        return " ".join(str(value or "").casefold().split())[:300]
+
+    @staticmethod
+    def _adaptive_signal_receipt(signal: Dict[str, Any]) -> Dict[str, Any]:
+        examples = [
+            {
+                key: example.get(key)
+                for key in (
+                    "video_id", "platform", "title", "views", "observed_at",
+                    "observation_age_hours", "url", "contribution",
+                )
+            }
+            for example in signal.get("examples") or []
+            if isinstance(example, dict)
+        ]
+        keyword_type = str(signal.get("keyword_type") or "keyword")
+        return {
+            "contract": "market_tape_adaptive_query_signal_v1",
+            "keyword": str(signal.get("keyword") or ""),
+            "keyword_type": keyword_type,
+            "selection_lane": (
+                "direct_current_query" if keyword_type == "query" else "derived_market_term"
+            ),
+            "evidence_source": (
+                "mt_discovery_attributions"
+                if keyword_type == "query"
+                else "mt_videos_plus_latest_mt_market_observations"
+            ),
+            "rank": signal.get("rank"),
+            "score": signal.get("score"),
+            "confidence": signal.get("confidence"),
+            "videos_total": int(signal.get("videos_total") or 0),
+            "creators_total": int(signal.get("creators_total") or 0),
+            "platforms": list(signal.get("platforms") or []),
+            "platforms_total": int(signal.get("platforms_total") or 0),
+            "repeated_videos": int(signal.get("repeated_videos") or 0),
+            "views_total": int(signal.get("views_total") or 0),
+            "latest_observed_at": signal.get("latest_observed_at"),
+            "evidence_video_ids": [
+                str(example.get("video_id")) for example in examples if example.get("video_id")
+            ],
+            "evidence_urls": [
+                str(example.get("url")) for example in examples if example.get("url")
+            ],
+            "examples": examples,
+        }
+
+    def _save_adaptive_query_plan(
+        self,
+        run_id: str,
+        sources: Sequence[Any],
+    ) -> SourceReceipt | None:
+        plan = self._last_discovery_topics
+        if plan.get("contract") != "market_tape_adaptive_query_feedback_v1":
+            return None
+        global_remaining = max(
+            0,
+            self.config.daily_unique_target - self.store.daily_unique_count(),
+        )
+        executable_sources = [
+            source for source in sources
+            if self.config.target_for(source.platform)
+            > self.store.daily_unique_count(source.platform)
+            and int(source.request_budget) > 0
+            and source.credentials_available()
+            and (not source.metered or self.config.allow_metered_reads)
+        ]
+        execution_admitted = bool(global_remaining > 0 and executable_sources)
+        plan["execution_admitted"] = execution_admitted
+        plan["execution_source_ids"] = sorted({
+            str(source.source_id) for source in executable_sources
+        })
+        proposal_signals = list(plan.get("signals") or [])
+        proposal_sha256 = str(plan.get("selection_sha256") or "")
+        budgets = plan.get("budgets")
+        selected_at = parse_datetime(plan.get("selected_at")) or utc_now()
+        reservation_at = utc_now()
+        cooldown_hours = max(0, min(24 * 30, int(
+            self.config.adaptive_topic_cooldown_hours
+        )))
+        cooldown_boundary = reservation_at - timedelta(hours=cooldown_hours)
+        if execution_admitted and proposal_signals and isinstance(budgets, dict):
+            atomic_admission = self.store.reserve_adaptive_query_admissions(
+                run_id=run_id,
+                admitted_at=reservation_at,
+                candidates=proposal_signals,
+                daily_limit=int(budgets.get("daily_feedback_limit") or 0),
+                family_daily_limit=int(budgets.get("query_family_daily_limit") or 0),
+                cooldown_boundary=cooldown_boundary,
+                cooldown_hours=cooldown_hours,
+                proposal_sha256=proposal_sha256,
+            )
+        else:
+            atomic_admission = {
+                "contract": "market_tape_adaptive_query_atomic_admission_v1",
+                "run_id": run_id,
+                "utc_day": reservation_at.date().isoformat(),
+                "admitted_at": isoformat(reservation_at),
+                "proposal_sha256": proposal_sha256,
+                "daily_limit": int((budgets or {}).get("daily_feedback_limit") or 0),
+                "family_daily_limit": int((budgets or {}).get("query_family_daily_limit") or 0),
+                "cooldown_hours": cooldown_hours,
+                "requested_cooldown_boundary": isoformat(cooldown_boundary),
+                "cooldown_boundary": isoformat(cooldown_boundary),
+                "daily_used_before": int(
+                    (budgets or {}).get("daily_feedback_used_before_selection") or 0
+                ),
+                "daily_used_after": int(
+                    (budgets or {}).get("daily_feedback_used_before_selection") or 0
+                ),
+                "new_admissions": 0,
+                "admitted": [],
+                "rejected": [
+                    {
+                        "query_family": self._query_family_key(signal.get("keyword")),
+                        "keyword": str(signal.get("keyword") or ""),
+                        "selection_lane": str(signal.get("selection_lane") or ""),
+                        "reasons": ["no_executable_feedback_source"],
+                        "daily_used": int(
+                            (budgets or {}).get("daily_feedback_used_before_selection") or 0
+                        ),
+                        "family_used": 0,
+                    }
+                    for signal in proposal_signals
+                ],
+                "state": "no_executable_feedback_source" if proposal_signals else "no_feedback_proposed",
+            }
+        admitted_keys = {
+            self._query_family_key(row.get("query_family"))
+            for row in atomic_admission.get("admitted") or []
+        }
+        admitted_signals = [
+            signal for signal in proposal_signals
+            if self._query_family_key(signal.get("keyword")) in admitted_keys
+        ]
+        exclusions = list(plan.get("excluded_candidates") or [])
+        exclusions.extend({
+            "keyword": str(row.get("keyword") or ""),
+            "keyword_type": "atomic_admission",
+            "reasons": list(row.get("reasons") or []),
+            "latest_activity_at": row.get("latest_cooldown_activity_at"),
+            "latest_cooldown_activity_at": row.get(
+                "latest_cooldown_activity_at"
+            ),
+            "cooldown_sources": list(row.get("cooldown_sources") or []),
+            "cooldown_hours": int(
+                atomic_admission.get("cooldown_hours") or 0
+            ),
+            "cooldown_boundary": atomic_admission.get("cooldown_boundary"),
+            "requested_cooldown_boundary": atomic_admission.get(
+                "requested_cooldown_boundary"
+            ),
+            "daily_selection_count": int(row.get("daily_used") or 0),
+        } for row in atomic_admission.get("rejected") or [])
+        plan["proposal_sha256"] = proposal_sha256
+        plan["proposed_feedback_signals"] = proposal_signals
+        plan["signals"] = admitted_signals
+        plan["admitted_feedback_signals"] = admitted_signals
+        plan["atomic_admission"] = atomic_admission
+        plan["excluded_candidates"] = exclusions
+        plan["excluded_candidates_preview"] = exclusions[:100]
+        plan["excluded_candidates_total"] = len(exclusions)
+        if isinstance(budgets, dict):
+            admitted = len(admitted_signals)
+            daily_limit = int(budgets.get("daily_feedback_limit") or 0)
+            daily_used_before = int(
+                atomic_admission.get("daily_used_before") or 0
+            )
+            daily_used_after = int(
+                atomic_admission.get("daily_used_after") or 0
+            )
+            budgets["utc_day"] = str(atomic_admission.get("utc_day") or "")
+            budgets["daily_feedback_used_before_selection"] = daily_used_before
+            budgets["daily_feedback_remaining_before_selection"] = max(
+                0,
+                daily_limit - daily_used_before,
+            )
+            budgets["daily_feedback_admitted"] = admitted
+            budgets["daily_feedback_used_after_selection"] = daily_used_after
+            budgets["daily_feedback_remaining_after_selection"] = max(
+                0,
+                daily_limit - daily_used_after,
+            )
+            budgets["atomic_contract"] = atomic_admission["contract"]
+            budgets["atomic_cooldown_boundary"] = atomic_admission.get(
+                "cooldown_boundary"
+            )
+        admitted_families = {
+            self._query_family_key(signal.get("keyword")) for signal in admitted_signals
+        }
+        configured = list(dict.fromkeys(
+            topic.strip() for topic in self.config.topics if topic.strip()
+        ))
+        baseline = [
+            topic for topic in plan.get("baseline_topics") or []
+            if self._query_family_key(topic) not in admitted_families
+        ]
+        final_topics = [
+            *(str(signal.get("keyword") or "") for signal in admitted_signals),
+            *baseline,
+        ]
+        if self.config.adaptive_topics_enabled:
+            maximum = max(1, min(100, int(self.config.adaptive_topic_limit)))
+            existing = {self._query_family_key(topic) for topic in final_topics}
+            final_topics.extend(
+                topic for topic in self._rotated_configured_topics(configured, selected_at)
+                if self._query_family_key(topic) not in existing
+            )
+            final_topics = list(dict.fromkeys(final_topics))[:maximum]
+        else:
+            final_topics = configured
+        plan["topics"] = final_topics
+        plan["baseline_topics"] = [
+            topic for topic in final_topics
+            if self._query_family_key(topic) not in admitted_families
+        ]
+        plan["adaptive_count"] = len(admitted_signals)
+        plan["direct_current_count"] = sum(
+            signal.get("selection_lane") == "direct_current_query"
+            for signal in admitted_signals
+        )
+        plan["derived_feedback_count"] = (
+            len(admitted_signals) - int(plan["direct_current_count"])
+        )
+        plan["exploration_count"] = max(0, len(final_topics) - len(admitted_signals))
+        for source in sources:
+            source.config = replace(source.config, topics=final_topics)
+        plan["selection_sha256"] = ""
+        canonical = json.dumps(
+            plan,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        plan["selection_sha256"] = hashlib.sha256(canonical).hexdigest()
+        now = utc_now()
+        receipt = SourceReceipt(
+            run_id=run_id,
+            source_id="market-tape-adaptive-query-planner",
+            platform="all",
+            state=SourceState.READY,
+            started_at=now,
+            finished_at=now,
+            request_count=0,
+            discovered_count=0,
+            metadata={"adaptive_query_selection": plan},
+        )
+        self.store.save_receipt(receipt)
+        return receipt
+
+    def _attach_adaptive_query_lineage(
+        self,
+        batch: ProviderBatch,
+        run_id: str,
+    ) -> None:
+        plan = self._last_discovery_topics
+        if plan.get("contract") != "market_tape_adaptive_query_feedback_v1":
+            return
+        signals = {
+            self._query_family_key(signal.get("keyword")): signal
+            for signal in plan.get("admitted_feedback_signals") or []
+            if isinstance(signal, dict) and signal.get("keyword")
+        }
+        baseline = {
+            self._query_family_key(topic)
+            for topic in plan.get("baseline_topics") or []
+        }
+        batch.receipt.metadata["adaptive_query_plan"] = {
+            "contract": plan["contract"],
+            "planner_source_id": "market-tape-adaptive-query-planner",
+            "planner_run_id": run_id,
+            "selection_sha256": plan.get("selection_sha256"),
+            "selected_at": plan.get("selected_at"),
+            "execution_admitted": bool(plan.get("execution_admitted")),
+            "feedback_query_families": sorted(signals),
+            "baseline_query_families": sorted(baseline),
+        }
+        enriched: List[QueryAttempt] = []
+        for attempt in batch.query_attempts:
+            family = self._query_family_key(
+                attempt.metadata.get("query_family") or attempt.query
+            )
+            signal = signals.get(family)
+            if signal:
+                origin = {
+                    **signal,
+                    "planner_run_id": run_id,
+                    "selection_sha256": plan.get("selection_sha256"),
+                    "selected_at": plan.get("selected_at"),
+                }
+            elif family in baseline:
+                origin = {
+                    "contract": "market_tape_adaptive_query_signal_v1",
+                    "keyword": family,
+                    "keyword_type": "configured",
+                    "selection_lane": "configured_baseline",
+                    "evidence_source": "configured_market_baseline",
+                    "planner_run_id": run_id,
+                    "selection_sha256": plan.get("selection_sha256"),
+                    "selected_at": plan.get("selected_at"),
+                }
+            else:
+                origin = {
+                    "contract": "market_tape_adaptive_query_signal_v1",
+                    "keyword": family,
+                    "keyword_type": "provider_expansion",
+                    "selection_lane": "provider_expansion",
+                    "evidence_source": "provider_query_expansion",
+                    "planner_run_id": run_id,
+                    "selection_sha256": plan.get("selection_sha256"),
+                    "selected_at": plan.get("selected_at"),
+                }
+            enriched.append(replace(
+                attempt,
+                metadata={
+                    **attempt.metadata,
+                    "adaptive_query_lineage": origin,
+                },
+            ))
+        batch.query_attempts = enriched
 
     @staticmethod
     def _diverse_keyword_signals(
         candidates: Sequence[Dict[str, Any]], limit: int
     ) -> List[Dict[str, Any]]:
+        maximum = max(0, int(limit))
+        if maximum == 0:
+            return []
         selected: List[Dict[str, Any]] = []
         token_sets: List[set[str]] = []
         compact_keys: set[str] = set()
@@ -804,7 +1327,7 @@ class MarketTapeCollector:
             token_sets.append(tokens)
             compact_keys.add(compact)
             evidence_sets.append(evidence)
-            if len(selected) >= limit:
+            if len(selected) >= maximum:
                 break
         return selected
 
@@ -926,6 +1449,9 @@ class MarketTapeCollector:
 def _recheck_batch_receipt(
     tracked: Sequence[Dict[str, Any]],
     selected_source_id: str,
+    *,
+    planner_phase: str,
+    selection_lane: str,
 ) -> Dict[str, Any]:
     assignments: List[Dict[str, Any]] = []
     reason_counts: Dict[str, int] = {}
@@ -955,6 +1481,8 @@ def _recheck_batch_receipt(
             "selected_source_id": selected_source_id,
             "scheduled_due_at": str(row.get("due_at") or ""),
             "recheck_reason": reason,
+            "planner_phase": planner_phase,
+            "selection_lane": selection_lane,
             "coverage_prediction_ids": assignment_prediction_ids,
             "coverage_trend_ids": assignment_trend_ids,
             "coverage_deadlines": assignment_deadlines,
@@ -966,6 +1494,8 @@ def _recheck_batch_receipt(
     ).encode("utf-8")
     return {
         "contract": "market_tape_recheck_batch_receipt_v1",
+        "planner_phase": planner_phase,
+        "selection_lane": selection_lane,
         "selected_source_id": selected_source_id,
         "tracked_count": len(tracked),
         "reason_counts": dict(sorted(reason_counts.items())),
