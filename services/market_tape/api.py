@@ -13,6 +13,7 @@ from flask import Flask, jsonify, request
 from .collector import MarketTapeCollector
 from .config import MarketTapeConfig
 from .dataset import MarketTapeDatasetManager
+from .full_pipeline import run_full_pipeline
 from .predictor import MarketTapePredictor
 from .store import MarketTapeStore
 from .sinks import SupabaseSink
@@ -162,6 +163,31 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             else "recheck"
         )
         return run_exclusive(lambda: MarketTapeCollector(resolved, store).run_cycle(mode))
+
+    @app.post("/api/market-tape/full-pipeline")
+    def market_tape_full_pipeline():
+        """Discover candidate videos, then download, Whisper-transcribe, and
+        vet the highest-performing untranscribed ones -- in one call."""
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        mode = str(body.get("discovery_mode", "full"))
+        if mode not in {"full", "discovery", "recheck"}:
+            return jsonify({"error": "discovery_mode must be full, discovery, or recheck"}), 400
+        platforms = body.get("platforms") or ["youtube", "tiktok", "instagram", "facebook"]
+        limit = _limit(body.get("limit"), 5, maximum=200)
+        topic = str(body.get("topic", ""))
+        model = str(body.get("model", "base"))
+        return run_exclusive(lambda: run_full_pipeline(
+            config=resolved,
+            store=store,
+            collector=MarketTapeCollector(resolved, store),
+            discovery_mode=mode,
+            transcript_limit=limit,
+            transcript_platforms=platforms,
+            transcript_model=model,
+            topic=topic,
+        ))
 
     @app.post("/api/market-tape/bootstrap-local")
     def market_tape_bootstrap_local():
