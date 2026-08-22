@@ -63,7 +63,8 @@ python3 scripts/transcribe_performance_cohort.py \
   --platform youtube --video-id VIDEO_ID --model base \
   --cookies-from-browser chrome
 
-# Resume the next performance-ranked backfill batch; existing artifacts are skipped.
+# Resume the next performance-ranked backfill batch; existing artifacts and
+# source URLs under a permanent/active-cooldown receipt are skipped.
 python3 scripts/backfill_transcript_bank.py \
   --platform youtube --limit 20 --model base \
   --cookies-from-browser chrome \
@@ -73,6 +74,11 @@ python3 scripts/backfill_transcript_bank.py \
 python3 scripts/audit_script_relatability.py \
   --script-id SCRIPT_ID --cohort-manifest /absolute/path/cohort.json
 ```
+
+Every new acquisition uses unique evidence files so retries cannot overwrite an
+older artifact's audio. Transcript payloads bind the provider media ID,
+source-info hash, audio hash, observation metrics, Whisper checkpoint, decoder
+parameters, yt-dlp version, and ffmpeg version.
 
 `PASS_PREDICTED_RELATABILITY` means the script is supported by the performance-qualified transcript cohort. It is not a claim about actual human response. Scores are capped at 85 until retention, engagement, and audience-response evidence exists for that exact published script.
 

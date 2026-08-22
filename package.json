@@ -12,7 +12,7 @@
     "status": "node index.js status",
     "delete": "node index.js delete",
     "migrate": "node index.js migrate",
-    "test": "node --test tests/"
+    "test": "node --test tests/*.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

@@ -17,7 +17,7 @@ from flask import Flask
 from services.market_tape.api import register_market_tape_routes
 from services.market_tape.collector import MarketTapeCollector
 from services.market_tape.config import MarketTapeConfig
-from services.market_tape.full_pipeline import run_full_pipeline
+from services.market_tape.full_pipeline import pipeline_state, run_full_pipeline
 from services.market_tape.models import MarketContent, MetricCounters, utc_now
 from services.market_tape.store import MarketTapeStore
 
@@ -78,6 +78,12 @@ def seed_real_candidate(
 
 
 class TestFullPipeline:
+    def test_non_provider_runtime_and_audit_failures_fail_closed(self):
+        assert pipeline_state("completed", "blocked_runtime") == "failed"
+        assert pipeline_state("completed", "audit_failed") == "failed"
+        assert pipeline_state("completed", "partial") == "partial"
+        assert pipeline_state("completed", "completed") == "completed"
+
     def test_empty_discovery_and_empty_backfill_completes_cleanly(self, market_config, tmp_path):
         """Zero registered sources, zero matching backfill candidates: both
         real stages run and complete without any external call."""

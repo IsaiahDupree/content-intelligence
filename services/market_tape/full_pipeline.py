@@ -21,6 +21,15 @@ from .config import MarketTapeConfig
 from .store import MarketTapeStore
 
 DEFAULT_TRANSCRIPT_STORAGE_ROOT = Path("/Volumes/My Passport/MarketTape/transcript-bank")
+TRANSCRIPT_FAILURE_STATES = {"failed", "blocked_runtime", "audit_failed"}
+
+
+def pipeline_state(discovery_state: str, transcript_status: str) -> str:
+    if discovery_state != "completed" or transcript_status in TRANSCRIPT_FAILURE_STATES:
+        return "failed"
+    if transcript_status == "partial":
+        return "partial"
+    return "completed"
 
 
 def matching_trend_ids(
@@ -98,12 +107,7 @@ def run_full_pipeline(
     vetted_transcript_ids = [
         item["transcript_id"] for item in backfill["artifacts"] if item["decision"] == "PASS"
     ]
-    if discovery["state"] != "completed" or backfill["status"] == "failed":
-        state = "failed"
-    elif backfill["status"] == "partial" or discovery["state"] != "completed":
-        state = "partial"
-    else:
-        state = "completed"
+    state = pipeline_state(discovery["state"], backfill["status"])
 
     return {
         "state": state,
@@ -132,4 +136,4 @@ def run_full_pipeline(
     }
 
 
-__all__ = ["matching_trend_ids", "run_full_pipeline"]
+__all__ = ["matching_trend_ids", "pipeline_state", "run_full_pipeline"]

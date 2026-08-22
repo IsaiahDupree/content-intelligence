@@ -44,8 +44,17 @@ batch; existing artifacts are skipped):
 /bin/zsh -l scripts/install_transcript_backfill_launchd.sh
 ```
 
-The worker stores audio, timestamped Whisper JSON, hashes, and append-only run
-manifests under `/Volumes/My Passport/MarketTape/transcript-bank`.
+The worker fails closed unless My Passport is an actual mounted filesystem. It
+stores audio, timestamped Whisper JSON, hashes, append-only run manifests, and
+an append-only acquisition-attempt ledger under
+`/Volumes/My Passport/MarketTape/transcript-bank`. Just-in-time SQLite claims
+and a process lock prevent duplicate transcription; permanent failures are
+excluded per exact source URL and transient failures use bounded exponential
+cooldowns. A partial batch remains visible in its manifest but exits
+successfully so launchd does not misclassify useful artifact growth as a crash.
+Each new artifact binds a unique, immutable audio download to the provider media
+ID and hash of yt-dlp's source metadata, plus exact yt-dlp, ffmpeg, Whisper,
+Torch, model-checkpoint, and decode-parameter provenance.
 
 Deploy and verify the Market Tape control-plane schema:
 

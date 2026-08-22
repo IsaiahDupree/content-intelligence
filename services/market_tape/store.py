@@ -29,7 +29,7 @@ from .predictor import (
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+-]*", re.IGNORECASE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how",
@@ -408,6 +408,73 @@ class MarketTapeStore:
                     finished_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS mt_transcript_acquisition_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'failure')),
+                    failure_class TEXT NOT NULL DEFAULT '',
+                    retryable INTEGER,
+                    retry_after TEXT,
+                    error_type TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    attempt_ordinal INTEGER NOT NULL,
+                    receipt_source TEXT NOT NULL,
+                    runtime_fingerprint TEXT NOT NULL DEFAULT '',
+                    claim_id TEXT NOT NULL DEFAULT '',
+                    attempt_contract TEXT NOT NULL DEFAULT 'transcript_acquisition_attempt_v1',
+                    receipt_sha256 TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
+                );
+                CREATE INDEX IF NOT EXISTS mt_transcript_attempt_video_idx
+                    ON mt_transcript_acquisition_attempts(video_id, source_url, finished_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_transcript_attempt_retry_idx
+                    ON mt_transcript_acquisition_attempts(outcome, retryable, retry_after);
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_acquisition_claims (
+                    claim_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    claim_contract TEXT NOT NULL DEFAULT 'transcript_acquisition_claim_v2',
+                    receipt_sha256 TEXT NOT NULL DEFAULT '',
+                    claimed_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    released_at TEXT,
+                    release_reason TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS mt_transcript_active_claim_idx
+                    ON mt_transcript_acquisition_claims(video_id, source_url)
+                    WHERE released_at IS NULL;
+                CREATE INDEX IF NOT EXISTS mt_transcript_claim_expiry_idx
+                    ON mt_transcript_acquisition_claims(released_at, expires_at);
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_ledger_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    receipt_json TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
+
+                CREATE TRIGGER IF NOT EXISTS mt_transcript_attempts_no_update
+                BEFORE UPDATE ON mt_transcript_acquisition_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript acquisition attempts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS mt_transcript_attempts_no_delete
+                BEFORE DELETE ON mt_transcript_acquisition_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript acquisition attempts are append-only');
+                END;
+
                 CREATE TABLE IF NOT EXISTS mt_trends (
                     trend_id TEXT PRIMARY KEY,
                     trend_type TEXT NOT NULL,
@@ -631,6 +698,42 @@ class MarketTapeStore:
                 );
                 """
             )
+            transcript_attempt_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(mt_transcript_acquisition_attempts)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "runtime_fingerprint": "TEXT NOT NULL DEFAULT ''",
+                "claim_id": "TEXT NOT NULL DEFAULT ''",
+                "attempt_contract": (
+                    "TEXT NOT NULL DEFAULT 'transcript_acquisition_attempt_v1'"
+                ),
+                "receipt_sha256": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if column not in transcript_attempt_columns:
+                    connection.execute(
+                        f"ALTER TABLE mt_transcript_acquisition_attempts "
+                        f"ADD COLUMN {column} {definition}"
+                    )
+            transcript_claim_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(mt_transcript_acquisition_claims)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "claim_contract": (
+                    "TEXT NOT NULL DEFAULT 'transcript_acquisition_claim_v2'"
+                ),
+                "receipt_sha256": "TEXT NOT NULL DEFAULT ''",
+            }.items():
+                if column not in transcript_claim_columns:
+                    connection.execute(
+                        f"ALTER TABLE mt_transcript_acquisition_claims "
+                        f"ADD COLUMN {column} {definition}"
+                    )
             source_health_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(mt_source_health)").fetchall()
             }
