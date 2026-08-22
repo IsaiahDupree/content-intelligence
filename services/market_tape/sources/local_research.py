@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from .base import MarketSource, sanitize
+from ..source_urls import normalize_tiktok_handle, normalize_tiktok_source_url
 from ..models import (
     MarketContent,
     MetricCounters,
@@ -168,9 +169,22 @@ class LocalResearchSource(MarketSource):
             external_id = match.group(1) if match else f"url-{stable_hash(url)[:24]}"
         if not external_id:
             return None
-        author = str(
-            raw.get("author") or raw.get("username") or raw.get("creator_handle") or "unknown"
-        ).strip().lstrip("@") or "unknown"
+        if self.platform == "tiktok":
+            author = normalize_tiktok_handle(
+                raw.get("author"),
+                raw.get("username"),
+                raw.get("creator_handle"),
+                source_url=url,
+            )
+            url = normalize_tiktok_source_url(url, external_id, author)
+            creator_external_id = normalize_tiktok_handle(
+                raw.get("authorId"), raw.get("creator_id"), author,
+            ) or "unknown"
+        else:
+            author = str(
+                raw.get("author") or raw.get("username") or raw.get("creator_handle") or "unknown"
+            ).strip().lstrip("@") or "unknown"
+            creator_external_id = str(raw.get("authorId") or raw.get("creator_id") or author)
         text = str(
             raw.get("description") or raw.get("caption") or raw.get("text") or raw.get("title") or ""
         )
@@ -193,7 +207,7 @@ class LocalResearchSource(MarketSource):
         return MarketContent(
             platform=self.platform,
             external_id=external_id,
-            creator_external_id=str(raw.get("authorId") or raw.get("creator_id") or author),
+            creator_external_id=creator_external_id,
             creator_handle=author,
             creator_name=str(raw.get("authorDisplayName") or raw.get("display_name") or ""),
             creator_followers=_count(raw.get("followers") or raw.get("follower_count")),

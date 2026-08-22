@@ -24,6 +24,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Sequence
 
+from services.market_tape.source_urls import is_usable_source_url
+
 
 UTC = timezone.utc
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
@@ -324,7 +326,9 @@ class TranscriptBank:
                 continue
             if len(matches) < minimum_topic_matches:
                 continue
-            if not candidate.source_url:
+            if not is_usable_source_url(
+                candidate.platform, candidate.external_id, candidate.source_url
+            ):
                 continue
             candidates.append(candidate)
             if len(candidates) >= limit:
@@ -415,7 +419,7 @@ class TranscriptBank:
                 or duration > policy.maximum_duration_seconds
                 or views_count < policy.minimum_views
                 or engagement < policy.minimum_engagement_rate
-                or not row["url"]
+                or not is_usable_source_url(platform, row["external_id"], row["url"])
             ):
                 continue
             metadata_text = " ".join(
@@ -571,6 +575,12 @@ class TranscriptBank:
         force: bool = False,
         cookies_from_browser: str | None = None,
     ) -> dict[str, Any]:
+        if not is_usable_source_url(
+            candidate.platform, candidate.external_id, candidate.source_url
+        ):
+            raise RuntimeError(
+                f"refusing unusable source URL for {candidate.video_id}"
+            )
         existing = self.latest_artifact(candidate.video_id, model_name)
         if existing and not force:
             payload = json.loads(

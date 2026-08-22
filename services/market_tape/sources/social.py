@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 from .base import MarketSource, SourceCredentialError
 from ..models import MarketContent, MetricCounters, ProviderBatch, QueryAttempt, parse_datetime, utc_now
+from ..source_urls import normalize_tiktok_handle, normalize_tiktok_source_url
 
 
 HASHTAG_RE = re.compile(r"#([\w-]+)", re.UNICODE)
@@ -144,10 +145,15 @@ class TikTokResearchSource(MarketSource):
 
     def _normalize(self, raw: Dict[str, Any], observed: Any, prior: Dict[str, Any]) -> MarketContent:
         external_id = str(raw.get("id"))
-        username = str(raw.get("username") or prior.get("creator_handle") or "unknown")
+        username = normalize_tiktok_handle(
+            raw.get("username"),
+            prior.get("creator_handle"),
+            prior.get("creator_external_id"),
+            source_url=prior.get("url"),
+        )
         text = str(raw.get("video_description") or prior.get("caption") or "")
         return MarketContent(
-            platform=self.platform, external_id=external_id, creator_external_id=username,
+            platform=self.platform, external_id=external_id, creator_external_id=username or "unknown",
             creator_handle=username, published_at=parse_datetime(raw.get("create_time") or prior.get("published_at")),
             observed_at=observed, source_id=self.source_id,
             metrics=MetricCounters.from_values(
@@ -155,7 +161,9 @@ class TikTokResearchSource(MarketSource):
                 shares=raw.get("share_count"), saves=raw.get("favorites_count"),
             ),
             caption=text, description=str(raw.get("voice_to_text") or ""),
-            url=f"https://www.tiktok.com/@{username}/video/{external_id}",
+            url=normalize_tiktok_source_url(
+                prior.get("url"), external_id, username,
+            ),
             duration_seconds=raw.get("video_duration"), hashtags=_hashtags(text, raw.get("hashtag_names", [])),
             audio_id=str(raw.get("music_id") or ""), raw_payload=raw, discovery_context=prior,
         )
@@ -237,15 +245,20 @@ class TikTokRapidSource(MarketSource):
     def _normalize(self, raw: Dict[str, Any], observed: Any, prior: Dict[str, Any]) -> MarketContent:
         external_id = str(raw.get("video_id") or raw.get("aweme_id") or raw.get("id") or "")
         author = _first_dict(raw.get("author"))
-        username = str(author.get("unique_id") or author.get("uniqueId") or "")
-        if not username and isinstance(raw.get("author"), str):
-            username = str(raw["author"])
-        username = username or str(prior.get("creator_handle") or prior.get("creator_external_id") or "unknown")
+        username = normalize_tiktok_handle(
+            author.get("unique_id"),
+            author.get("uniqueId"),
+            raw.get("author"),
+            prior.get("creator_handle"),
+            prior.get("creator_external_id"),
+            source_url=prior.get("url"),
+        )
+        creator_external_id = normalize_tiktok_handle(author.get("id"), username) or "unknown"
         stats = _first_dict(raw.get("stats"))
         text = str(raw.get("title") or raw.get("desc") or prior.get("caption") or "")
         music = _first_dict(raw.get("music_info") or raw.get("music"))
         return MarketContent(
-            platform=self.platform, external_id=external_id, creator_external_id=str(author.get("id") or username),
+            platform=self.platform, external_id=external_id, creator_external_id=creator_external_id,
             creator_handle=username, creator_name=str(author.get("nickname") or ""),
             creator_followers=_int(author.get("follower_count") or author.get("followerCount")),
             published_at=parse_datetime(raw.get("create_time") or raw.get("createTime") or prior.get("published_at")),
@@ -257,7 +270,9 @@ class TikTokRapidSource(MarketSource):
                 shares=raw.get("share_count") or raw.get("shareCount") or stats.get("shareCount"),
                 saves=raw.get("collect_count") or raw.get("collectCount") or stats.get("collectCount"),
             ),
-            caption=text, url=f"https://www.tiktok.com/@{username}/video/{external_id}",
+            caption=text, url=normalize_tiktok_source_url(
+                prior.get("url"), external_id, username,
+            ),
             thumbnail_url=str(raw.get("cover") or raw.get("originCover") or ""),
             duration_seconds=raw.get("duration") or _first_dict(raw.get("video")).get("duration"),
             hashtags=_hashtags(text, raw.get("textExtra", [])), audio_id=str(music.get("id") or ""),
