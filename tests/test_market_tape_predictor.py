@@ -9,9 +9,12 @@ from services.market_tape.config import MarketTapeConfig
 from services.market_tape.models import MarketContent, MetricCounters
 from services.market_tape.predictor import (
     ENTRY_HORIZON,
+    MODEL_CONTRACT,
+    MODEL_FAMILY,
     MarketTapePredictor,
     load_active_model,
     predict_probability,
+    predict_trend_snapshot,
 )
 from services.market_tape.store import MarketTapeStore
 
@@ -26,17 +29,47 @@ def test_grouped_logistic_candidate_is_promoted_and_reproducible(tmp_path):
     active = load_active_model(config)
 
     assert first["status"] == "promoted"
+    assert first["contract"] == MODEL_CONTRACT
+    assert first["model_family"] == MODEL_FAMILY
     assert first["model_purpose"] == "early_breakout_entry"
     assert first["training"]["horizon"] == ENTRY_HORIZON
+    assert first["cross_validation"]["method"] == "purged_grouped_walk_forward"
+    assert first["cross_validation"]["folds"] >= 3
+    assert first["cross_validation"]["chronological_order_passed"] is True
+    assert first["cross_validation"]["group_isolation_passed"] is True
+    assert first["cross_validation"]["label_embargo_passed"] is True
+    assert first["promotion_gate"]["passed"] is True
+    assert all(
+        receipt["group_overlap_count"] == 0
+        and receipt["training_max_predicted_at"] < receipt["validation_start"]
+        and receipt["training_max_label_available_at"] <= receipt["validation_start"]
+        for receipt in first["cross_validation"]["fold_receipts"]
+        if receipt["state"] == "measured"
+    )
     assert first["cross_validation"]["brier_skill_score"] > 0.05
     assert first["cross_validation"]["roc_auc"] >= 0.65
     assert second["operation"] == "unchanged"
     assert active is not None
     assert active["model_version"] == first["model_version"]
-    assert predict_probability(active, _positive_features()) > predict_probability(
-        active,
-        _negative_features(),
+    positive_probability = predict_probability(active, _positive_features())
+    negative_probability = predict_probability(active, _negative_features())
+    assert 0.0 < negative_probability < positive_probability < 1.0
+    inference = predict_trend_snapshot(active, _positive_features())
+    assert inference["state"] == "predicted"
+    assert inference["diagnostics"]["policy_source"] == "artifact_v2"
+    certainty_pressure = json.loads(json.dumps(active))
+    certainty_pressure["model"]["intercept"] = 30.0
+    certainty_pressure["model"]["coefficients"] = [0.0] * len(
+        certainty_pressure["model"]["coefficients"]
     )
+    training_center = dict(zip(
+        certainty_pressure["model"]["features"],
+        certainty_pressure["model"]["means"],
+    ))
+    bounded = predict_trend_snapshot(certainty_pressure, training_center)
+    assert bounded["state"] == "predicted"
+    assert bounded["probability"] == 0.995
+    assert bounded["diagnostics"]["probability_was_bounded"] is True
     status = MarketTapePredictor(config, store).status()
     assert status["state"] == "active"
     assert len(status["models"]) == 1
@@ -56,14 +89,18 @@ def test_grouped_logistic_candidate_is_promoted_and_reproducible(tmp_path):
     ), "live-run")
     store.aggregate_trends(run_id="live-run")
     store.create_predictions("live-run")
-    assert any(
+    assert not any(
         prediction["model_version"] == active["model_version"]
         for prediction in store.list_predictions(100, "trend")
     )
-    forecast = store.forecast_active_trends(observed, limit=100)
+    forecast = store.forecast_active_trends(
+        observed + timedelta(minutes=1),
+        limit=100,
+    )
     assert forecast["state"] == "completed"
-    assert forecast["predictions_added"] > 0
-    assert forecast["outbox_records"] == forecast["predictions_added"]
+    assert forecast["predictions_added"] == 0
+    assert forecast["skipped_insufficient_support"] > 0
+    assert forecast["outbox_records"] == 0
 
     _insert_opportunity_fixture(store, active["model_version"], observed)
     opportunities = store.trend_opportunities(
@@ -103,6 +140,88 @@ def test_insufficient_predictor_remains_retestable_without_promotion(tmp_path):
     assert result["retestable"] is True
     assert load_active_model(config) is None
     assert (config.prediction_model_dir / f"{result['model_version']}.json").is_file()
+
+
+def test_future_label_leakage_cannot_promote_from_real_sqlite(tmp_path):
+    config = _config(tmp_path)
+    store = MarketTapeStore(config)
+    _insert_labeled_predictions(
+        store,
+        120,
+        positive_every=10,
+        interval=timedelta(minutes=1),
+    )
+
+    result = MarketTapePredictor(config, store).train()
+
+    assert result["status"] == "rejected"
+    assert result["promotion_gate"]["passed"] is False
+    assert "minimum_walk_forward_folds" in result["promotion_gate"][
+        "failure_reasons"
+    ]
+    assert result["cross_validation"]["method"] == "purged_grouped_walk_forward"
+    assert result["cross_validation"]["folds"] == 0
+    assert all(
+        receipt["state"] == "skipped"
+        for receipt in result["cross_validation"]["fold_receipts"]
+    )
+    assert load_active_model(config) is None
+    assert not (config.prediction_model_dir / "active.json").exists()
+
+
+def test_ood_snapshot_abstains_with_diagnostics_and_no_sqlite_prediction(tmp_path):
+    config = _config(tmp_path)
+    store = MarketTapeStore(config)
+    _insert_labeled_predictions(store, 120, positive_every=10)
+    trained = MarketTapePredictor(config, store).train()
+    assert trained["status"] == "promoted"
+
+    observed = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    with store.connect() as connection:
+        _insert_trend_observation(
+            connection,
+            "ood-trend",
+            "OOD trend",
+            "topic",
+            observed,
+            state="emerging",
+            strength=66.0,
+            saturation=0.2,
+            videos=2,
+            creators=2,
+            platforms=1,
+            relative_strength=9.0,
+            momentum=9.0,
+            acceleration=9.0,
+        )
+
+    forecast = store.forecast_active_trends(
+        observed + timedelta(minutes=1),
+        limit=10,
+    )
+
+    assert forecast["state"] == "completed"
+    assert forecast["predictions_added"] == 0
+    assert forecast["abstained_out_of_distribution"] == 1
+    assert forecast["abstention_reasons"] == {"out_of_distribution": 1}
+    receipt = forecast["abstentions"][0]
+    assert receipt["trend_id"] == "ood-trend"
+    assert receipt["contract"] == "market_tape_trend_inference_v2"
+    assert receipt["state"] == "abstained"
+    assert receipt["probability"] is None
+    assert receipt["diagnostics"]["policy_contract"] == (
+        "market_tape_standardized_ood_policy_v1"
+    )
+    assert receipt["diagnostics"]["maximum_absolute_standardized_value"] > 4.0
+    assert {
+        item["feature"] for item in receipt["diagnostics"]["ood_features"]
+    } >= {"relative_strength", "momentum", "acceleration"}
+    with store.connect() as connection:
+        written = connection.execute(
+            "SELECT COUNT(*) FROM mt_predictions WHERE model_version = ?",
+            (trained["model_version"],),
+        ).fetchone()[0]
+    assert written == 0
 
 
 def test_opportunity_ranker_remains_available_without_a_promoted_model(tmp_path):
@@ -312,13 +431,19 @@ def _config(tmp_path):
     )
 
 
-def _insert_labeled_predictions(store, count, positive_every):
+def _insert_labeled_predictions(
+    store,
+    count,
+    positive_every,
+    *,
+    interval=timedelta(hours=2),
+):
     started = datetime(2026, 8, 1, tzinfo=timezone.utc)
     with store.connect() as connection:
         for index in range(count):
             actual = int(index % positive_every == 0)
             features = _positive_features() if actual else _negative_features()
-            predicted_at = (started + timedelta(minutes=index)).isoformat()
+            predicted_at = (started + interval * index).isoformat()
             connection.execute(
                 """INSERT INTO mt_predictions(
                        subject_type, subject_id, model_version, predicted_at,
@@ -394,6 +519,11 @@ def _insert_trend_observation(
     strength,
     saturation,
     videos,
+    creators=8,
+    platforms=3,
+    relative_strength=1.5,
+    momentum=1.2,
+    acceleration=1.0,
 ):
     connection.execute(
         """INSERT OR IGNORE INTO mt_trends(
@@ -420,14 +550,22 @@ def _insert_trend_observation(
                p90_video_velocity, creator_breadth, platform_breadth,
                top1_concentration, top10_concentration, momentum, acceleration,
                relative_strength, saturation, trend_strength, index_version, state
-           ) VALUES(?, ?, ?, 2, 8, 2, 3, 100000, 10000, 1000, 500,
-                    1000, 100, 10, 5, 2, 0.5,
-                    2.0, 4.0, 0.8, 0.5, 0.2, 0.6, 1.2, 1.0, 1.5,
+           ) VALUES(?, ?, ?, ?, ?, ?, ?, 100000, 10000, 1000, 500,
+                    1000, 100, 10, 5, ?, 0.5,
+                    2.0, 4.0, 0.8, 0.5, 0.2, 0.6, ?, ?, ?,
                     ?, ?, 'trend-strength-v2', ?)""",
         (
             trend_id,
             observed.isoformat(),
             videos,
+            min(2, videos),
+            creators,
+            min(2, creators),
+            platforms,
+            min(2, videos),
+            momentum,
+            acceleration,
+            relative_strength,
             saturation,
             strength,
             state,
@@ -442,8 +580,10 @@ def _positive_features():
         "relative_strength": 2.5,
         "momentum": 2.0,
         "acceleration": 1.5,
-        "creator_breadth": 0.85,
-        "platform_breadth": 0.8,
+        "creator_breadth": 1.0,
+        "platform_breadth": 1.0,
+        "videos_total": 8,
+        "creators_total": 8,
         "saturation": 0.55,
     }
 
@@ -457,5 +597,7 @@ def _negative_features():
         "acceleration": 0.0,
         "creator_breadth": 0.5,
         "platform_breadth": 0.2,
+        "videos_total": 8,
+        "creators_total": 4,
         "saturation": 0.01,
     }

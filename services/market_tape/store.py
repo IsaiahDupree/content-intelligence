@@ -24,7 +24,7 @@ from .predictor import (
     model_accepts_features,
     model_prediction_horizon,
     model_purpose,
-    predict_probability,
+    predict_trend_snapshot,
 )
 
 
@@ -37,7 +37,10 @@ STOP_WORDS = {
 }
 OPPORTUNITY_CONTRACT = "market_tape_actionable_opportunities_v1"
 OPPORTUNITY_RANKER_VERSION = "actionable-opportunity-v6"
+TREND_MODEL_ADMISSION_CONTRACT = "market_tape_trend_model_admission_v1"
 TREND_INDEX_VERSION = "trend-strength-v2"
+TREND_OUTCOME_COVERAGE_TOLERANCE = timedelta(minutes=30)
+TREND_OUTCOME_COVERAGE_GRACE = timedelta(hours=2)
 ACTIONABLE_TREND_STATES = {"discovering", "emerging", "breakout", "recurring"}
 GENERIC_TREND_LABELS = {
     "1", "best tool", "business", "businessgrowth", "clips", "content",
@@ -536,6 +539,11 @@ class MarketTapeStore:
                     ON mt_predictions(subject_type, subject_id, predicted_at DESC);
                 CREATE INDEX IF NOT EXISTS mt_predictions_outcome_idx
                     ON mt_predictions(outcome_json, predicted_at);
+                CREATE INDEX IF NOT EXISTS mt_predictions_forecast_lineage_idx
+                    ON mt_predictions(
+                        subject_type, model_version, horizon, subject_id,
+                        predicted_at DESC
+                    );
 
                 -- MT-009: calibration metrics are RECORDED after horizons
                 -- close, not only computed on demand. Append-only snapshots.
@@ -1775,6 +1783,8 @@ class MarketTapeStore:
                     "acceleration": float(row["acceleration"]),
                     "creator_breadth": float(row["creator_breadth"]),
                     "platform_breadth": float(row["platform_breadth"]),
+                    "videos_total": int(row["videos_total"]),
+                    "creators_total": int(row["creators_total"]),
                     "saturation": float(row["saturation"]),
                     "state": row["state"],
                     "index_version": row["index_version"],
@@ -1810,7 +1820,13 @@ class MarketTapeStore:
                     active_trend_model is not None
                     and model_accepts_features(active_trend_model, features)
                 ):
-                    model_probability = predict_probability(active_trend_model, features)
+                    inference = predict_trend_snapshot(
+                        active_trend_model,
+                        features,
+                    )
+                    if inference["state"] == "abstained":
+                        continue
+                    model_probability = float(inference["probability"])
                     model_peak_hours = max(0.5, 6.0 * (1.0 - model_probability))
                     model_horizon = model_prediction_horizon(active_trend_model)
                     model_features = {
@@ -1819,6 +1835,7 @@ class MarketTapeStore:
                         "training_dataset_sha256": active_trend_model[
                             "training_dataset_sha256"
                         ],
+                        "inference_diagnostics": inference["diagnostics"],
                     }
                     connection.execute(
                         """INSERT INTO mt_predictions(
@@ -1883,6 +1900,8 @@ class MarketTapeStore:
                     "acceleration": float(row["acceleration"]),
                     "creator_breadth": float(row["creator_breadth"]),
                     "platform_breadth": float(row["platform_breadth"]),
+                    "videos_total": int(row["videos_total"]),
+                    "creators_total": int(row["creators_total"]),
                     "saturation": float(row["saturation"]),
                     "state": row["state"],
                     "index_version": row["index_version"],
@@ -1937,40 +1956,117 @@ class MarketTapeStore:
         predicted_at: Optional[datetime] = None,
         limit: int = 5000,
     ) -> Dict[str, Any]:
-        """Apply the promoted model to recent trend states without requiring a new ingest."""
-        predicted_at = predicted_at or utc_now()
+        """Apply the promoted model only to fresh, previously unused snapshots.
+
+        The source snapshot must be within the same 30-minute tolerance used to
+        prove outcome coverage (and never older than its prediction horizon).
+        The exact observation id and timestamp are durable feature lineage, so
+        another invocation cannot forecast the same evidence again.
+        """
+        predicted_at = _as_datetime(predicted_at or utc_now()).astimezone(
+            timezone.utc
+        )
         active_model = load_active_model(self.config)
         if active_model is None:
-            return {"state": "no_promoted_model", "predictions_added": 0}
+            return {
+                "state": "no_promoted_model",
+                "predictions_added": 0,
+                "skipped_insufficient_support": 0,
+                "skipped_stale": 0,
+                "skipped_duplicate": 0,
+            }
         predicted = isoformat(predicted_at)
-        cutoff = isoformat(predicted_at - timedelta(hours=24))
         inserted_ids: List[int] = []
         skipped_ineligible = 0
+        skipped_insufficient_support = 0
+        skipped_stale = 0
+        skipped_duplicate = 0
+        abstentions: List[Dict[str, Any]] = []
+        abstention_reasons: Dict[str, int] = {}
         model_horizon = model_prediction_horizon(active_model)
+        horizon_hours = _prediction_horizon_hours(model_horizon)
+        source_max_age = min(
+            TREND_OUTCOME_COVERAGE_TOLERANCE,
+            timedelta(hours=max(0.0, horizon_hours)),
+        )
         with self.connect() as connection:
+            # Serialise the lineage check and inserts. Without this lock, two
+            # CLI callers could both observe no prediction and write the same
+            # source snapshot.
+            connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """SELECT observation.*
                    FROM mt_trend_observations observation
-                   WHERE observation.observed_at >= ?
+                   WHERE observation.observed_at <= ?
                      AND observation.state != 'dead'
                      AND observation.trend_observation_id = (
-                         SELECT MAX(current.trend_observation_id)
+                         SELECT current.trend_observation_id
                          FROM mt_trend_observations current
                          WHERE current.trend_id = observation.trend_id
+                           AND current.observed_at <= ?
+                         ORDER BY current.observed_at DESC,
+                                  current.trend_observation_id DESC
+                         LIMIT 1
                      )
                    ORDER BY observation.trend_strength DESC,
                             observation.observed_at DESC
                    LIMIT ?""",
-                (cutoff, min(20000, max(1, int(limit)))),
+                (
+                    predicted,
+                    predicted,
+                    min(20000, max(1, int(limit))),
+                ),
             ).fetchall()
+            existing_by_subject: Dict[str, List[Dict[str, Any]]] = {}
+            for prediction in connection.execute(
+                """SELECT subject_id, predicted_at, features_json
+                   FROM mt_predictions
+                   WHERE subject_type = 'trend'
+                     AND model_version = ?
+                     AND horizon = ?""",
+                (active_model["model_version"], model_horizon),
+            ).fetchall():
+                existing_by_subject.setdefault(
+                    str(prediction["subject_id"]), []
+                ).append(dict(prediction))
             for row in rows:
+                source_observed_at = _as_datetime(row["observed_at"])
+                source_age = predicted_at - source_observed_at
+                if source_age < timedelta(0) or source_age > source_max_age:
+                    skipped_stale += 1
+                    continue
+                if (
+                    int(row["videos_total"]) < 2
+                    or int(row["creators_total"]) < 2
+                ):
+                    skipped_insufficient_support += 1
+                    continue
+                source_observation_id = int(row["trend_observation_id"])
+                if _has_source_prediction(
+                    existing_by_subject.get(str(row["trend_id"]), []),
+                    source_observation_id=source_observation_id,
+                    source_observed_at=source_observed_at,
+                ):
+                    skipped_duplicate += 1
+                    continue
                 features = {
                     "forecast_source": "active_trend_snapshot",
+                    "source_observation_type": "trend_observation",
+                    "source_observation_id": source_observation_id,
+                    "source_observed_at": row["observed_at"],
+                    "source_observation_age_seconds": round(
+                        source_age.total_seconds(), 3
+                    ),
+                    "source_max_age_seconds": round(
+                        source_max_age.total_seconds(), 3
+                    ),
                     "trend_strength": float(row["trend_strength"]),
                     "relative_strength": float(row["relative_strength"]),
                     "momentum": float(row["momentum"]),
                     "acceleration": float(row["acceleration"]),
                     "creator_breadth": float(row["creator_breadth"]),
+                    "videos_total": int(row["videos_total"]),
+                    "creators_total": int(row["creators_total"]),
                     "platform_breadth": float(row["platform_breadth"]),
                     "saturation": float(row["saturation"]),
                     "state": row["state"],
@@ -1985,7 +2081,26 @@ class MarketTapeStore:
                     skipped_ineligible += 1
                     continue
                 features["model_purpose"] = model_purpose(active_model)
-                probability = predict_probability(active_model, features)
+                inference = predict_trend_snapshot(active_model, features)
+                if inference["state"] == "abstained":
+                    reasons = inference["diagnostics"].get("reasons") or [
+                        "unspecified"
+                    ]
+                    for reason in reasons:
+                        abstention_reasons[str(reason)] = (
+                            abstention_reasons.get(str(reason), 0) + 1
+                        )
+                    abstentions.append({
+                        "trend_id": row["trend_id"],
+                        "observed_at": row["observed_at"],
+                        "contract": inference["contract"],
+                        "state": inference["state"],
+                        "probability": inference["probability"],
+                        "diagnostics": inference["diagnostics"],
+                    })
+                    continue
+                probability = float(inference["probability"])
+                features["inference_diagnostics"] = inference["diagnostics"]
                 peak_hours = max(0.5, 6.0 * (1.0 - probability))
                 cursor = connection.execute(
                     """INSERT INTO mt_predictions(
@@ -2004,7 +2119,12 @@ class MarketTapeStore:
                         json.dumps(features, sort_keys=True),
                     ),
                 )
-                inserted_ids.append(int(cursor.lastrowid))
+                prediction_id = int(cursor.lastrowid)
+                inserted_ids.append(prediction_id)
+                existing_by_subject.setdefault(str(row["trend_id"]), []).append({
+                    "predicted_at": predicted,
+                    "features_json": json.dumps(features, sort_keys=True),
+                })
         queued = self.enqueue_prediction_updates(inserted_ids)
         return {
             "state": "completed",
@@ -2014,12 +2134,36 @@ class MarketTapeStore:
             "predicted_at": predicted,
             "predictions_added": len(inserted_ids),
             "skipped_ineligible": skipped_ineligible,
+            "skipped_insufficient_support": skipped_insufficient_support,
+            "skipped_stale": skipped_stale,
+            "skipped_duplicate": skipped_duplicate,
+            "source_freshness_policy": {
+                "maximum_age_seconds": round(
+                    source_max_age.total_seconds(), 3
+                ),
+                "prediction_horizon_hours": horizon_hours,
+                "coverage_tolerance_seconds": round(
+                    TREND_OUTCOME_COVERAGE_TOLERANCE.total_seconds(), 3
+                ),
+                "future_observations_allowed": False,
+                "minimum_videos": 2,
+                "minimum_creators": 2,
+            },
+            "abstained_out_of_distribution": len(abstentions),
+            "abstention_reasons": abstention_reasons,
+            "abstentions": abstentions,
             "outbox_records": queued,
         }
 
     def evaluate_predictions(self, as_of: Optional[datetime] = None) -> Dict[str, Any]:
-        """Attach horizon outcomes only when enough future tape exists to score them."""
-        as_of = as_of or utc_now()
+        """Attach measured outcomes or terminal, non-binary coverage receipts.
+
+        Trend forecasts without sufficient future tape remain pending through
+        a two-hour grace window. Once it closes they become unscorable, never a
+        guessed negative label, so calibration continues to use measured
+        binary outcomes only.
+        """
+        as_of = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
         pending: List[Dict[str, Any]] = []
         with self.connect() as connection:
             pending = [dict(row) for row in connection.execute(
@@ -2056,6 +2200,7 @@ class MarketTapeStore:
             updates: List[Tuple[str, int]] = []
             pending_due = 0
             unscorable = 0
+            missing_future_trend_coverage = 0
             for prediction in pending:
                 predicted_at = _as_datetime(prediction["predicted_at"])
                 horizon_hours = _prediction_horizon_hours(str(prediction["horizon"]))
@@ -2131,7 +2276,7 @@ class MarketTapeStore:
                     coverage = bool(
                         window
                         and _as_datetime(window[-1]["observed_at"])
-                        >= target_at - timedelta(minutes=30)
+                        >= target_at - TREND_OUTCOME_COVERAGE_TOLERANCE
                     )
                     if outcome is None and coverage:
                         breakout_states = {"breakout", "expanding", "saturating"}
@@ -2165,6 +2310,38 @@ class MarketTapeStore:
                             "evaluated_at": isoformat(as_of),
                             "target_at": isoformat(target_at),
                         }
+                    elif (
+                        outcome is None
+                        and as_of >= target_at + TREND_OUTCOME_COVERAGE_GRACE
+                    ):
+                        observations_during_grace = [
+                            row for row in rows
+                            if predicted_at < _as_datetime(row["observed_at"])
+                            <= target_at + TREND_OUTCOME_COVERAGE_GRACE
+                        ]
+                        outcome = {
+                            "state": "unscorable",
+                            "reason": "missing_future_trend_coverage",
+                            "observations_in_horizon": len(window),
+                            "observations_during_grace": len(
+                                observations_during_grace
+                            ),
+                            "latest_follow_up_at": (
+                                observations_during_grace[-1]["observed_at"]
+                                if observations_during_grace
+                                else None
+                            ),
+                            "required_terminal_observation_at_or_after": isoformat(
+                                target_at - TREND_OUTCOME_COVERAGE_TOLERANCE
+                            ),
+                            "coverage_grace_closed_at": isoformat(
+                                target_at + TREND_OUTCOME_COVERAGE_GRACE
+                            ),
+                            "evaluated_at": isoformat(as_of),
+                            "target_at": isoformat(target_at),
+                        }
+                        unscorable += 1
+                        missing_future_trend_coverage += 1
                 if outcome is not None:
                     updates.append((json.dumps(outcome, sort_keys=True), int(prediction["prediction_id"])))
 
@@ -2182,6 +2359,13 @@ class MarketTapeStore:
             "pending_due": pending_due - len(updates),
             "newly_labeled": len(updates),
             "newly_unscorable": unscorable,
+            "newly_missing_future_trend_coverage": (
+                missing_future_trend_coverage
+            ),
+            "trend_coverage_grace_hours": round(
+                TREND_OUTCOME_COVERAGE_GRACE.total_seconds() / 3600.0,
+                3,
+            ),
             "outbox_records": queued,
         })
         if updates:
@@ -2225,6 +2409,7 @@ class MarketTapeStore:
             ).fetchone()[0])
         grouped: Dict[Tuple[str, str, str], List[Tuple[float, int]]] = {}
         unscorable = 0
+        unscorable_by_reason: Dict[str, int] = {}
         for row in rows:
             try:
                 outcome = json.loads(row["outcome_json"])
@@ -2232,6 +2417,14 @@ class MarketTapeStore:
                 continue
             if outcome.get("state") != "scored":
                 unscorable += 1
+                reason = str(
+                    outcome.get("reason")
+                    or outcome.get("state")
+                    or "unspecified"
+                )
+                unscorable_by_reason[reason] = (
+                    unscorable_by_reason.get(reason, 0) + 1
+                )
                 continue
             key = (str(row["subject_type"]), str(row["model_version"]), str(row["horizon"]))
             grouped.setdefault(key, []).append((
@@ -2299,6 +2492,7 @@ class MarketTapeStore:
             "minimum_labels": self.config.prediction_min_backtest_labels,
             "scored_labels": sum(model["labels"] for model in models),
             "unscorable": unscorable,
+            "unscorable_by_reason": unscorable_by_reason,
             "pending": pending,
             "models": models,
         }
@@ -2597,6 +2791,7 @@ class MarketTapeStore:
     ) -> Dict[str, Any]:
         """Rank specific, evidenced trends without conflating rank with probability."""
         active_model = load_active_model(self.config)
+        generated_at = utc_now()
         maximum = min(500, max(1, int(limit)))
         saturation_ceiling = min(1.0, max(0.0, float(max_saturation)))
         minimum_videos = min(10000, max(1, int(min_videos)))
@@ -2604,8 +2799,25 @@ class MarketTapeStore:
             10000,
             max(1, int(min_measured_videos)),
         )
-        cutoff = isoformat(utc_now() - timedelta(hours=24))
+        cutoff = isoformat(generated_at - timedelta(hours=24))
+        generated = isoformat(generated_at)
+        active_horizon = (
+            model_prediction_horizon(active_model)
+            if active_model is not None
+            else ""
+        )
         with self.connect() as connection:
+            model_admission = _prospective_model_admission(
+                connection,
+                active_model=active_model,
+                horizon=active_horizon,
+                minimum_labels=max(
+                    1, self.config.prediction_min_backtest_labels
+                ),
+                minimum_class_labels=max(
+                    2, self.config.prediction_min_positive_labels
+                ),
+            )
             rows = [dict(row) for row in connection.execute(
                 """WITH ranked_predictions AS (
                        SELECT prediction.*, ROW_NUMBER() OVER (
@@ -2616,7 +2828,9 @@ class MarketTapeStore:
                        FROM mt_predictions prediction
                        WHERE prediction.subject_type = 'trend'
                          AND prediction.model_version = ?
+                         AND prediction.horizon = ?
                          AND prediction.predicted_at >= ?
+                         AND prediction.predicted_at <= ?
                    ), ranked_observations AS (
                        SELECT observation.*, ROW_NUMBER() OVER (
                            PARTITION BY observation.trend_id
@@ -2661,7 +2875,9 @@ class MarketTapeStore:
                 (
                     str(active_model.get("model_version") or "")
                     if active_model is not None else "",
+                    active_horizon,
                     cutoff,
+                    generated,
                     cutoff,
                 ),
             ).fetchall()]
@@ -2673,10 +2889,32 @@ class MarketTapeStore:
             ((active_model or {}).get("training") or {}).get("index_version")
             or "trend-strength-v1"
         )
-        model_ready = bool(
+        artifact_index_compatible = bool(
             active_model is not None
             and model_index_version == TREND_INDEX_VERSION
         )
+        unexpired_predictions = sum(
+            int(_prediction_is_unexpired(row, generated_at))
+            for row in rows
+            if row.get("model_version") and row.get("probability") is not None
+        )
+        model_ready = bool(
+            artifact_index_compatible
+            and model_admission["prospective_validation_passed"]
+            and unexpired_predictions > 0
+        )
+        model_admission.update({
+            "artifact_index_compatible": artifact_index_compatible,
+            "unexpired_predictions": unexpired_predictions,
+            "admitted_for_ranking": model_ready,
+        })
+        if not artifact_index_compatible and active_model is not None:
+            model_admission["admission_reason"] = "index_version_mismatch"
+        elif (
+            model_admission["prospective_validation_passed"]
+            and unexpired_predictions == 0
+        ):
+            model_admission["admission_reason"] = "no_unexpired_predictions"
         if model_ready and purpose == "early_breakout_entry":
             weights = {
                 "model_probability": 0.25,
@@ -2730,6 +2968,7 @@ class MarketTapeStore:
                 model_ready
                 and row.get("model_version")
                 and row.get("probability") is not None
+                and _prediction_is_unexpired(row, generated_at)
             )
             probability = (
                 min(1.0, max(0.0, float(row["probability"])))
@@ -2951,13 +3190,14 @@ class MarketTapeStore:
             "contract": OPPORTUNITY_CONTRACT,
             "ranker_version": OPPORTUNITY_RANKER_VERSION,
             "state": "ready",
-            "generated_at": isoformat(utc_now()),
+            "generated_at": generated,
             "active_model": ({
                 "model_version": active_model["model_version"],
                 "model_purpose": purpose,
                 "training_index_version": model_index_version,
-                "compatible_with_current_index": model_ready,
+                "compatible_with_current_index": artifact_index_compatible,
             } if active_model is not None else None),
+            "model_admission": model_admission,
             "current_index_version": TREND_INDEX_VERSION,
             "score_is_probability": False,
             "ranking_weights": weights,
@@ -3231,6 +3471,225 @@ def _prediction_horizon_hours(horizon: str) -> float:
         return 6.0
     match = re.search(r"within_(\d+(?:\.\d+)?)h", horizon)
     return float(match.group(1)) if match else 24.0
+
+
+def _prediction_is_unexpired(
+    prediction: Dict[str, Any],
+    as_of: datetime,
+) -> bool:
+    try:
+        predicted_at = _as_datetime(prediction["predicted_at"])
+        horizon_hours = _prediction_horizon_hours(str(prediction["horizon"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    return predicted_at <= as_of <= predicted_at + timedelta(
+        hours=max(0.0, horizon_hours)
+    )
+
+
+def _prospective_model_admission(
+    connection: sqlite3.Connection,
+    *,
+    active_model: Optional[Dict[str, Any]],
+    horizon: str,
+    minimum_labels: int,
+    minimum_class_labels: int,
+) -> Dict[str, Any]:
+    """Admit probabilities only after exact-model prospective calibration."""
+    thresholds = {
+        "minimum_labels": int(minimum_labels),
+        "minimum_unique_subjects": int(minimum_labels),
+        "minimum_forecast_time_batches": 3,
+        "minimum_positive_labels": int(minimum_class_labels),
+        "minimum_negative_labels": int(minimum_class_labels),
+        "minimum_brier_skill_score_exclusive": 0.05,
+        "maximum_expected_calibration_error": 0.15,
+    }
+    receipt: Dict[str, Any] = {
+        "contract": TREND_MODEL_ADMISSION_CONTRACT,
+        "model_version": (
+            str(active_model.get("model_version") or "")
+            if active_model is not None
+            else None
+        ),
+        "horizon": horizon or None,
+        "prospective_validation_passed": False,
+        "admitted_for_ranking": False,
+        "admission_reason": "no_active_model",
+        "thresholds": thresholds,
+        "prospective_metrics": None,
+    }
+    if active_model is None:
+        return receipt
+    rows = [dict(row) for row in connection.execute(
+        """SELECT subject_id, predicted_at, probability, outcome_json
+           FROM mt_predictions
+           WHERE subject_type = 'trend'
+             AND model_version = ?
+             AND horizon = ?""",
+        (str(active_model["model_version"]), horizon),
+    ).fetchall()]
+    measured: List[Tuple[float, int, str, str]] = []
+    unscorable = 0
+    pending = 0
+    for row in rows:
+        if not row.get("outcome_json"):
+            pending += 1
+            continue
+        try:
+            outcome = json.loads(str(row["outcome_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            unscorable += 1
+            continue
+        if outcome.get("state") != "scored":
+            unscorable += 1
+            continue
+        measured.append((
+            min(1.0, max(0.0, float(row["probability"]))),
+            int(bool(outcome.get("actual"))),
+            str(row["subject_id"]),
+            str(row["predicted_at"]),
+        ))
+    labels = len(measured)
+    positives = sum(row[1] for row in measured)
+    negatives = labels - positives
+    unique_subjects = len({row[2] for row in measured})
+    forecast_time_batches = len({
+        _as_datetime(row[3]).astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
+        for row in measured
+    })
+    brier = (
+        sum((row[0] - row[1]) ** 2 for row in measured)
+        / labels
+        if labels
+        else None
+    )
+    prevalence = positives / labels if labels else None
+    baseline_brier = (
+        prevalence * (1.0 - prevalence)
+        if prevalence is not None
+        else None
+    )
+    brier_skill = (
+        1.0 - float(brier) / float(baseline_brier)
+        if brier is not None and baseline_brier
+        else None
+    )
+    binary_values = [(row[0], row[1]) for row in measured]
+    bins = _calibration_bins(binary_values) if measured else []
+    expected_calibration_error = (
+        sum(
+            bucket["count"] / labels
+            * abs(bucket["mean_probability"] - bucket["positive_rate"])
+            for bucket in bins
+        )
+        if labels
+        else None
+    )
+    checks = {
+        "minimum_labels": labels >= minimum_labels,
+        "minimum_unique_subjects": unique_subjects >= minimum_labels,
+        "minimum_forecast_time_batches": forecast_time_batches >= 3,
+        "minimum_positive_labels": positives >= minimum_class_labels,
+        "minimum_negative_labels": negatives >= minimum_class_labels,
+        "positive_brier_skill": (
+            brier_skill is not None and brier_skill > 0.05
+        ),
+        "calibration_error": (
+            expected_calibration_error is not None
+            and expected_calibration_error <= 0.15
+        ),
+    }
+    reason_by_check = {
+        "minimum_labels": "insufficient_prospective_labels",
+        "minimum_unique_subjects": "insufficient_unique_subjects",
+        "minimum_forecast_time_batches": "insufficient_forecast_time_batches",
+        "minimum_positive_labels": "insufficient_positive_labels",
+        "minimum_negative_labels": "insufficient_negative_labels",
+        "positive_brier_skill": "insufficient_brier_skill",
+        "calibration_error": "excessive_calibration_error",
+    }
+    failed_checks = [name for name, passed in checks.items() if not passed]
+    reason = (
+        "no_prospective_labels"
+        if labels == 0
+        else reason_by_check[failed_checks[0]]
+        if failed_checks
+        else "prospective_validation_passed"
+    )
+    receipt.update({
+        "prospective_validation_passed": not failed_checks,
+        "admission_reason": reason,
+        "checks": checks,
+        "prospective_metrics": {
+            "labels": labels,
+            "unique_subjects": unique_subjects,
+            "forecast_time_batches": forecast_time_batches,
+            "positives": positives,
+            "negatives": negatives,
+            "pending": pending,
+            "unscorable": unscorable,
+            "brier_score": round(brier, 6) if brier is not None else None,
+            "naive_prevalence_brier_score": (
+                round(baseline_brier, 6)
+                if baseline_brier is not None
+                else None
+            ),
+            "brier_skill_score": (
+                round(brier_skill, 6)
+                if brier_skill is not None
+                else None
+            ),
+            "expected_calibration_error": (
+                round(expected_calibration_error, 6)
+                if expected_calibration_error is not None
+                else None
+            ),
+            "roc_auc": _roc_auc(binary_values) if measured else None,
+        },
+    })
+    return receipt
+
+
+def _has_source_prediction(
+    predictions: Sequence[Dict[str, Any]],
+    *,
+    source_observation_id: int,
+    source_observed_at: datetime,
+) -> bool:
+    """Match durable lineage, with a fail-closed legacy fallback.
+
+    Forecasts written before source lineage was added can still be identified:
+    if their prediction timestamp is at or after the candidate snapshot, that
+    snapshot was already the latest evidence available to the old writer.
+    Explicit lineage always wins, allowing a newer observation to be forecast.
+    """
+    for prediction in predictions:
+        features: Dict[str, Any] = {}
+        try:
+            parsed = json.loads(str(prediction.get("features_json") or "{}"))
+            if isinstance(parsed, dict):
+                features = parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            features = {}
+        explicit_id = features.get("source_observation_id")
+        if explicit_id is not None:
+            try:
+                if int(explicit_id) == int(source_observation_id):
+                    return True
+                continue
+            except (TypeError, ValueError):
+                # Invalid claimed lineage is not safe evidence for another
+                # forecast; fall through to the timestamp check.
+                pass
+        try:
+            if _as_datetime(prediction["predicted_at"]) >= source_observed_at:
+                return True
+        except (KeyError, TypeError, ValueError):
+            # An existing same-subject/model/horizon row with unreadable
+            # lineage cannot safely authorize a second prediction.
+            return True
+    return False
 
 
 def _opportunity_exclusion_reason(

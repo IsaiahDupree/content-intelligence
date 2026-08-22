@@ -14,6 +14,7 @@ from .collector import MarketTapeCollector
 from .config import MarketTapeConfig
 from .dataset import MarketTapeDatasetManager
 from .full_pipeline import run_full_pipeline
+from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
 from .store import MarketTapeStore
 from .sinks import SupabaseSink
@@ -38,6 +39,19 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
     @app.get("/api/market-tape/status")
     def market_tape_status():
         return jsonify(store.status())
+
+    @app.get("/api/market-tape/intelligence")
+    def market_tape_intelligence():
+        limit = _limit(request.args.get("limit"), 25, maximum=100)
+        window = _limit(request.args.get("window_hours"), 168, maximum=24 * 90)
+        minimum = _limit(request.args.get("min_videos"), 2, maximum=1000)
+        return jsonify(build_intelligence_snapshot(
+            resolved,
+            store,
+            limit=limit,
+            window_hours=window,
+            minimum_videos=minimum,
+        ))
 
     @app.get("/api/market-tape/sources")
     def market_tape_sources():

@@ -61,8 +61,18 @@ def rank_keywords(
         observed = parse_datetime(row.get("observed_at")) or now
         if not published:
             continue
-        age_hours = (observed - published).total_seconds() / 3600.0
-        if age_hours < 0 or age_hours > horizon:
+        age_at_observation_hours = (observed - published).total_seconds() / 3600.0
+        age_now_hours = (now - published).total_seconds() / 3600.0
+        observation_age_hours = max(
+            0.0,
+            (now - observed).total_seconds() / 3600.0,
+        )
+        if (
+            age_at_observation_hours < 0
+            or age_now_hours < 0
+            or age_now_hours > horizon
+            or observation_age_hours > horizon
+        ):
             continue
         views = max(0, int(row.get("views") or 0))
         likes = max(0, int(row.get("likes") or 0))
@@ -88,9 +98,12 @@ def rank_keywords(
         if not candidates:
             continue
 
-        implied_views_per_hour = views / max(1.0, age_hours)
+        implied_views_per_hour = views / max(1.0, age_at_observation_hours)
         actual_log_velocity = max(0.0, float(row.get("view_velocity") or 0.0))
-        freshness = math.exp(-age_hours / max(12.0, horizon / 3.0))
+        decay_hours = max(12.0, horizon / 3.0)
+        content_freshness = math.exp(-age_now_hours / decay_hours)
+        observation_freshness = math.exp(-observation_age_hours / decay_hours)
+        freshness = content_freshness * observation_freshness
         engagement_rate = min(0.5, (likes + comments + shares) / max(1, views))
         contribution = freshness * (
             math.log1p(views)
@@ -107,7 +120,11 @@ def rank_keywords(
             "platform": platform,
             "title": str(row.get("title") or row.get("caption") or "")[:240],
             "views": views,
-            "age_hours": round(age_hours, 3),
+            "age_hours_at_observation": round(age_at_observation_hours, 3),
+            "age_hours_now": round(age_now_hours, 3),
+            "observed_at": observed.astimezone(timezone.utc).isoformat(),
+            "observation_age_hours": round(observation_age_hours, 3),
+            "observation_freshness": round(observation_freshness, 6),
             "implied_views_per_hour": round(implied_views_per_hour, 3),
             "url": str(row.get("url") or ""),
             "contribution": round(contribution, 6),
@@ -127,6 +144,9 @@ def rank_keywords(
             aggregate["rates"].append(implied_views_per_hour)
             aggregate["velocities"].append(actual_log_velocity)
             aggregate["freshness"].append(freshness)
+            aggregate["observation_freshness"].append(observation_freshness)
+            aggregate["observation_ages"].append(observation_age_hours)
+            aggregate["observed_at"].append(observed)
             aggregate["contributions"].append(contribution)
             aggregate["examples"].append(example)
 
@@ -178,6 +198,17 @@ def rank_keywords(
             "max_implied_views_per_hour": round(max(aggregate["rates"], default=0.0), 3),
             "median_log_velocity": round(statistics.median(aggregate["velocities"]), 6),
             "freshness": round(statistics.fmean(aggregate["freshness"]), 6),
+            "observation_freshness": round(
+                statistics.fmean(aggregate["observation_freshness"]),
+                6,
+            ),
+            "median_observation_age_hours": round(
+                statistics.median(aggregate["observation_ages"]),
+                3,
+            ),
+            "latest_observed_at": max(aggregate["observed_at"]).astimezone(
+                timezone.utc
+            ).isoformat(),
             "top1_view_concentration": round(concentration, 6),
             "confidence": round(confidence, 6),
             "raw_score": round(raw_score, 6),
@@ -255,6 +286,9 @@ def _new_accumulator() -> Dict[str, Any]:
         "rates": [],
         "velocities": [],
         "freshness": [],
+        "observation_freshness": [],
+        "observation_ages": [],
+        "observed_at": [],
         "contributions": [],
         "examples": [],
     }

@@ -258,7 +258,10 @@ def test_append_only_observations_motion_and_raw_archive(market_config):
     assert store.aggregate_trends(run_id="run-1") > 0
     assert store.create_predictions("run-1") > 0
     predictions = store.list_predictions(100)
-    assert {row["subject_type"] for row in predictions} == {"video", "trend"}
+    assert {row["subject_type"] for row in predictions} == {"video"}
+    assert all(
+        row["subject_type"] != "trend" for row in predictions
+    ), "a one-video/one-creator singleton cannot produce a trend forecast"
     assert all(0 <= row["probability"] <= 1 for row in predictions)
     candles = store.social_candles(window_minutes=60, limit=24)
     assert sum(row["new_views"] for row in candles) == 150
@@ -1657,6 +1660,7 @@ def test_market_tape_api_is_readable_and_write_control_is_local(market_config):
     register_market_tape_routes(app, market_config)
     client = app.test_client()
     assert client.get("/api/market-tape/status").status_code == 200
+    assert client.get("/api/market-tape/intelligence?limit=5").status_code == 200
     assert client.get("/api/market-tape/videos").status_code == 200
     assert client.get("/api/market-tape/trends").status_code == 200
     assert client.get("/api/market-tape/keywords").status_code == 200

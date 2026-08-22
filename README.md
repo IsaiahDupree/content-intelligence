@@ -25,6 +25,7 @@ Verify the Market Tape software:
 ```bash
 python3 -m pytest tests/test_market_tape.py -q
 python3 -m services.market_tape.cli keywords --limit 100 --window-hours 168 --min-videos 2
+python3 -m services.market_tape.cli intelligence --limit 25 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli query-frontier --limit 100 --window-hours 168 --min-videos 2
 python3 -m services.market_tape.cli sync --reconcile --force --drain --max-batches 250
 python3 scripts/research_youtube_queries.py --query-file docs/adaptive-query-expansion-2026-08-19.txt --output-dir '/Volumes/My Passport/MarketTape/trend-frontier/manual'

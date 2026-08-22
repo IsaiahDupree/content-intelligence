@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -12,8 +14,14 @@ from .config import MarketTapeConfig
 from .models import isoformat, stable_hash, utc_now
 
 
-MODEL_CONTRACT = "market_tape_trend_predictor_v1"
-MODEL_FAMILY = "early-breakout-logistic-v3"
+LEGACY_MODEL_CONTRACT = "market_tape_trend_predictor_v1"
+MODEL_CONTRACT = "market_tape_trend_predictor_v2"
+LEGACY_ACTIVE_CONTRACT = "market_tape_active_predictor_v1"
+ACTIVE_MODEL_CONTRACT = "market_tape_active_predictor_v2"
+INFERENCE_CONTRACT = "market_tape_trend_inference_v2"
+INFERENCE_POLICY_CONTRACT = "market_tape_standardized_ood_policy_v1"
+PROMOTION_GATE_CONTRACT = "market_tape_predictor_promotion_gate_v2"
+MODEL_FAMILY = "early-breakout-logistic-walk-forward-v4"
 MODEL_PURPOSE = "early_breakout_entry"
 ENTRY_HORIZON = "enters_breakout_within_6h"
 PROGRESSION_HORIZON = "is_or_reaches_breakout_within_6h"
@@ -42,6 +50,13 @@ FEATURE_CLIPS = {
     "platform_breadth": (0.0, 1.0),
     "saturation": (0.0, 1.0),
 }
+MINIMUM_WALK_FORWARD_FOLDS = 3
+MAXIMUM_STANDARDIZED_DISTANCE = 4.0
+SUPPORT_MARGIN_STANDARD_DEVIATIONS = 1.0
+MINIMUM_INFERENCE_COVERAGE = 0.8
+PROBABILITY_BOUNDS = (0.005, 0.995)
+MINIMUM_EVIDENCE_VIDEOS = 2
+MINIMUM_EVIDENCE_CREATORS = 2
 
 
 class MarketTapePredictor:
@@ -56,10 +71,12 @@ class MarketTapePredictor:
         labels = len(rows)
         positives = sum(row["actual"] for row in rows)
         negatives = labels - positives
+        subjects = len({row["subject_id"] for row in rows})
         dataset_hash = stable_hash([
             {
                 "subject_id": row["subject_id"],
                 "predicted_at": row["predicted_at"],
+                "label_available_at": row["label_available_at"],
                 "actual": row["actual"],
                 "features": row["features"],
             }
@@ -90,16 +107,22 @@ class MarketTapePredictor:
         if labels >= minimum_labels and folds >= 2:
             cross_validation = self._cross_validate(rows, folds)
             model = _fit_logistic(rows)
-            qualified = (
-                cross_validation["brier_skill_score"] > 0.05
-                and cross_validation["roc_auc"] is not None
-                and cross_validation["roc_auc"] >= 0.65
-            )
-            status = "promoted" if qualified else "rejected"
+            status = "rejected"
+
+        promotion_gate = _promotion_gate(
+            cross_validation,
+            labels=labels,
+            positives=positives,
+            negatives=negatives,
+            minimum_labels=minimum_labels,
+            minimum_positive_labels=minimum_positives,
+        )
+        if model is not None and promotion_gate["passed"]:
+            status = "promoted"
 
         artifact = {
             "contract": MODEL_CONTRACT,
-            "schema_version": 1,
+            "schema_version": 2,
             "model_family": MODEL_FAMILY,
             "model_purpose": MODEL_PURPOSE,
             "model_version": model_version,
@@ -113,13 +136,19 @@ class MarketTapePredictor:
                 "eligibility": {
                     "initial_states_excluded": sorted(BREAKOUT_STATES),
                     "maximum_initial_trend_strength_exclusive": 70.0,
+                    "minimum_videos": MINIMUM_EVIDENCE_VIDEOS,
+                    "minimum_creators": MINIMUM_EVIDENCE_CREATORS,
                 },
                 "labels": labels,
                 "positives": positives,
                 "negatives": negatives,
-                "grouping": "subject_id",
+                "subjects": subjects,
+                "grouping": "subject_id_purged_from_each_validation_fold",
+                "ordering": "predicted_at_ascending",
+                "label_availability": "prediction_horizon_closed_before_validation",
             },
             "cross_validation": cross_validation,
+            "promotion_gate": promotion_gate,
             "parameters": {
                 "features": list(FEATURES),
                 "feature_clips": {
@@ -129,15 +158,18 @@ class MarketTapePredictor:
                 "learning_rate": 0.1,
                 "iterations": 2000,
             },
+            "inference_policy": _inference_policy(model),
             "model": model,
             "retestable": True,
         }
         self.config.prediction_model_dir.mkdir(parents=True, exist_ok=True)
         _atomic_json(artifact_path, artifact)
         if status == "promoted":
+            if not _safe_v2_artifact(artifact):
+                raise ValueError("refusing to activate predictor without the v2 safety gate")
             artifact_sha = _file_sha256(artifact_path)
             _atomic_json(self.config.prediction_model_dir / "active.json", {
-                "contract": "market_tape_active_predictor_v1",
+                "contract": ACTIVE_MODEL_CONTRACT,
                 "model_version": model_version,
                 "artifact_file": artifact_path.name,
                 "artifact_sha256": artifact_sha,
@@ -161,13 +193,18 @@ class MarketTapePredictor:
                     artifact = _read_json(path)
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
-                if artifact.get("contract") != MODEL_CONTRACT:
+                if artifact.get("contract") not in {
+                    LEGACY_MODEL_CONTRACT,
+                    MODEL_CONTRACT,
+                }:
                     continue
                 registry.append({
+                    "contract": artifact.get("contract"),
                     "model_version": artifact.get("model_version"),
                     "model_family": artifact.get("model_family"),
                     "model_purpose": model_purpose(artifact),
                     "status": artifact.get("status"),
+                    "activation_safety": _activation_safety(artifact),
                     "trained_at": artifact.get("trained_at"),
                     "labels": (artifact.get("training") or {}).get("labels"),
                     "cross_validation": artifact.get("cross_validation"),
@@ -178,7 +215,7 @@ class MarketTapePredictor:
             str(row.get("model_version") or ""),
         ), reverse=True)
         return {
-            "contract": "market_tape_predictor_registry_v1",
+            "contract": "market_tape_predictor_registry_v2",
             "state": "active" if active else "no_promoted_model",
             "active_model": active_status,
             "models": registry,
@@ -187,7 +224,8 @@ class MarketTapePredictor:
     def _training_rows(self) -> List[Dict[str, Any]]:
         with self.store.connect() as connection:
             raw_rows = [dict(row) for row in connection.execute(
-                """SELECT subject_id, predicted_at, features_json, outcome_json
+                """SELECT prediction_id, subject_id, predicted_at, horizon,
+                          features_json, outcome_json
                    FROM mt_predictions
                    WHERE subject_type = 'trend'
                      AND model_version IN (?, ?, ?)
@@ -208,9 +246,16 @@ class MarketTapePredictor:
                 continue
             if not eligible_for_early_entry(features):
                 continue
+            predicted_at = _as_utc(row["predicted_at"])
+            label_available_at = _label_available_at(
+                predicted_at,
+                str(row.get("horizon") or ENTRY_HORIZON),
+                outcome,
+            )
             rows.append({
                 "subject_id": str(row["subject_id"]),
-                "predicted_at": str(row["predicted_at"]),
+                "predicted_at": isoformat(predicted_at),
+                "label_available_at": isoformat(label_available_at),
                 "actual": int(bool(outcome.get("actual"))),
                 "features": _feature_vector(features),
             })
@@ -218,40 +263,238 @@ class MarketTapePredictor:
 
     @staticmethod
     def _cross_validate(rows: Sequence[Dict[str, Any]], folds: int) -> Dict[str, Any]:
-        assignments = _stratified_group_folds(rows, folds)
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                _as_utc(row["predicted_at"]),
+                str(row["subject_id"]),
+            ),
+        )
+        timestamps = sorted({_as_utc(row["predicted_at"]) for row in ordered})
         predictions: List[Tuple[float, int]] = []
         baselines: List[Tuple[float, int]] = []
-        fold_receipts = []
-        for fold in range(folds):
-            training = [row for row in rows if assignments[row["subject_id"]] != fold]
-            validation = [row for row in rows if assignments[row["subject_id"]] == fold]
-            model = _fit_logistic(training)
-            prevalence = sum(row["actual"] for row in training) / len(training)
-            fold_predictions = [
-                (predict_probability({"model": model}, row["features"]), row["actual"])
-                for row in validation
+        fold_receipts: List[Dict[str, Any]] = []
+        validation_rows_considered = 0
+        validation_rows_abstained = 0
+        if len(timestamps) < folds + 1:
+            return {
+                "state": "insufficient_walk_forward_folds",
+                "method": "purged_grouped_walk_forward",
+                "requested_folds": folds,
+                "folds": 0,
+                "labels": 0,
+                "positives": 0,
+                "brier_score": None,
+                "baseline_brier_score": None,
+                "brier_skill_score": None,
+                "roc_auc": None,
+                "prediction_coverage": 0.0,
+                "chronological_order_passed": False,
+                "group_isolation_passed": False,
+                "label_embargo_passed": False,
+                "fold_receipts": [],
+            }
+
+        boundary_indices = [
+            min(len(timestamps) - 1, (len(timestamps) * step) // (folds + 1))
+            for step in range(1, folds + 1)
+        ]
+        boundaries = [timestamps[index] for index in boundary_indices]
+        for fold, validation_start in enumerate(boundaries):
+            validation_end = (
+                boundaries[fold + 1]
+                if fold + 1 < len(boundaries)
+                else None
+            )
+            validation = [
+                row for row in ordered
+                if _as_utc(row["predicted_at"]) >= validation_start
+                and (
+                    validation_end is None
+                    or _as_utc(row["predicted_at"]) < validation_end
+                )
             ]
-            predictions.extend(fold_predictions)
-            baselines.extend((prevalence, row["actual"]) for row in validation)
-            fold_receipts.append({
+            validation_subjects = {row["subject_id"] for row in validation}
+            chronological_training = [
+                row for row in ordered
+                if _as_utc(row["predicted_at"]) < validation_start
+            ]
+            mature_training = [
+                row for row in chronological_training
+                if _as_utc(row["label_available_at"]) <= validation_start
+            ]
+            training = [
+                row for row in mature_training
+                if row["subject_id"] not in validation_subjects
+            ]
+            training_subjects = {row["subject_id"] for row in training}
+            overlap = sorted(training_subjects & validation_subjects)
+            receipt: Dict[str, Any] = {
                 "fold": fold,
+                "state": "measured",
                 "training_rows": len(training),
                 "validation_rows": len(validation),
+                "training_subjects": len(training_subjects),
+                "validation_subjects": len(validation_subjects),
                 "validation_positives": sum(row["actual"] for row in validation),
+                "validation_start": isoformat(validation_start),
+                "validation_end_exclusive": (
+                    isoformat(validation_end) if validation_end is not None else None
+                ),
+                "training_max_predicted_at": _maximum_timestamp(
+                    training,
+                    "predicted_at",
+                ),
+                "training_max_label_available_at": _maximum_timestamp(
+                    training,
+                    "label_available_at",
+                ),
+                "purged_unmatured_rows": (
+                    len(chronological_training) - len(mature_training)
+                ),
+                "purged_overlapping_group_rows": (
+                    len(mature_training) - len(training)
+                ),
+                "group_overlap_count": len(overlap),
+                "chronological_order_passed": bool(
+                    training
+                    and max(_as_utc(row["predicted_at"]) for row in training)
+                    < min(_as_utc(row["predicted_at"]) for row in validation)
+                ) if validation else False,
+                "label_embargo_passed": bool(
+                    training
+                    and max(_as_utc(row["label_available_at"]) for row in training)
+                    <= min(_as_utc(row["predicted_at"]) for row in validation)
+                ) if validation else False,
+            }
+            training_classes = {int(row["actual"]) for row in training}
+            validation_classes = {int(row["actual"]) for row in validation}
+            if not training or not validation:
+                receipt.update({"state": "skipped", "reason": "empty_temporal_partition"})
+                fold_receipts.append(receipt)
+                continue
+            if training_classes != {0, 1}:
+                receipt.update({"state": "skipped", "reason": "training_class_missing"})
+                fold_receipts.append(receipt)
+                continue
+            if validation_classes != {0, 1}:
+                receipt.update({"state": "skipped", "reason": "validation_class_missing"})
+                fold_receipts.append(receipt)
+                continue
+            if overlap:
+                receipt.update({"state": "skipped", "reason": "group_overlap"})
+                fold_receipts.append(receipt)
+                continue
+            if not receipt["chronological_order_passed"]:
+                receipt.update({"state": "skipped", "reason": "chronology_violation"})
+                fold_receipts.append(receipt)
+                continue
+            if not receipt["label_embargo_passed"]:
+                receipt.update({"state": "skipped", "reason": "label_embargo_violation"})
+                fold_receipts.append(receipt)
+                continue
+
+            model = _fit_logistic(training)
+            prevalence = sum(row["actual"] for row in training) / len(training)
+            fold_predictions: List[Tuple[float, int]] = []
+            fold_abstentions = 0
+            validation_rows_considered += len(validation)
+            validation_artifact = {
+                "contract": MODEL_CONTRACT,
+                "model": model,
+                "inference_policy": _inference_policy(model),
+            }
+            for row in validation:
+                decision = predict_trend_snapshot(
+                    validation_artifact,
+                    row["features"],
+                )
+                if decision["state"] == "abstained":
+                    fold_abstentions += 1
+                    continue
+                fold_predictions.append(
+                    (float(decision["probability"]), int(row["actual"]))
+                )
+            validation_rows_abstained += fold_abstentions
+            predictions.extend(fold_predictions)
+            baselines.extend(
+                (prevalence, actual) for _, actual in fold_predictions
+            )
+            receipt.update({
+                "predictions": len(fold_predictions),
+                "abstentions": fold_abstentions,
+                "prediction_coverage": round(
+                    len(fold_predictions) / len(validation),
+                    6,
+                ),
             })
+            fold_receipts.append(receipt)
+
+        measured_folds = [
+            receipt for receipt in fold_receipts
+            if receipt.get("state") == "measured"
+        ]
+        if not predictions or not baselines:
+            return {
+                "state": "insufficient_walk_forward_folds",
+                "method": "purged_grouped_walk_forward",
+                "requested_folds": folds,
+                "folds": len(measured_folds),
+                "labels": 0,
+                "positives": 0,
+                "brier_score": None,
+                "baseline_brier_score": None,
+                "brier_skill_score": None,
+                "roc_auc": None,
+                "prediction_coverage": 0.0,
+                "chronological_order_passed": all(
+                    receipt.get("chronological_order_passed", False)
+                    for receipt in measured_folds
+                ) and bool(measured_folds),
+                "group_isolation_passed": all(
+                    receipt.get("group_overlap_count") == 0
+                    for receipt in measured_folds
+                ) and bool(measured_folds),
+                "label_embargo_passed": all(
+                    receipt.get("label_embargo_passed", False)
+                    for receipt in measured_folds
+                ) and bool(measured_folds),
+                "fold_receipts": fold_receipts,
+            }
         brier = _brier(predictions)
         baseline_brier = _brier(baselines)
         skill = 1.0 - brier / baseline_brier if baseline_brier > 0 else 0.0
+        coverage = (
+            (validation_rows_considered - validation_rows_abstained)
+            / validation_rows_considered
+            if validation_rows_considered else 0.0
+        )
         return {
-            "state": "measured",
-            "method": "deterministic_stratified_group_kfold",
-            "folds": folds,
+            "state": (
+                "measured"
+                if len(measured_folds) >= MINIMUM_WALK_FORWARD_FOLDS
+                else "insufficient_walk_forward_folds"
+            ),
+            "method": "purged_grouped_walk_forward",
+            "requested_folds": folds,
+            "folds": len(measured_folds),
             "labels": len(predictions),
             "positives": sum(actual for _, actual in predictions),
             "brier_score": round(brier, 6),
             "baseline_brier_score": round(baseline_brier, 6),
             "brier_skill_score": round(skill, 6),
             "roc_auc": _roc_auc(predictions),
+            "prediction_coverage": round(coverage, 6),
+            "abstentions": validation_rows_abstained,
+            "chronological_order_passed": all(
+                receipt["chronological_order_passed"] for receipt in measured_folds
+            ) and bool(measured_folds),
+            "group_isolation_passed": all(
+                receipt["group_overlap_count"] == 0 for receipt in measured_folds
+            ) and bool(measured_folds),
+            "label_embargo_passed": all(
+                receipt["label_embargo_passed"] for receipt in measured_folds
+            ) and bool(measured_folds),
             "mean_probability": round(
                 sum(probability for probability, _ in predictions) / len(predictions),
                 6,
@@ -266,6 +509,11 @@ def load_active_model(config: MarketTapeConfig) -> Dict[str, Any] | None:
         return None
     try:
         pointer = _read_json(pointer_path)
+        if pointer.get("contract") not in {
+            LEGACY_ACTIVE_CONTRACT,
+            ACTIVE_MODEL_CONTRACT,
+        }:
+            return None
         artifact_file = Path(str(pointer["artifact_file"])).name
         artifact_path = config.prediction_model_dir / artifact_file
         if _file_sha256(artifact_path) != pointer["artifact_sha256"]:
@@ -273,7 +521,12 @@ def load_active_model(config: MarketTapeConfig) -> Dict[str, Any] | None:
         artifact = _read_json(artifact_path)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    if artifact.get("contract") != MODEL_CONTRACT or artifact.get("status") != "promoted":
+    if artifact.get("status") != "promoted":
+        return None
+    contract = artifact.get("contract")
+    if contract == MODEL_CONTRACT and not _safe_v2_artifact(artifact):
+        return None
+    if contract not in {LEGACY_MODEL_CONTRACT, MODEL_CONTRACT}:
         return None
     return artifact
 
@@ -300,7 +553,17 @@ def eligible_for_early_entry(features: Dict[str, Any]) -> bool:
         strength = float(features.get("trend_strength") or 0.0)
     except (TypeError, ValueError):
         strength = 0.0
-    return state not in BREAKOUT_STATES and strength < 70.0
+    try:
+        videos = int(features.get("videos_total") or 0)
+        creators = int(features.get("creators_total") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        state not in BREAKOUT_STATES
+        and strength < 70.0
+        and videos >= MINIMUM_EVIDENCE_VIDEOS
+        and creators >= MINIMUM_EVIDENCE_CREATORS
+    )
 
 
 def model_accepts_features(artifact: Dict[str, Any], features: Dict[str, Any]) -> bool:
@@ -315,10 +578,11 @@ def model_accepts_features(artifact: Dict[str, Any], features: Dict[str, Any]) -
     return True
 
 
-def predict_probability(
+def predict_trend_snapshot(
     artifact: Dict[str, Any],
     features: Dict[str, Any] | Sequence[float],
-) -> float:
+) -> Dict[str, Any]:
+    """Return a bounded probability or an auditable OOD abstention."""
     model = artifact.get("model") or {}
     means = model.get("means") or []
     standard_deviations = model.get("standard_deviations") or []
@@ -329,14 +593,321 @@ def predict_probability(
         and len(coefficients) == len(FEATURES)
     ):
         raise ValueError("predictor artifact has invalid coefficient dimensions")
-    vector = _feature_vector(features)
-    score = float(model["intercept"])
-    for index, value in enumerate(vector):
-        score += float(coefficients[index]) * (
-            (value - float(means[index]))
-            / max(1e-9, float(standard_deviations[index]))
+
+    policy = _resolved_inference_policy(artifact)
+    raw_values, input_issues = _validated_feature_values(features)
+    diagnostics: Dict[str, Any] = {
+        "policy_contract": policy["contract"],
+        "policy_source": policy["source"],
+        "model_contract": artifact.get("contract") or "unspecified",
+        "model_version": artifact.get("model_version"),
+        "reasons": list(input_issues),
+        "ood_features": [],
+        "standardized_features": {},
+        "maximum_absolute_standardized_value": 0.0,
+        "probability_bounds": list(policy["probability_bounds"]),
+    }
+    if input_issues:
+        return {
+            "contract": INFERENCE_CONTRACT,
+            "state": "abstained",
+            "probability": None,
+            "diagnostics": diagnostics,
+        }
+
+    standardized: List[float] = []
+    profiles = model.get("feature_profiles") or {}
+    for index, feature in enumerate(FEATURES):
+        value = raw_values[index]
+        lower, upper = policy["feature_bounds"][feature]
+        scale = max(1e-12, float(standard_deviations[index]))
+        standardized_value = (value - float(means[index])) / scale
+        diagnostics["standardized_features"][feature] = round(
+            standardized_value,
+            6,
         )
-    return round(_sigmoid(score), 6)
+        diagnostics["maximum_absolute_standardized_value"] = max(
+            diagnostics["maximum_absolute_standardized_value"],
+            abs(standardized_value),
+        )
+        feature_reasons: List[str] = []
+        if value < float(lower) or value > float(upper):
+            feature_reasons.append("outside_contract_bounds")
+        if abs(standardized_value) > float(
+            policy["maximum_absolute_standardized_value"]
+        ):
+            feature_reasons.append("standardized_distance_exceeded")
+        profile = profiles.get(feature) or {}
+        if profile:
+            support_margin = (
+                float(policy["support_margin_standard_deviations"]) * scale
+            )
+            support_lower = float(profile["minimum"]) - support_margin
+            support_upper = float(profile["maximum"]) + support_margin
+            if value < support_lower or value > support_upper:
+                feature_reasons.append("outside_training_support")
+        if feature_reasons:
+            diagnostics["ood_features"].append({
+                "feature": feature,
+                "value": round(value, 12),
+                "standardized_value": round(standardized_value, 6),
+                "reasons": feature_reasons,
+            })
+        standardized.append(max(
+            -float(policy["maximum_absolute_standardized_value"]),
+            min(
+                float(policy["maximum_absolute_standardized_value"]),
+                standardized_value,
+            ),
+        ))
+
+    diagnostics["maximum_absolute_standardized_value"] = round(
+        diagnostics["maximum_absolute_standardized_value"],
+        6,
+    )
+    if diagnostics["ood_features"]:
+        diagnostics["reasons"].append("out_of_distribution")
+        return {
+            "contract": INFERENCE_CONTRACT,
+            "state": "abstained",
+            "probability": None,
+            "diagnostics": diagnostics,
+        }
+
+    score = float(model["intercept"]) + sum(
+        float(coefficient) * value
+        for coefficient, value in zip(coefficients, standardized)
+    )
+    raw_probability = _sigmoid(score)
+    probability_lower, probability_upper = policy["probability_bounds"]
+    bounded_probability = min(
+        float(probability_upper),
+        max(float(probability_lower), raw_probability),
+    )
+    diagnostics.update({
+        "raw_probability": round(raw_probability, 12),
+        "probability_was_bounded": not math.isclose(
+            raw_probability,
+            bounded_probability,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ),
+    })
+    return {
+        "contract": INFERENCE_CONTRACT,
+        "state": "predicted",
+        "probability": round(bounded_probability, 6),
+        "diagnostics": diagnostics,
+    }
+
+
+def predict_probability(
+    artifact: Dict[str, Any],
+    features: Dict[str, Any] | Sequence[float],
+) -> float:
+    decision = predict_trend_snapshot(artifact, features)
+    if decision["state"] != "predicted":
+        reasons = ",".join(decision["diagnostics"]["reasons"])
+        raise ValueError(f"predictor abstained: {reasons}")
+    return float(decision["probability"])
+
+
+def _promotion_gate(
+    cross_validation: Dict[str, Any],
+    *,
+    labels: int,
+    positives: int,
+    negatives: int,
+    minimum_labels: int,
+    minimum_positive_labels: int,
+) -> Dict[str, Any]:
+    checks = {
+        "minimum_labels": labels >= minimum_labels,
+        "minimum_class_labels": (
+            positives >= minimum_positive_labels
+            and negatives >= minimum_positive_labels
+        ),
+        "validation_method": (
+            cross_validation.get("method") == "purged_grouped_walk_forward"
+        ),
+        "minimum_walk_forward_folds": (
+            int(cross_validation.get("folds") or 0)
+            >= MINIMUM_WALK_FORWARD_FOLDS
+        ),
+        "chronological_order": bool(
+            cross_validation.get("chronological_order_passed")
+        ),
+        "group_isolation": bool(
+            cross_validation.get("group_isolation_passed")
+        ),
+        "label_embargo": bool(cross_validation.get("label_embargo_passed")),
+        "inference_coverage": (
+            float(cross_validation.get("prediction_coverage") or 0.0)
+            >= MINIMUM_INFERENCE_COVERAGE
+        ),
+        "positive_brier_skill": (
+            cross_validation.get("brier_skill_score") is not None
+            and float(cross_validation["brier_skill_score"]) > 0.05
+        ),
+        "minimum_roc_auc": (
+            cross_validation.get("roc_auc") is not None
+            and float(cross_validation["roc_auc"]) >= 0.65
+        ),
+    }
+    return {
+        "contract": PROMOTION_GATE_CONTRACT,
+        "passed": all(checks.values()),
+        "checks": checks,
+        "failure_reasons": [
+            name for name, passed in checks.items() if not passed
+        ],
+        "thresholds": {
+            "minimum_walk_forward_folds": MINIMUM_WALK_FORWARD_FOLDS,
+            "minimum_inference_coverage": MINIMUM_INFERENCE_COVERAGE,
+            "minimum_brier_skill_score_exclusive": 0.05,
+            "minimum_roc_auc": 0.65,
+        },
+    }
+
+
+def _safe_v2_artifact(artifact: Dict[str, Any]) -> bool:
+    gate = artifact.get("promotion_gate") or {}
+    validation = artifact.get("cross_validation") or {}
+    policy = artifact.get("inference_policy") or {}
+    checks = gate.get("checks") or {}
+    fold_receipts = [
+        receipt for receipt in validation.get("fold_receipts") or []
+        if receipt.get("state") == "measured"
+    ]
+    return bool(
+        artifact.get("contract") == MODEL_CONTRACT
+        and int(artifact.get("schema_version") or 0) == 2
+        and artifact.get("model_family") == MODEL_FAMILY
+        and artifact.get("status") == "promoted"
+        and gate.get("contract") == PROMOTION_GATE_CONTRACT
+        and gate.get("passed") is True
+        and checks
+        and all(value is True for value in checks.values())
+        and validation.get("method") == "purged_grouped_walk_forward"
+        and validation.get("state") == "measured"
+        and len(fold_receipts) >= MINIMUM_WALK_FORWARD_FOLDS
+        and all(receipt.get("group_overlap_count") == 0 for receipt in fold_receipts)
+        and all(receipt.get("chronological_order_passed") is True for receipt in fold_receipts)
+        and all(receipt.get("label_embargo_passed") is True for receipt in fold_receipts)
+        and policy.get("contract") == INFERENCE_POLICY_CONTRACT
+        and artifact.get("model")
+    )
+
+
+def _activation_safety(artifact: Dict[str, Any]) -> str:
+    if artifact.get("contract") == MODEL_CONTRACT:
+        return "walk_forward_verified" if _safe_v2_artifact(artifact) else "not_activatable"
+    if artifact.get("contract") == LEGACY_MODEL_CONTRACT:
+        return "legacy_compatible_not_newly_promotable"
+    return "unsupported"
+
+
+def _inference_policy(model: Dict[str, Any] | None) -> Dict[str, Any]:
+    return {
+        "contract": INFERENCE_POLICY_CONTRACT,
+        "source": "artifact_v2",
+        "required_features": list(FEATURES),
+        "feature_bounds": {
+            feature: list(bounds) for feature, bounds in FEATURE_CLIPS.items()
+        },
+        "standardization": "training_mean_and_scale",
+        "maximum_absolute_standardized_value": MAXIMUM_STANDARDIZED_DISTANCE,
+        "support_margin_standard_deviations": SUPPORT_MARGIN_STANDARD_DEVIATIONS,
+        "out_of_distribution_action": "abstain",
+        "probability_bounds": list(PROBABILITY_BOUNDS),
+        "training_profile_present": bool(
+            model and model.get("feature_profiles")
+        ),
+    }
+
+
+def _resolved_inference_policy(artifact: Dict[str, Any]) -> Dict[str, Any]:
+    configured = artifact.get("inference_policy") or {}
+    if (
+        artifact.get("contract") == MODEL_CONTRACT
+        and configured.get("contract") == INFERENCE_POLICY_CONTRACT
+    ):
+        policy = dict(configured)
+        policy["source"] = "artifact_v2"
+        return policy
+    policy = _inference_policy(artifact.get("model") or {})
+    policy.update({
+        "source": "legacy_derived",
+        "support_margin_standard_deviations": 0.0,
+    })
+    return policy
+
+
+def _validated_feature_values(
+    features: Dict[str, Any] | Sequence[float],
+) -> Tuple[List[float], List[str]]:
+    values: List[float] = []
+    issues: List[str] = []
+    if not isinstance(features, dict) and len(features) != len(FEATURES):
+        return [], ["invalid_feature_count"]
+    for index, feature in enumerate(FEATURES):
+        if isinstance(features, dict) and feature not in features:
+            issues.append(f"missing_feature:{feature}")
+            values.append(0.0)
+            continue
+        try:
+            raw = features[feature] if isinstance(features, dict) else features[index]
+            value = float(raw)
+        except (IndexError, KeyError, TypeError, ValueError):
+            issues.append(f"invalid_feature:{feature}")
+            values.append(0.0)
+            continue
+        if not math.isfinite(value):
+            issues.append(f"non_finite_feature:{feature}")
+            value = 0.0
+        values.append(value)
+    return values, issues
+
+
+def _label_available_at(
+    predicted_at: datetime,
+    horizon: str,
+    outcome: Dict[str, Any],
+) -> datetime:
+    available_at = predicted_at + timedelta(hours=_horizon_hours(horizon))
+    follow_up_at = outcome.get("follow_up_at")
+    if follow_up_at:
+        try:
+            available_at = max(available_at, _as_utc(follow_up_at))
+        except (TypeError, ValueError):
+            pass
+    return available_at
+
+
+def _horizon_hours(horizon: str) -> float:
+    match = re.search(r"within_(\d+(?:\.\d+)?)h", horizon)
+    if match:
+        return max(0.0, float(match.group(1)))
+    return 6.0
+
+
+def _as_utc(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _maximum_timestamp(
+    rows: Sequence[Dict[str, Any]],
+    field: str,
+) -> str | None:
+    if not rows:
+        return None
+    return isoformat(max(_as_utc(row[field]) for row in rows))
 
 
 def _fit_logistic(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -345,9 +916,12 @@ def _fit_logistic(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     width = len(FEATURES)
     means = [sum(vector[index] for vector in vectors) / len(vectors) for index in range(width)]
     deviations = [
-        max(1e-9, math.sqrt(sum(
-            (vector[index] - means[index]) ** 2 for vector in vectors
-        ) / len(vectors)))
+        max(
+            1e-6 * (FEATURE_CLIPS[FEATURES[index]][1] - FEATURE_CLIPS[FEATURES[index]][0]),
+            math.sqrt(sum(
+                (vector[index] - means[index]) ** 2 for vector in vectors
+            ) / len(vectors)),
+        )
         for index in range(width)
     ]
     standardized = [
@@ -381,6 +955,15 @@ def _fit_logistic(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "features": list(FEATURES),
         "means": [round(value, 12) for value in means],
         "standard_deviations": [round(value, 12) for value in deviations],
+        "feature_profiles": {
+            feature: {
+                "minimum": round(min(vector[index] for vector in vectors), 12),
+                "maximum": round(max(vector[index] for vector in vectors), 12),
+                "mean": round(means[index], 12),
+                "standard_deviation": round(deviations[index], 12),
+            }
+            for index, feature in enumerate(FEATURES)
+        },
         "coefficients": [round(value, 12) for value in coefficients],
         "intercept": round(intercept, 12),
     }

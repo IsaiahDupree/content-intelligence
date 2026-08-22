@@ -10,6 +10,7 @@ from .collector import MarketTapeCollector
 from .config import MarketTapeConfig
 from .daemon import MarketTapeDaemon
 from .dataset import MarketTapeDatasetManager
+from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
 from .sources import build_sources
 from .sinks import SupabaseSink
@@ -30,6 +31,10 @@ def main() -> int:
     daemon = subparsers.add_parser("daemon")
     daemon.add_argument("--once", action="store_true")
     subparsers.add_parser("status")
+    intelligence = subparsers.add_parser("intelligence")
+    intelligence.add_argument("--limit", type=int, default=25)
+    intelligence.add_argument("--window-hours", type=int, default=168)
+    intelligence.add_argument("--min-videos", type=int, default=2)
     sync = subparsers.add_parser("sync")
     sync.add_argument("--force", action="store_true", help="Retry backed-off outbox rows immediately")
     sync.add_argument("--reconcile", action="store_true", help="Queue local records missing from the outbox")
@@ -93,6 +98,14 @@ def main() -> int:
         return 0
     if args.command == "status":
         return _print(store.status())
+    if args.command == "intelligence":
+        return _print(build_intelligence_snapshot(
+            config,
+            store,
+            limit=args.limit,
+            window_hours=args.window_hours,
+            minimum_videos=args.min_videos,
+        ))
     if args.command == "sync":
         reconciled = store.enqueue_missing_for_sync() if args.reconcile else 0
         if args.force:
