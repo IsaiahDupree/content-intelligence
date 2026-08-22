@@ -344,7 +344,10 @@ class TranscriptBank:
         platform_values = tuple(dict.fromkeys(value.lower() for value in platforms))
         marks = ",".join("?" for _ in platform_values)
         trend_values = tuple(dict.fromkeys(str(value) for value in trend_ids if str(value)))
+        filter_terms = tuple(topic_terms(topic))
         trend_clause = ""
+        topic_clause = ""
+        topic_parameters: tuple[str, ...] = ()
         if trend_values:
             trend_marks = ",".join("?" for _ in trend_values)
             trend_clause = f"""
@@ -354,6 +357,13 @@ class TranscriptBank:
                       AND target.trend_id IN ({trend_marks})
                 )
             """
+        elif filter_terms:
+            topic_marks = " OR ".join(
+                "LOWER(v.title || ' ' || v.caption || ' ' || v.description) LIKE ?"
+                for _ in filter_terms
+            )
+            topic_clause = f"AND ({topic_marks})"
+            topic_parameters = tuple(f"%{term}%" for term in filter_terms)
         query = f"""
             WITH latest AS (
                 SELECT o.*
@@ -372,16 +382,21 @@ class TranscriptBank:
             LEFT JOIN mt_transcript_artifacts artifact ON artifact.video_id=v.video_id
             WHERE v.platform IN ({marks}) AND artifact.video_id IS NULL
             {trend_clause}
+            {topic_clause}
             ORDER BY o.views DESC, o.relative_strength DESC
             LIMIT ?
         """
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 query,
-                (*platform_values, *trend_values, max(limit * 20, 500)),
+                (
+                    *platform_values,
+                    *trend_values,
+                    *topic_parameters,
+                    max(limit * 20, 500),
+                ),
             ).fetchall()
 
-        filter_terms = tuple(topic_terms(topic))
         candidates: list[Candidate] = []
         for row in rows:
             platform = str(row["platform"])

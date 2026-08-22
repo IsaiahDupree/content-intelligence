@@ -59,6 +59,68 @@ def test_youtube_backfill_accepts_twelve_minutes_but_not_longer(tmp_path):
     assert [candidate.external_id for candidate in candidates] == ["accepted-603"]
 
 
+def test_topic_backfill_prefilters_before_global_performance_ranking(tmp_path):
+    config = MarketTapeConfig(
+        db_path=tmp_path / "market.sqlite3",
+        object_dir=tmp_path / "objects",
+        heartbeat_path=tmp_path / "heartbeat.json",
+        lock_path=tmp_path / "market.lock",
+        platforms=["youtube"],
+        topics=["AI automation"],
+        supabase_sync_enabled=False,
+    )
+    store = MarketTapeStore(config)
+    store.start_run("topic-prefilter-run", "integration")
+    observed_at = datetime.now(timezone.utc)
+    for index in range(501):
+        store.ingest(
+            MarketContent(
+                platform="youtube",
+                external_id=f"unrelated-{index}",
+                creator_external_id=f"unrelated-creator-{index}",
+                published_at=observed_at - timedelta(days=1),
+                observed_at=observed_at,
+                source_id="topic-prefilter-integration",
+                metrics=MetricCounters(views=1_000_000 + index, likes=60_000),
+                title="A globally popular cooking demonstration",
+                description="Food, recipes, and kitchen technique.",
+                url=f"https://www.youtube.com/watch?v=unrelated-{index}",
+                duration_seconds=45,
+                raw_payload={"index": index},
+            ),
+            "topic-prefilter-run",
+        )
+    store.ingest(
+        MarketContent(
+            platform="youtube",
+            external_id="relevant-ai-automation",
+            creator_external_id="relevant-creator",
+            published_at=observed_at - timedelta(days=1),
+            observed_at=observed_at,
+            source_id="topic-prefilter-integration",
+            metrics=MetricCounters(views=25_000, likes=1_500, comments=100),
+            title="AI automation for the work you keep forgetting",
+            description="A practical AI automation demonstration.",
+            url="https://www.youtube.com/watch?v=relevant-ai-automation",
+            duration_seconds=70,
+            raw_payload={"relevant": True},
+        ),
+        "topic-prefilter-run",
+    )
+    store.finish_run("topic-prefilter-run")
+
+    bank = TranscriptBank(config.db_path, tmp_path / "transcript-bank")
+    candidates = bank.select_backfill_candidates(
+        topic="AI automation",
+        limit=1,
+        platforms=["youtube"],
+    )
+
+    assert [candidate.external_id for candidate in candidates] == [
+        "relevant-ai-automation"
+    ]
+
+
 def test_real_files_are_hash_bound_and_bad_script_claim_fails_closed(tmp_path):
     config = MarketTapeConfig(
         db_path=tmp_path / "market.sqlite3",
