@@ -2788,6 +2788,7 @@ class MarketTapeStore:
         max_saturation: float = 0.75,
         min_videos: int = 2,
         min_measured_videos: int = 2,
+        candidate_scan_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Rank specific, evidenced trends without conflating rank with probability."""
         active_model = load_active_model(self.config)
@@ -2799,6 +2800,14 @@ class MarketTapeStore:
             10000,
             max(1, int(min_measured_videos)),
         )
+        bounded_candidate_scan = min(
+            5000,
+            max(
+                500,
+                maximum * 20,
+                int(candidate_scan_limit or 0),
+            ),
+        )
         cutoff = isoformat(generated_at - timedelta(hours=24))
         generated = isoformat(generated_at)
         active_horizon = (
@@ -2806,6 +2815,8 @@ class MarketTapeStore:
             if active_model is not None
             else ""
         )
+        coarse_suppressed: Dict[str, int] = {}
+        coarse_candidates_considered = 0
         with self.connect() as connection:
             model_admission = _prospective_model_admission(
                 connection,
@@ -2818,29 +2829,84 @@ class MarketTapeStore:
                     2, self.config.prediction_min_positive_labels
                 ),
             )
+            coarse = dict(connection.execute(
+                """SELECT COUNT(*) AS candidates_considered,
+                          SUM(CASE WHEN observation.index_version != :index_version
+                              THEN 1 ELSE 0 END) AS stale_index_version,
+                          SUM(CASE WHEN observation.index_version = :index_version
+                                        AND lower(trend.trend_type) = 'format'
+                              THEN 1 ELSE 0 END) AS format_aggregate,
+                          SUM(CASE WHEN observation.index_version = :index_version
+                                        AND lower(trend.trend_type) != 'format'
+                                        AND lower(observation.state) NOT IN (
+                                            'discovering', 'emerging', 'breakout', 'recurring'
+                                        )
+                              THEN 1 ELSE 0 END) AS non_actionable_state,
+                          SUM(CASE WHEN observation.index_version = :index_version
+                                        AND lower(trend.trend_type) != 'format'
+                                        AND lower(observation.state) IN (
+                                            'discovering', 'emerging', 'breakout', 'recurring'
+                                        )
+                                        AND observation.saturation > :saturation
+                              THEN 1 ELSE 0 END) AS above_saturation_ceiling,
+                          SUM(CASE WHEN observation.index_version = :index_version
+                                        AND lower(trend.trend_type) != 'format'
+                                        AND lower(observation.state) IN (
+                                            'discovering', 'emerging', 'breakout', 'recurring'
+                                        )
+                                        AND observation.saturation <= :saturation
+                                        AND observation.videos_total < :min_videos
+                              THEN 1 ELSE 0 END) AS insufficient_video_evidence,
+                          SUM(CASE WHEN observation.index_version = :index_version
+                                        AND lower(trend.trend_type) != 'format'
+                                        AND lower(observation.state) IN (
+                                            'discovering', 'emerging', 'breakout', 'recurring'
+                                        )
+                                        AND observation.saturation <= :saturation
+                                        AND observation.videos_total >= :min_videos
+                                        AND observation.counter_delta_videos < :min_measured
+                              THEN 1 ELSE 0 END) AS insufficient_measured_activity,
+                          SUM(CASE WHEN observation.index_version = :index_version
+                                        AND lower(trend.trend_type) != 'format'
+                                        AND lower(observation.state) IN (
+                                            'discovering', 'emerging', 'breakout', 'recurring'
+                                        )
+                                        AND observation.saturation <= :saturation
+                                        AND observation.videos_total >= :min_videos
+                                        AND observation.counter_delta_videos >= :min_measured
+                              THEN 1 ELSE 0 END) AS coarse_eligible_candidates
+                   FROM mt_trends trend
+                   JOIN mt_trend_observations observation
+                     ON observation.trend_observation_id = (
+                         SELECT current.trend_observation_id
+                         FROM mt_trend_observations current
+                         WHERE current.trend_id = trend.trend_id
+                           AND current.observed_at >= :cutoff
+                         ORDER BY current.observed_at DESC,
+                                  current.trend_observation_id DESC
+                         LIMIT 1
+                     )""",
+                {
+                    "cutoff": cutoff,
+                    "index_version": TREND_INDEX_VERSION,
+                    "saturation": saturation_ceiling,
+                    "min_videos": minimum_videos,
+                    "min_measured": minimum_measured_videos,
+                },
+            ).fetchone())
+            coarse_candidates_considered = int(
+                coarse.pop("candidates_considered") or 0
+            )
+            coarse_eligible_candidates = int(
+                coarse.pop("coarse_eligible_candidates") or 0
+            )
+            coarse_suppressed = {
+                reason: int(count)
+                for reason, count in coarse.items()
+                if int(count or 0) > 0
+            }
             rows = [dict(row) for row in connection.execute(
-                """WITH ranked_predictions AS (
-                       SELECT prediction.*, ROW_NUMBER() OVER (
-                           PARTITION BY prediction.subject_id
-                           ORDER BY prediction.predicted_at DESC,
-                                    prediction.prediction_id DESC
-                       ) AS row_number
-                       FROM mt_predictions prediction
-                       WHERE prediction.subject_type = 'trend'
-                         AND prediction.model_version = ?
-                         AND prediction.horizon = ?
-                         AND prediction.predicted_at >= ?
-                         AND prediction.predicted_at <= ?
-                   ), ranked_observations AS (
-                       SELECT observation.*, ROW_NUMBER() OVER (
-                           PARTITION BY observation.trend_id
-                           ORDER BY observation.observed_at DESC,
-                                    observation.trend_observation_id DESC
-                       ) AS row_number
-                       FROM mt_trend_observations observation
-                       WHERE observation.observed_at >= ?
-                   )
-                   SELECT trend.trend_id, trend.trend_type, trend.canonical_key,
+                """SELECT trend.trend_id, trend.trend_type, trend.canonical_key,
                           trend.display_name, trend.first_seen_at, trend.last_seen_at,
                           observation.observed_at, observation.videos_total,
                           observation.videos_new_1h, observation.creators_total,
@@ -2863,27 +2929,60 @@ class MarketTapeStore:
                           prediction.probability, prediction.expected_peak_at,
                           prediction.expected_remaining_life_hours
                    FROM mt_trends trend
-                   JOIN ranked_observations observation
-                     ON observation.trend_id = trend.trend_id
-                    AND observation.row_number = 1
-                   LEFT JOIN ranked_predictions prediction
-                     ON prediction.subject_id = trend.trend_id
-                    AND prediction.row_number = 1
+                   JOIN mt_trend_observations observation
+                     ON observation.trend_observation_id = (
+                         SELECT current.trend_observation_id
+                         FROM mt_trend_observations current
+                         WHERE current.trend_id = trend.trend_id
+                           AND current.observed_at >= ?
+                         ORDER BY current.observed_at DESC,
+                                  current.trend_observation_id DESC
+                         LIMIT 1
+                     )
+                   LEFT JOIN mt_predictions prediction
+                     ON prediction.prediction_id = (
+                         SELECT current.prediction_id
+                         FROM mt_predictions current
+                         WHERE current.subject_type = 'trend'
+                           AND current.subject_id = trend.trend_id
+                           AND current.model_version = ?
+                           AND current.horizon = ?
+                           AND current.predicted_at >= ?
+                           AND current.predicted_at <= ?
+                         ORDER BY current.predicted_at DESC,
+                                  current.prediction_id DESC
+                         LIMIT 1
+                     )
+                   WHERE observation.index_version = ?
+                     AND lower(trend.trend_type) != 'format'
+                     AND lower(observation.state) IN (
+                         'discovering', 'emerging', 'breakout', 'recurring'
+                     )
+                     AND observation.saturation <= ?
+                     AND observation.videos_total >= ?
+                     AND observation.counter_delta_videos >= ?
                    ORDER BY observation.trend_strength DESC,
-                            prediction.probability DESC
-                   LIMIT 20000""",
+                            observation.videos_total DESC,
+                            observation.observed_at DESC,
+                            trend.trend_id ASC
+                   LIMIT ?""",
                 (
+                    cutoff,
                     str(active_model.get("model_version") or "")
                     if active_model is not None else "",
                     active_horizon,
                     cutoff,
                     generated,
-                    cutoff,
+                    TREND_INDEX_VERSION,
+                    saturation_ceiling,
+                    minimum_videos,
+                    minimum_measured_videos,
+                    bounded_candidate_scan,
                 ),
             ).fetchall()]
 
         candidates: List[Dict[str, Any]] = []
-        suppressed: Dict[str, int] = {}
+        suppressed: Dict[str, int] = dict(coarse_suppressed)
         purpose = model_purpose(active_model) if active_model is not None else "none"
         model_index_version = str(
             ((active_model or {}).get("training") or {}).get("index_version")
@@ -3206,6 +3305,7 @@ class MarketTapeStore:
                 "maximum_saturation": saturation_ceiling,
                 "minimum_videos": minimum_videos,
                 "minimum_measured_videos": minimum_measured_videos,
+                "candidate_scan_limit": bounded_candidate_scan,
                 "format_aggregates_excluded": True,
                 "generic_distribution_labels_excluded": True,
                 "generic_hook_phrases_excluded": True,
@@ -3216,7 +3316,38 @@ class MarketTapeStore:
                 "maximum_trend_type_share": 0.5,
                 "maximum_opportunity_class_share": 0.6,
             },
-            "candidates_considered": len(rows),
+            "candidates_considered": coarse_candidates_considered,
+            "coarse_eligible_candidates": coarse_eligible_candidates,
+            "candidate_rows_loaded": len(rows),
+            "candidate_scan_truncated": coarse_eligible_candidates > len(rows),
+            "candidate_preselection": {
+                "model_neutral": True,
+                "order": [
+                    "trend_strength_desc",
+                    "videos_total_desc",
+                    "observed_at_desc",
+                    "trend_id_asc",
+                ],
+                "maximum_loaded_trend_strength": (
+                    max(float(row["trend_strength"]) for row in rows)
+                    if rows else None
+                ),
+                "minimum_loaded_trend_strength": (
+                    min(float(row["trend_strength"]) for row in rows)
+                    if rows else None
+                ),
+                "first_loaded_trend_id": (
+                    str(rows[0]["trend_id"]) if rows else None
+                ),
+                "last_loaded_trend_id": (
+                    str(rows[-1]["trend_id"]) if rows else None
+                ),
+            },
+            "ranking_scope": (
+                "bounded_top_strength_candidates"
+                if coarse_eligible_candidates > len(rows)
+                else "all_coarse_eligible_candidates"
+            ),
             "eligible_candidates": len(candidates),
             "suppressed_by_reason": dict(sorted(suppressed.items())),
             "opportunities": selected,
