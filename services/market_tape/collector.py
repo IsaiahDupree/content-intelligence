@@ -464,34 +464,167 @@ class MarketTapeCollector:
         return receipts
 
     def _run_rechecks(self, run_id: str) -> List[Dict[str, Any]]:
-        due = self.store.due_polls(self.config.max_due_rechecks_per_cycle)
-        if not due:
-            return []
         sources = self._build_sources(run_id)
         source_map = {source.source_id: source for source in sources}
         receipts: List[Dict[str, Any]] = []
+        circuit_by_source: Dict[str, ProviderBatch | None] = {}
+        capable_source_ids: set[str] = set()
+        source_capability: List[Dict[str, Any]] = []
         try:
+            for source in sources:
+                circuit = self._circuit_open_batch(source)
+                circuit_by_source[source.source_id] = circuit
+                if source.platform not in self.config.platforms:
+                    capability_state = "platform_disabled"
+                elif isinstance(source, LocalResearchSource):
+                    # This adapter can replay a Safari-produced archive, but
+                    # ``refresh`` does not trigger a current provider read. It
+                    # therefore cannot guarantee an observation inside a
+                    # forecast's terminal scoring window and must not make the
+                    # coverage planner report a false refresh capability.
+                    capability_state = "archive_only_no_terminal_refresh"
+                elif source.request_budget <= 0:
+                    capability_state = "request_budget_exhausted"
+                elif source.metered and not self.config.allow_metered_reads:
+                    capability_state = "metered_reads_disabled"
+                elif not source.credentials_available():
+                    capability_state = "credentials_unavailable"
+                elif circuit is not None:
+                    capability_state = "source_circuit_open"
+                else:
+                    capability_state = "refresh_capable"
+                    capable_source_ids.add(source.source_id)
+                source_capability.append({
+                    "source_id": source.source_id,
+                    "platform": source.platform,
+                    "state": capability_state,
+                    "request_budget_remaining": max(0, int(source.request_budget)),
+                    "metered": bool(source.metered),
+                })
+
+            plan = self.store.due_poll_plan(
+                self.config.max_due_rechecks_per_cycle,
+                forecast_capable_platforms={
+                    source.platform
+                    for source in sources
+                    if source.source_id in capable_source_ids
+                },
+            )
+            due = plan["polls"]
+            queue_receipt = dict(plan["receipt"])
+            queue_receipt["source_capability"] = source_capability
+            degraded_planner_states = {
+                "no_refresh_capable_platform",
+                "no_refreshable_forecast_member",
+                "refresh_capability_gap",
+                "refresh_capability_and_cycle_capacity_gap",
+                "cycle_capacity_limited",
+            }
+            planner_now = utc_now()
+            planner_receipt = SourceReceipt(
+                run_id=run_id,
+                source_id="market-tape-recheck-planner",
+                platform="all",
+                state=(
+                    SourceState.DEGRADED
+                    if queue_receipt["coverage_state"] in degraded_planner_states
+                    else SourceState.READY
+                ),
+                started_at=planner_now,
+                finished_at=planner_now,
+                request_count=0,
+                discovered_count=0,
+                refreshed_count=0,
+                error_code=(
+                    str(queue_receipt["coverage_state"])
+                    if queue_receipt["coverage_state"] in degraded_planner_states
+                    else ""
+                ),
+                error_detail=(
+                    "Active-model forecast coverage could not be fully queued"
+                    if queue_receipt["coverage_state"] in degraded_planner_states
+                    else ""
+                ),
+                metadata={"recheck_plan": queue_receipt},
+            )
+            self.store.save_receipt(planner_receipt)
+            receipts.append(planner_receipt.to_dict())
+            if not due:
+                return receipts
+
             for platform, rows in due.items():
-                grouped: Dict[str, List[Dict[str, Any]]] = {}
+                grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
                 for row in rows:
-                    grouped.setdefault(str(row["preferred_source_id"]), []).append(row)
-                for source_id, tracked in grouped.items():
+                    lane = (
+                        "forecast_terminal"
+                        if row.get("recheck_reason")
+                        == "active_model_forecast_terminal_coverage"
+                        else "scheduled"
+                    )
+                    grouped.setdefault(
+                        (str(row["preferred_source_id"]), lane),
+                        [],
+                    ).append(row)
+                for (source_id, lane), tracked in grouped.items():
+                    requires_terminal_refresh = lane == "forecast_terminal"
                     source = source_map.get(source_id)
                     if source is None:
                         candidates = [candidate for candidate in sources if candidate.platform == platform]
-                        source = next((candidate for candidate in candidates if candidate.credentials_available()), candidates[0] if candidates else None)
-                    if source is None:
-                        self.store.mark_poll_failure((row["video_id"] for row in tracked), "source_unavailable")
-                        continue
-                    circuit_batch = self._circuit_open_batch(source)
-                    if circuit_batch is not None:
-                        alternatives = [
-                            candidate for candidate in sources
+                        source = (
+                            next((
+                                candidate
+                                for candidate in candidates
+                                if candidate.source_id in capable_source_ids
+                            ), None)
+                            if requires_terminal_refresh
+                            else next(
+                                (
+                                    candidate
+                                    for candidate in candidates
+                                    if candidate.credentials_available()
+                                ),
+                                candidates[0] if candidates else None,
+                            )
+                        )
+                    if (
+                        requires_terminal_refresh
+                        and (
+                            source is None
+                            or source.source_id not in capable_source_ids
+                        )
+                    ):
+                        alternative = next((
+                            candidate
+                            for candidate in sources
                             if candidate.platform == platform
+                            and candidate.source_id in capable_source_ids
+                        ), None)
+                        source = alternative
+                    if source is None:
+                        self.store.mark_poll_failure(
+                            (row["video_id"] for row in tracked),
+                            (
+                                "forecast_refresh_capability_unavailable"
+                                if requires_terminal_refresh
+                                else "source_unavailable"
+                            ),
+                        )
+                        continue
+                    circuit_batch = circuit_by_source.get(source.source_id)
+                    if circuit_batch is not None:
+                        alternatives = [candidate for candidate in sources if (
+                            candidate.platform == platform
                             and candidate.source_id != source.source_id
-                            and candidate.credentials_available()
-                            and self._circuit_open_batch(candidate) is None
-                        ]
+                            and (
+                                candidate.source_id in capable_source_ids
+                                if requires_terminal_refresh
+                                else (
+                                    candidate.credentials_available()
+                                    and circuit_by_source.get(candidate.source_id)
+                                    is None
+                                )
+                            )
+                        )]
                         if alternatives:
                             source = alternatives[0]
                             circuit_batch = None
@@ -499,10 +632,17 @@ class MarketTapeCollector:
                         self.store.mark_poll_failure(
                             (row["video_id"] for row in tracked), "source_circuit_open"
                         )
+                        circuit_batch.receipt.metadata["recheck_queue"] = (
+                            _recheck_batch_receipt(tracked, source.source_id)
+                        )
                         self._persist_batch(circuit_batch, run_id)
                         receipts.append(circuit_batch.receipt.to_dict())
                         continue
                     batch = source.refresh(tracked)
+                    batch.receipt.metadata["recheck_queue"] = _recheck_batch_receipt(
+                        tracked,
+                        source.source_id,
+                    )
                     returned = {item.video_id for item in batch.items}
                     tracked_ids = {str(row["video_id"]) for row in tracked}
                     missing = sorted(tracked_ids - returned)
@@ -781,6 +921,62 @@ class MarketTapeCollector:
         temporary = self.config.heartbeat_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(self.config.heartbeat_path)
+
+
+def _recheck_batch_receipt(
+    tracked: Sequence[Dict[str, Any]],
+    selected_source_id: str,
+) -> Dict[str, Any]:
+    assignments: List[Dict[str, Any]] = []
+    reason_counts: Dict[str, int] = {}
+    prediction_ids: set[int] = set()
+    trend_ids: set[str] = set()
+    deadlines: set[str] = set()
+    for row in tracked:
+        reason = str(row.get("recheck_reason") or "scheduled_poll_due")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        coverage = row.get("forecast_coverage") or []
+        assignment_prediction_ids = sorted({
+            int(obligation["prediction_id"]) for obligation in coverage
+        })
+        assignment_trend_ids = sorted({
+            str(obligation["trend_id"]) for obligation in coverage
+        })
+        assignment_deadlines = sorted({
+            str(obligation["coverage_deadline_at"]) for obligation in coverage
+        })
+        prediction_ids.update(assignment_prediction_ids)
+        trend_ids.update(assignment_trend_ids)
+        deadlines.update(assignment_deadlines)
+        assignments.append({
+            "video_id": str(row.get("video_id") or ""),
+            "platform": str(row.get("platform") or ""),
+            "preferred_source_id": str(row.get("preferred_source_id") or ""),
+            "selected_source_id": selected_source_id,
+            "scheduled_due_at": str(row.get("due_at") or ""),
+            "recheck_reason": reason,
+            "coverage_prediction_ids": assignment_prediction_ids,
+            "coverage_trend_ids": assignment_trend_ids,
+            "coverage_deadlines": assignment_deadlines,
+        })
+    canonical = json.dumps(
+        assignments,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "contract": "market_tape_recheck_batch_receipt_v1",
+        "selected_source_id": selected_source_id,
+        "tracked_count": len(tracked),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "coverage_prediction_count": len(prediction_ids),
+        "coverage_trend_count": len(trend_ids),
+        "coverage_prediction_ids": sorted(prediction_ids),
+        "coverage_trend_ids": sorted(trend_ids),
+        "coverage_deadlines": sorted(deadlines),
+        "assignments": assignments,
+        "assignments_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
 
 
 def _file_sha256(path: Path) -> str:

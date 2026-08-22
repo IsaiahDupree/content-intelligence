@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import heapq
 import json
 import math
 import re
@@ -1367,13 +1368,77 @@ class MarketTapeStore:
             )
         return len(ids)
 
-    def due_polls(self, limit: int) -> Dict[str, List[Dict[str, Any]]]:
+    def due_polls(
+        self,
+        limit: int,
+        *,
+        as_of: Optional[datetime] = None,
+        forecast_capable_platforms: Optional[Iterable[str]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return the bounded refresh queue while retaining the legacy shape.
+
+        ``due_poll_plan`` owns the auditable selection contract.  This wrapper
+        keeps existing callers source-compatible while ensuring forecast
+        terminal-coverage work receives the same priority everywhere.
+        """
+
+        return self.due_poll_plan(
+            limit,
+            as_of=as_of,
+            forecast_capable_platforms=forecast_capable_platforms,
+        )["polls"]
+
+    def due_poll_plan(
+        self,
+        limit: int,
+        *,
+        as_of: Optional[datetime] = None,
+        forecast_capable_platforms: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """Plan rechecks needed to preserve prospective forecast labels.
+
+        A trend forecast is only scorable when a measured trend observation
+        lands in the final 30 minutes of its horizon.  Normal age-based polling
+        can schedule every member past that narrow window.  The planner therefore
+        admits one real member refresh for each uncovered exact-active-model trend
+        when that window is open, even if its ordinary ``due_at`` is later.
+
+        Forecast work remains inside the existing per-cycle limit.  Candidate
+        rows are restricted to platforms for which the collector reports a
+        refresh-capable source; provider request ceilings are still enforced by
+        those source instances.  One video may cover several trend forecasts, so
+        a deterministic greedy set cover minimizes provider work without
+        fabricating observations or changing outcome semantics.
+        """
+
         maximum = max(1, int(limit))
+        selected_at = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
+        selected_at_iso = isoformat(selected_at)
+        if forecast_capable_platforms is None:
+            capable_platforms = sorted({
+                str(platform).strip().casefold()
+                for platform in self.config.platforms
+                if str(platform).strip()
+            })
+        else:
+            capable_platforms = sorted({
+                str(platform).strip().casefold()
+                for platform in forecast_capable_platforms
+                if str(platform).strip()
+            })
+
+        active_model = load_active_model(self.config)
+        coverage_obligations: List[Dict[str, Any]] = []
+        coverage_candidates: List[Dict[str, Any]] = []
+        active_model_version = ""
+        active_horizon = ""
         with self.connect() as connection:
-            rows = connection.execute(
+            normal_rows = [dict(row) for row in connection.execute(
                 """WITH ranked AS (
                        SELECT q.video_id, q.platform, q.external_id,
                               q.preferred_source_id, q.hot_mode, q.due_at,
+                              q.failure_count, q.last_observed_at,
+                              q.last_error_code,
                               v.published_at, v.title, v.caption, v.description,
                               v.language, v.url, v.thumbnail_url,
                               v.duration_seconds,
@@ -1382,7 +1447,8 @@ class MarketTapeStore:
                               c.display_name AS creator_name,
                               c.followers AS creator_followers,
                               ROW_NUMBER() OVER (
-                                  PARTITION BY q.platform ORDER BY q.due_at, q.video_id
+                                  PARTITION BY q.platform
+                                  ORDER BY q.due_at, q.failure_count, q.video_id
                               ) AS platform_rank
                        FROM mt_poll_queue q
                        JOIN mt_videos v ON v.video_id = q.video_id
@@ -1392,35 +1458,270 @@ class MarketTapeStore:
                    SELECT * FROM ranked
                    WHERE platform_rank <= ?
                    ORDER BY due_at, platform, video_id""",
-                (isoformat(utc_now()), maximum),
-            ).fetchall()
-        available: Dict[str, List[Dict[str, Any]]] = {}
-        for row in rows:
+                (selected_at_iso, maximum),
+            ).fetchall()]
+            for row in normal_rows:
+                row.pop("platform_rank", None)
+
+            if active_model is not None:
+                active_model_version = str(active_model["model_version"])
+                active_horizon = model_prediction_horizon(active_model)
+                horizon_seconds = max(
+                    0.0,
+                    _prediction_horizon_hours(active_horizon) * 3600.0,
+                )
+                tolerance_seconds = min(
+                    horizon_seconds,
+                    TREND_OUTCOME_COVERAGE_TOLERANCE.total_seconds(),
+                )
+                lower_prediction_at = isoformat(
+                    selected_at - timedelta(seconds=horizon_seconds)
+                )
+                upper_prediction_at = isoformat(
+                    selected_at
+                    - timedelta(seconds=max(0.0, horizon_seconds - tolerance_seconds))
+                )
+                coverage_params: Tuple[Any, ...] = (
+                    active_model_version,
+                    active_horizon,
+                    lower_prediction_at,
+                    upper_prediction_at,
+                    (horizon_seconds - tolerance_seconds) / 86400.0,
+                    horizon_seconds / 86400.0,
+                )
+                prediction_rows = connection.execute(
+                    """SELECT prediction_id, subject_id AS trend_id,
+                              predicted_at, model_version, horizon
+                       FROM mt_predictions prediction
+                       WHERE subject_type = 'trend'
+                         AND model_version = ?
+                         AND horizon = ?
+                         AND outcome_json IS NULL
+                         AND julianday(predicted_at) > julianday(?)
+                         AND julianday(predicted_at) <= julianday(?)
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_trend_observations observation
+                             WHERE observation.trend_id = prediction.subject_id
+                               AND julianday(observation.observed_at)
+                                   > julianday(prediction.predicted_at)
+                               AND julianday(observation.observed_at)
+                                   >= julianday(prediction.predicted_at) + ?
+                               AND julianday(observation.observed_at)
+                                   <= julianday(prediction.predicted_at) + ?
+                         )
+                       ORDER BY predicted_at, prediction_id""",
+                    coverage_params,
+                ).fetchall()
+                for raw in prediction_rows:
+                    row = dict(raw)
+                    predicted_at = _as_datetime(row["predicted_at"])
+                    target_at = predicted_at + timedelta(seconds=horizon_seconds)
+                    coverage_obligations.append({
+                        "prediction_id": int(row["prediction_id"]),
+                        "trend_id": str(row["trend_id"]),
+                        "model_version": str(row["model_version"]),
+                        "horizon": str(row["horizon"]),
+                        "predicted_at": isoformat(predicted_at),
+                        "coverage_window_open_at": isoformat(
+                            target_at - timedelta(seconds=tolerance_seconds)
+                        ),
+                        "coverage_deadline_at": isoformat(target_at),
+                    })
+
+                if coverage_obligations and capable_platforms:
+                    placeholders = ",".join("?" for _ in capable_platforms)
+                    coverage_candidates = [dict(row) for row in connection.execute(
+                        f"""WITH coverage_predictions AS (
+                               SELECT DISTINCT subject_id AS trend_id
+                               FROM mt_predictions prediction
+                               WHERE subject_type = 'trend'
+                                 AND model_version = ?
+                                 AND horizon = ?
+                                 AND outcome_json IS NULL
+                                 AND julianday(predicted_at) > julianday(?)
+                                 AND julianday(predicted_at) <= julianday(?)
+                                 AND NOT EXISTS (
+                                     SELECT 1
+                                     FROM mt_trend_observations observation
+                                     WHERE observation.trend_id = prediction.subject_id
+                                       AND julianday(observation.observed_at)
+                                           > julianday(prediction.predicted_at)
+                                       AND julianday(observation.observed_at)
+                                           >= julianday(prediction.predicted_at) + ?
+                                       AND julianday(observation.observed_at)
+                                           <= julianday(prediction.predicted_at) + ?
+                                 )
+                           )
+                           SELECT membership.trend_id,
+                                  q.video_id, q.platform, q.external_id,
+                                  q.preferred_source_id, q.hot_mode, q.due_at,
+                                  q.failure_count, q.last_observed_at,
+                                  q.last_error_code,
+                                  v.published_at, v.title, v.caption,
+                                  v.description, v.language, v.url,
+                                  v.thumbnail_url, v.duration_seconds,
+                                  c.external_id AS creator_external_id,
+                                  c.handle AS creator_handle,
+                                  c.display_name AS creator_name,
+                                  c.followers AS creator_followers
+                           FROM coverage_predictions forecast
+                           JOIN mt_trend_memberships membership
+                             ON membership.trend_id = forecast.trend_id
+                           JOIN mt_poll_queue q
+                             ON q.video_id = membership.video_id
+                           JOIN mt_videos v ON v.video_id = q.video_id
+                           JOIN mt_creators c ON c.creator_id = v.creator_id
+                           WHERE q.platform IN ({placeholders})
+                           ORDER BY q.failure_count,
+                                    CASE WHEN q.due_at <= ? THEN 0 ELSE 1 END,
+                                    q.due_at, q.video_id, membership.trend_id""",
+                        (
+                            *coverage_params,
+                            *capable_platforms,
+                            selected_at_iso,
+                        ),
+                    ).fetchall()]
+
+        obligations_by_trend: Dict[str, List[Dict[str, Any]]] = {}
+        for obligation in coverage_obligations:
+            obligations_by_trend.setdefault(
+                str(obligation["trend_id"]), []
+            ).append(obligation)
+        forecast_rows, covered_trend_ids = _select_forecast_rechecks(
+            coverage_candidates,
+            obligations_by_trend,
+            maximum,
+            selected_at_iso,
+        )
+        selected: List[Dict[str, Any]] = list(forecast_rows)
+        selected_video_ids = {str(row["video_id"]) for row in selected}
+
+        normal_by_platform: Dict[str, List[Dict[str, Any]]] = {}
+        for row in normal_rows:
+            if str(row["video_id"]) in selected_video_ids:
+                continue
             payload = dict(row)
-            payload.pop("platform_rank", None)
-            available.setdefault(str(row["platform"]), []).append(payload)
-        selected: List[Dict[str, Any]] = []
+            payload.update({
+                "queue_contract": "market_tape_recheck_queue_v2",
+                "queue_selected_at": selected_at_iso,
+                "recheck_priority": 1,
+                "recheck_reason": "scheduled_poll_due",
+                "forecast_coverage": [],
+            })
+            normal_by_platform.setdefault(str(row["platform"]), []).append(
+                payload
+            )
         platforms = sorted(
-            available,
+            normal_by_platform,
             key=lambda platform: (
-                str(available[platform][0]["due_at"]),
+                str(normal_by_platform[platform][0]["due_at"]),
                 platform,
             ),
         )
         while len(selected) < maximum:
             advanced = False
             for platform in platforms:
-                if available[platform]:
-                    selected.append(available[platform].pop(0))
+                if normal_by_platform[platform]:
+                    selected.append(normal_by_platform[platform].pop(0))
                     advanced = True
                     if len(selected) >= maximum:
                         break
             if not advanced:
                 break
+
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for row in selected:
             grouped.setdefault(str(row["platform"]), []).append(row)
-        return grouped
+
+        selected_obligations = [
+            obligation
+            for row in forecast_rows
+            for obligation in row.get("forecast_coverage", [])
+        ]
+        due_prediction_ids = {
+            int(obligation["prediction_id"])
+            for obligation in coverage_obligations
+        }
+        selected_prediction_ids = {
+            int(obligation["prediction_id"])
+            for obligation in selected_obligations
+        }
+        candidate_trend_ids = {
+            str(row["trend_id"]) for row in coverage_candidates
+        }
+        due_trend_ids = set(obligations_by_trend)
+        selected_assignments = [_poll_assignment_receipt(row) for row in selected]
+        if active_model is None:
+            coverage_state = "no_active_model"
+        elif not coverage_obligations:
+            coverage_state = "no_open_coverage_window"
+        elif not capable_platforms:
+            coverage_state = "no_refresh_capable_platform"
+        elif not candidate_trend_ids:
+            coverage_state = "no_refreshable_forecast_member"
+        elif (
+            due_trend_ids - candidate_trend_ids
+            and (due_trend_ids & candidate_trend_ids) - covered_trend_ids
+        ):
+            coverage_state = "refresh_capability_and_cycle_capacity_gap"
+        elif due_trend_ids - candidate_trend_ids:
+            coverage_state = "refresh_capability_gap"
+        elif selected_prediction_ids != due_prediction_ids:
+            coverage_state = "cycle_capacity_limited"
+        else:
+            coverage_state = "queued"
+        receipt = {
+            "contract": "market_tape_forecast_recheck_plan_v1",
+            "selected_at": selected_at_iso,
+            "queue_limit": maximum,
+            "selection_policy": (
+                "active_model_terminal_coverage_set_cover_then_platform_fair_due"
+            ),
+            "deduplication_key": "video_id",
+            "provider_budget_policy": (
+                "selection_never_exceeds_cycle_limit_and_sources_enforce_remaining_budget"
+            ),
+            "selected_total": len(selected),
+            "selected_forecast_coverage": len(forecast_rows),
+            "selected_scheduled_due": len(selected) - len(forecast_rows),
+            "normal_due_candidates_loaded": len(normal_rows),
+            "forecast_capable_platforms": capable_platforms,
+            "active_model_version": active_model_version,
+            "active_horizon": active_horizon,
+            "coverage_state": coverage_state,
+            "coverage_predictions_due": len(due_prediction_ids),
+            "coverage_trends_due": len(due_trend_ids),
+            "coverage_candidate_videos": len({
+                str(row["video_id"]) for row in coverage_candidates
+            }),
+            "coverage_candidate_trends": len(candidate_trend_ids),
+            "coverage_predictions_selected": len(selected_prediction_ids),
+            "coverage_trends_selected": len(covered_trend_ids),
+            "coverage_predictions_unselected": len(
+                due_prediction_ids - selected_prediction_ids
+            ),
+            "coverage_trends_without_refreshable_member": len(
+                due_trend_ids - candidate_trend_ids
+            ),
+            "coverage_trends_unselected_for_capacity": len(
+                (due_trend_ids & candidate_trend_ids) - covered_trend_ids
+            ),
+            "sampling_window": {
+                "terminal_tolerance_seconds": round(
+                    TREND_OUTCOME_COVERAGE_TOLERANCE.total_seconds(), 3
+                ),
+                "closes_at_forecast_target": True,
+                "post_target_refresh_does_not_create_a_label": True,
+            },
+            "selected_assignments": selected_assignments,
+            "selection_sha256": stable_hash(selected_assignments),
+        }
+        return {
+            "contract": "market_tape_recheck_plan_v1",
+            "polls": grouped,
+            "receipt": receipt,
+        }
 
     def remaining_request_budget(self, source_id: str, daily_limit: int) -> int:
         with self.connect() as connection:
@@ -4010,6 +4311,108 @@ def _prediction_key(payload: Dict[str, Any]) -> str:
         "predicted_at": payload["predicted_at"],
         "horizon": payload["horizon"],
     })
+
+
+def _select_forecast_rechecks(
+    candidate_rows: Sequence[Dict[str, Any]],
+    obligations_by_trend: Dict[str, List[Dict[str, Any]]],
+    limit: int,
+    selected_at: str,
+) -> Tuple[List[Dict[str, Any]], set[str]]:
+    """Choose a deterministic minimum-work cover for open forecast windows."""
+
+    row_by_video: Dict[str, Dict[str, Any]] = {}
+    trends_by_video: Dict[str, set[str]] = {}
+    for raw in candidate_rows:
+        video_id = str(raw.get("video_id") or "")
+        trend_id = str(raw.get("trend_id") or "")
+        if not video_id or trend_id not in obligations_by_trend:
+            continue
+        payload = dict(raw)
+        payload.pop("trend_id", None)
+        row_by_video.setdefault(video_id, payload)
+        trends_by_video.setdefault(video_id, set()).add(trend_id)
+
+    uncovered = set(obligations_by_trend)
+    heap: List[Tuple[int, int, int, str, str]] = []
+    for video_id, trend_ids in trends_by_video.items():
+        row = row_by_video[video_id]
+        gain = sum(len(obligations_by_trend[trend_id]) for trend_id in trend_ids)
+        scheduled_due = 0 if str(row.get("due_at") or "") <= selected_at else 1
+        heapq.heappush(heap, (
+            -gain,
+            scheduled_due,
+            max(0, int(row.get("failure_count") or 0)),
+            str(row.get("due_at") or ""),
+            video_id,
+        ))
+
+    selected: List[Dict[str, Any]] = []
+    covered: set[str] = set()
+    maximum = max(0, int(limit))
+    while heap and uncovered and len(selected) < maximum:
+        negative_gain, scheduled_due, failures, due_at, video_id = heapq.heappop(
+            heap
+        )
+        newly_covered = trends_by_video[video_id] & uncovered
+        current_gain = sum(
+            len(obligations_by_trend[trend_id])
+            for trend_id in newly_covered
+        )
+        if current_gain <= 0:
+            continue
+        if current_gain != -negative_gain:
+            heapq.heappush(heap, (
+                -current_gain,
+                scheduled_due,
+                failures,
+                due_at,
+                video_id,
+            ))
+            continue
+        obligations = sorted(
+            (
+                obligation
+                for trend_id in newly_covered
+                for obligation in obligations_by_trend[trend_id]
+            ),
+            key=lambda obligation: (
+                str(obligation["coverage_deadline_at"]),
+                int(obligation["prediction_id"]),
+            ),
+        )
+        payload = dict(row_by_video[video_id])
+        payload.update({
+            "queue_contract": "market_tape_recheck_queue_v2",
+            "queue_selected_at": selected_at,
+            "recheck_priority": 0,
+            "recheck_reason": "active_model_forecast_terminal_coverage",
+            "forecast_coverage": obligations,
+        })
+        selected.append(payload)
+        uncovered.difference_update(newly_covered)
+        covered.update(newly_covered)
+    return selected, covered
+
+
+def _poll_assignment_receipt(row: Dict[str, Any]) -> Dict[str, Any]:
+    coverage = row.get("forecast_coverage") or []
+    return {
+        "video_id": str(row.get("video_id") or ""),
+        "platform": str(row.get("platform") or ""),
+        "preferred_source_id": str(row.get("preferred_source_id") or ""),
+        "scheduled_due_at": str(row.get("due_at") or ""),
+        "recheck_reason": str(row.get("recheck_reason") or "scheduled_poll_due"),
+        "coverage_prediction_ids": [
+            int(obligation["prediction_id"]) for obligation in coverage
+        ],
+        "coverage_trend_ids": sorted({
+            str(obligation["trend_id"]) for obligation in coverage
+        }),
+        "coverage_deadlines": sorted({
+            str(obligation["coverage_deadline_at"]) for obligation in coverage
+        }),
+    }
 
 
 def _grouped_rows(
