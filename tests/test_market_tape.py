@@ -112,10 +112,20 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
             return
         self._json({"error": "not found"}, status=404)
 
+    outage = False  # when True, every POST answers like a PostgREST schema-cache 503
+
     def do_POST(self):  # noqa: N802 - HTTP handler contract
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length) or b"[]")
         self.__class__.received_posts.append({"path": urlparse(self.path).path, "body": body})
+        if self.__class__.outage:
+            payload = json.dumps({"code": "PGRST002", "message": "Could not query the database for the schema cache. Retrying."}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if isinstance(body, dict) and body.get("read_only") is True:
             if "row_count" in body.get("query", ""):
                 self._json([
@@ -1769,3 +1779,87 @@ def _keyword_signal(keyword, score, confidence, video_ids):
         "creators_total": len(video_ids),
         "examples": [{"video_id": video_id} for video_id in video_ids],
     }
+
+
+def test_calibration_is_recorded_after_horizons_close(market_config):
+    """MT-009: outcomes and calibration metrics are recorded, not only computed."""
+    store = MarketTapeStore(market_config)
+    store.start_run("run-1", "full")
+    observed = datetime.now(timezone.utc) - timedelta(hours=30)
+    store.ingest(_content(observed, views=100), "run-1")
+    store.ingest(_content(observed + timedelta(minutes=5), views=250), "run-1")
+    store.aggregate_trends(run_id="run-1")
+    assert store.create_predictions("run-1") > 0
+    # Write scored outcomes directly (the evaluator needs future tape; the
+    # contract under test is persistence of calibration, not labeling).
+    with store.connect() as connection:
+        rows = connection.execute("SELECT prediction_id, probability FROM mt_predictions").fetchall()
+        for index, row in enumerate(rows):
+            outcome = {"state": "scored", "actual": int(index % 2 == 0)}
+            connection.execute(
+                "UPDATE mt_predictions SET outcome_json = ? WHERE prediction_id = ?",
+                (json.dumps(outcome), row["prediction_id"]),
+            )
+        connection.commit()
+    assert all(0.0 <= float(row["probability"]) <= 1.0 for row in rows)
+
+    receipt = store.record_calibration()
+    assert receipt["recorded"] >= 1
+    history = store.calibration_history()
+    assert len(history) == receipt["recorded"]
+    first = history[0]
+    for field in ("computed_at", "model_version", "horizon", "labels",
+                  "brier_score", "log_loss", "expected_calibration_error",
+                  "calibration_bins"):
+        assert field in first
+    # Append-only: a second recording adds rows, never overwrites.
+    store.record_calibration()
+    assert len(store.calibration_history(limit=500)) == 2 * receipt["recorded"]
+
+
+
+def test_central_outage_never_discards_local_observations(provider_server, market_config, monkeypatch):
+    """MT-010: outbox records stay durable through a central 503 outage and
+    flush transactionally once the mirror recovers."""
+    store = MarketTapeStore(market_config)
+    store.start_run("outage-run", "full")
+    store.ingest(_content(datetime.now(timezone.utc), 100), "outage-run")
+    store.finish_run("outage-run")
+    queued = store.enqueue_run_for_sync("outage-run")
+    assert queued > 0
+    local_before = store.status()["totals"]["observations"]
+
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-role-integration-key-1234567890")
+    enabled = replace(market_config, supabase_sync_enabled=True)
+    ProviderTestHandler.outage = True
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        failed = sink.flush()
+    finally:
+        sink.close()
+        ProviderTestHandler.outage = False
+    assert failed["state"] != "ready"
+    assert failed["pending"] == queued            # nothing discarded
+    assert failed["synced"] == 0
+    assert store.status()["totals"]["observations"] == local_before  # local acquisition intact
+    # Failed rows were scheduled for retry with exponential backoff, not dropped.
+    with store.connect() as connection:
+        scheduled = connection.execute(
+            "SELECT COUNT(*) FROM mt_sync_outbox WHERE attempts = 1 AND next_attempt_at IS NOT NULL"
+        ).fetchone()[0]
+        assert scheduled == queued
+        # Simulate the backoff window elapsing so the recovery flush is eligible.
+        connection.execute(
+            "UPDATE mt_sync_outbox SET next_attempt_at = '2000-01-01T00:00:00+00:00'"
+        )
+        connection.commit()
+
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        recovered = sink.flush()
+    finally:
+        sink.close()
+    assert recovered["state"] == "ready"
+    assert recovered["pending"] == 0
+    assert recovered["synced"] >= queued

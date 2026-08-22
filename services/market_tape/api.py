@@ -87,6 +87,17 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
     def market_tape_prediction_backtest():
         return jsonify(store.prediction_backtest())
 
+    @app.get("/api/market-tape/calibration")
+    def market_tape_calibration_history():
+        limit = _limit(request.args.get("limit"), 50, maximum=500)
+        return jsonify({"calibration": store.calibration_history(limit)})
+
+    @app.post("/api/market-tape/calibration/record")
+    def market_tape_record_calibration():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        return jsonify(store.record_calibration())
+
     @app.get("/api/market-tape/opportunities")
     def market_tape_opportunities():
         limit = _limit(request.args.get("limit"), 100, maximum=500)

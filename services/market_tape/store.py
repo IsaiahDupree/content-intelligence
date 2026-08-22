@@ -537,6 +537,27 @@ class MarketTapeStore:
                 CREATE INDEX IF NOT EXISTS mt_predictions_outcome_idx
                     ON mt_predictions(outcome_json, predicted_at);
 
+                -- MT-009: calibration metrics are RECORDED after horizons
+                -- close, not only computed on demand. Append-only snapshots.
+                CREATE TABLE IF NOT EXISTS mt_prediction_calibration (
+                    calibration_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    computed_at TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    horizon TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    labels INTEGER NOT NULL,
+                    positives INTEGER NOT NULL,
+                    brier_score REAL NOT NULL,
+                    brier_skill_score REAL,
+                    log_loss REAL NOT NULL,
+                    expected_calibration_error REAL NOT NULL,
+                    roc_auc REAL,
+                    calibration_bins_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS mt_prediction_calibration_model_idx
+                    ON mt_prediction_calibration(model_version, horizon, computed_at DESC);
+
                 CREATE TABLE IF NOT EXISTS mt_sync_outbox (
                     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_type TEXT NOT NULL,
@@ -2163,6 +2184,9 @@ class MarketTapeStore:
             "newly_unscorable": unscorable,
             "outbox_records": queued,
         })
+        if updates:
+            # MT-009: once new horizons close, record the calibration snapshot.
+            report["calibration"] = self.record_calibration()
         return report
 
     def enqueue_prediction_updates(self, prediction_ids: Sequence[int]) -> int:
@@ -2278,6 +2302,50 @@ class MarketTapeStore:
             "pending": pending,
             "models": models,
         }
+
+    def record_calibration(self) -> Dict[str, Any]:
+        """MT-009: persist the current backtest as an append-only calibration
+        snapshot per (subject_type, model_version, horizon). Observed outcomes
+        are already written by evaluate_predictions once a horizon closes;
+        this records the resulting calibration metrics alongside them."""
+        backtest = self.prediction_backtest()
+        computed_at = isoformat(datetime.now(timezone.utc))
+        recorded = 0
+        with self.connect() as connection:
+            for model in backtest["models"]:
+                connection.execute(
+                    """INSERT INTO mt_prediction_calibration(
+                           computed_at, subject_type, model_version, horizon, state,
+                           labels, positives, brier_score, brier_skill_score, log_loss,
+                           expected_calibration_error, roc_auc, calibration_bins_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        computed_at, model["subject_type"], model["model_version"],
+                        model["horizon"], model["state"], model["labels"],
+                        model["positives"], model["brier_score"],
+                        model["brier_skill_score"], model["log_loss"],
+                        model["expected_calibration_error"], model["roc_auc"],
+                        json.dumps(model["calibration_bins"]),
+                    ),
+                )
+                recorded += 1
+            connection.commit()
+        return {"computed_at": computed_at, "recorded": recorded,
+                "state": backtest["state"], "scored_labels": backtest["scored_labels"]}
+
+    def calibration_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM mt_prediction_calibration
+                   ORDER BY computed_at DESC, calibration_id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        history = []
+        for row in rows:
+            item = dict(row)
+            item["calibration_bins"] = json.loads(item.pop("calibration_bins_json"))
+            history.append(item)
+        return history
 
     def status(self) -> Dict[str, Any]:
         today = datetime.now(timezone.utc).date().isoformat()
