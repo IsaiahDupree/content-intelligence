@@ -6,7 +6,14 @@ from typing import List
 
 from .base import MarketSource
 from .local_research import LocalResearchSource
-from .social import InstagramRapidSource, MetaGraphSource, TikTokRapidSource, TikTokResearchSource, XRecentSearchSource
+from .social import (
+    InstagramRapidSource,
+    MetaGraphSource,
+    ThreadsKeywordSearchSource,
+    TikTokRapidSource,
+    TikTokResearchSource,
+    XRecentSearchSource,
+)
 from .youtube import YouTubeSource
 from ..config import MarketTapeConfig
 
@@ -43,12 +50,10 @@ def build_sources(config: MarketTapeConfig, run_id: str, budget_for) -> List[Mar
             source_id="facebook-graph-authorized", edge="videos",
             fields="id,title,description,created_time,permalink_url,views,likes.summary(true),comments.summary(true)",
         ),
-        MetaGraphSource(
-            config, run_id, budget("threads", "threads-graph-authorized"),
-            platform="threads", account_env="THREADS_USER_ID",
-            token_envs=("THREADS_ACCESS_TOKEN", "META_ACCESS_TOKEN"),
-            source_id="threads-graph-authorized", edge="threads",
-            fields="id,media_type,permalink,username,text,timestamp,shortcode,thumbnail_url",
+        ThreadsKeywordSearchSource(
+            config,
+            run_id,
+            budget("threads", ThreadsKeywordSearchSource.source_id),
         ),
     ]
     return sources

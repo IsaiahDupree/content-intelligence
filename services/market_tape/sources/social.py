@@ -42,6 +42,7 @@ class TikTokResearchSource(MarketSource):
         super().__init__(*args, **kwargs)
         self.base_url = base_url.rstrip("/")
         self.access_token = os.getenv("TIKTOK_RESEARCH_ACCESS_TOKEN", "").strip()
+        self._configured_access_token = self.access_token
         self.client_key = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
         self.client_secret = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
 
@@ -52,6 +53,11 @@ class TikTokResearchSource(MarketSource):
         if self.credentials_available():
             return []
         return ["TIKTOK_RESEARCH_ACCESS_TOKEN or TIKTOK_CLIENT_KEY+TIKTOK_CLIENT_SECRET"]
+
+    def credential_material(self) -> Sequence[str]:
+        if self._configured_access_token:
+            return (self._configured_access_token,)
+        return (self.client_key, self.client_secret)
 
     def _token(self) -> str:
         if self.access_token:
@@ -390,6 +396,9 @@ class XRecentSearchSource(MarketSource):
     def missing_credentials(self) -> List[str]:
         return [] if self.token else ["X_BEARER_TOKEN or TWITTER_BEARER_TOKEN"]
 
+    def credential_material(self) -> Sequence[str]:
+        return (self.token,)
+
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
         try:
@@ -469,8 +478,204 @@ class XRecentSearchSource(MarketSource):
         )
 
 
+class ThreadsKeywordSearchSource(MarketSource):
+    """Public Threads discovery and object refresh through the Threads Graph API."""
+
+    source_id = "threads-graph-keyword-search"
+    platform = "threads"
+    credential_names = ("THREADS_ACCESS_TOKEN",)
+
+    fields = (
+        "id,media_product_type,media_type,media_url,permalink,owner,username,"
+        "text,timestamp,shortcode,thumbnail_url,is_quote_post"
+    )
+
+    def __init__(
+        self,
+        *args: Any,
+        base_url: str = "https://graph.threads.net",
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.base_url = base_url.rstrip("/")
+
+    @property
+    def token(self) -> str:
+        return os.getenv("THREADS_ACCESS_TOKEN", "").strip()
+
+    def _headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def discover(self, max_items: int) -> ProviderBatch:
+        started = utc_now()
+        try:
+            self.preflight()
+            observed = utc_now()
+            output: Dict[str, MarketContent] = {}
+            query_counts: Dict[str, int] = {}
+            cursor = ""
+            for topic in self.config.topics:
+                if len(output) >= max_items or self.request_count >= self.request_budget:
+                    break
+                data = self.request_json(
+                    "GET",
+                    f"{self.base_url}/keyword_search",
+                    headers=self._headers(),
+                    params={
+                        "q": topic,
+                        "search_type": "RECENT",
+                        "search_mode": "KEYWORD",
+                        "limit": min(50, max_items - len(output)),
+                        "fields": self.fields,
+                    },
+                )
+                records = data.get("data", [])
+                query_counts[topic] = len(records) if isinstance(records, list) else 0
+                for raw in records if isinstance(records, list) else []:
+                    if not isinstance(raw, dict) or not raw.get("id"):
+                        continue
+                    item = self._normalize(raw, observed, {
+                        "topic": topic,
+                        "search_type": "RECENT",
+                        "search_mode": "KEYWORD",
+                    })
+                    output[item.external_id] = item
+                    if len(output) >= max_items:
+                        break
+                cursors = _first_dict(_first_dict(data.get("paging")).get("cursors"))
+                cursor = str(cursors.get("after") or cursor)
+            batch = self.success_batch(
+                started,
+                list(output.values())[:max_items],
+                operation="discover",
+                cursor=cursor,
+                metadata={
+                    "scope": "public_keyword_search",
+                    "endpoint": "keyword_search",
+                    "search_type": "RECENT",
+                    "search_mode": "KEYWORD",
+                    "required_scope": "threads_keyword_search",
+                    "engagement_metrics_observed": any(
+                        item.discovery_context.get("engagement_metrics_observed", False)
+                        for item in output.values()
+                    ),
+                },
+            )
+            batch.query_attempts = _query_attempts(
+                self,
+                started,
+                batch.receipt.finished_at,
+                query_counts,
+                metadata={
+                    "surface": "keyword_search",
+                    "search_type": "RECENT",
+                    "search_mode": "KEYWORD",
+                    "required_scope": "threads_keyword_search",
+                    "metric_contract": "content_metadata_unless_provider_counters_present",
+                },
+            )
+            return batch
+        except Exception as error:
+            return self.blocked_batch(started, error)
+
+    def refresh(self, tracked: Sequence[Dict[str, Any]]) -> ProviderBatch:
+        started = utc_now()
+        try:
+            self.preflight()
+            observed = utc_now()
+            output: List[MarketContent] = []
+            for prior in tracked:
+                if self.request_count >= self.request_budget:
+                    break
+                external_id = str(prior.get("external_id") or "").strip()
+                if not external_id:
+                    continue
+                data = self.request_json(
+                    "GET",
+                    f"{self.base_url}/{external_id}",
+                    headers=self._headers(),
+                    params={"fields": self.fields},
+                )
+                if data.get("id"):
+                    output.append(self._normalize(data, observed, prior))
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata={
+                    "scope": "public_object_lookup",
+                    "endpoint": "thread_object",
+                    "required_scope": "threads_basic",
+                    "engagement_metrics_observed": any(
+                        item.discovery_context.get("engagement_metrics_observed", False)
+                        for item in output
+                    ),
+                },
+            )
+        except Exception as error:
+            return self.blocked_batch(started, error)
+
+    def _normalize(
+        self,
+        raw: Dict[str, Any],
+        observed: Any,
+        prior: Dict[str, Any] | None = None,
+    ) -> MarketContent:
+        prior = prior or {}
+        owner = _first_dict(raw.get("owner"))
+        username = str(
+            raw.get("username") or prior.get("creator_handle") or "unknown"
+        ).strip().lstrip("@") or "unknown"
+        creator_external_id = str(
+            owner.get("id") or prior.get("creator_external_id") or username
+        ).strip() or "unknown"
+        text = str(raw.get("text") or prior.get("caption") or "")
+        metric_values = {
+            "views": raw.get("views"),
+            "likes": raw.get("like_count"),
+            "comments": raw.get("reply_count"),
+            "shares": raw.get("repost_count"),
+        }
+        engagement_metrics_observed = any(
+            key in raw and value is not None
+            for key, value in (
+                ("views", metric_values["views"]),
+                ("like_count", metric_values["likes"]),
+                ("reply_count", metric_values["comments"]),
+                ("repost_count", metric_values["shares"]),
+            )
+        )
+        return MarketContent(
+            platform=self.platform,
+            external_id=str(raw.get("id")),
+            creator_external_id=creator_external_id,
+            creator_handle=username,
+            published_at=parse_datetime(
+                raw.get("timestamp") or prior.get("published_at")
+            ),
+            observed_at=observed,
+            source_id=self.source_id,
+            metrics=MetricCounters.from_values(**metric_values),
+            caption=text,
+            url=str(raw.get("permalink") or prior.get("url") or ""),
+            thumbnail_url=str(raw.get("thumbnail_url") or ""),
+            media_type=str(raw.get("media_type") or "post").lower(),
+            hashtags=_hashtags(text),
+            raw_payload=raw,
+            discovery_context={
+                **prior,
+                "engagement_metrics_observed": engagement_metrics_observed,
+                "metric_contract": (
+                    "provider_counters"
+                    if engagement_metrics_observed
+                    else "content_metadata_only"
+                ),
+            },
+        )
+
+
 class MetaGraphSource(MarketSource):
-    """Authorized account media from Instagram, Facebook, or Threads."""
+    """Authorized account media from Instagram or Facebook."""
 
     def __init__(
         self,
@@ -515,6 +720,9 @@ class MetaGraphSource(MarketSource):
         if not self.token:
             missing.append(" or ".join(self.token_envs))
         return missing
+
+    def credential_material(self) -> Sequence[str]:
+        return (self.account_id, self.token)
 
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()

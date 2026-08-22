@@ -1034,6 +1034,7 @@ class MarketTapeCollector:
             and int(source.request_budget) > 0
             and source.credentials_available()
             and (not source.metered or self.config.allow_metered_reads)
+            and self._circuit_open_batch(source) is None
         ]
         execution_admitted = bool(global_remaining > 0 and executable_sources)
         plan["execution_admitted"] = execution_admitted
@@ -1363,12 +1364,18 @@ class MarketTapeCollector:
         retry = self.store.source_retry_status(source.source_id)
         if not retry.get("blocked"):
             return None
-        if source.source_id == "youtube-data-api-v3" and retry.get("error_code") in {
-            "provider_rate_limited", "provider_auth_or_quota",
-        }:
-            return None
         state = str(retry.get("state", "degraded"))
-        if state == SourceState.BLOCKED_CREDENTIAL.value and source.credentials_available():
+        current_credential_fingerprint = source.credential_fingerprint()
+        credential_sensitive_failure = (
+            state == SourceState.BLOCKED_CREDENTIAL.value
+            or retry.get("error_code") == "provider_auth_or_quota"
+        )
+        if (
+            credential_sensitive_failure
+            and current_credential_fingerprint
+            and current_credential_fingerprint
+            != str(retry.get("credential_fingerprint") or "")
+        ):
             return None
         if state == SourceState.BLOCKED_APPROVAL.value and (
             not source.metered or self.config.allow_metered_reads
@@ -1404,15 +1411,18 @@ class MarketTapeCollector:
         duplicates = 0
         provider_item_failures = batch.receipt.failed_count
         ingest_failures = 0
+        new_unique_count = 0
         ingest_failure_types: Dict[str, int] = {}
         for item in batch.items:
             try:
-                added, _ = self.store.ingest(item, run_id)
-                if added:
+                observation_added, unique_added = self.store.ingest(item, run_id)
+                if observation_added:
                     accepted += 1
                     accepted_ids.add(item.video_id)
                 else:
                     duplicates += 1
+                if unique_added:
+                    new_unique_count += 1
             except (TypeError, ValueError, KeyError) as error:
                 ingest_failures += 1
                 error_type = type(error).__name__
@@ -1420,6 +1430,9 @@ class MarketTapeCollector:
         batch.receipt.accepted_count = accepted
         batch.receipt.duplicate_count = duplicates
         batch.receipt.failed_count = provider_item_failures + ingest_failures
+        batch.receipt.metadata["new_observation_count"] = accepted
+        batch.receipt.metadata["new_unique_count"] = new_unique_count
+        batch.receipt.metadata["watermark_advanced"] = accepted > 0
         if ingest_failures:
             batch.receipt.metadata["ingest_failure_count"] = ingest_failures
             batch.receipt.metadata["ingest_failure_types"] = ingest_failure_types

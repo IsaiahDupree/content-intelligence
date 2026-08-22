@@ -20,7 +20,6 @@ from ..models import (
     MetricCounters,
     ProviderBatch,
     QueryAttempt,
-    SourceState,
     isoformat,
     parse_datetime,
     stable_hash,
@@ -89,15 +88,13 @@ class LocalResearchSource(MarketSource):
                     "archive_dir": str(self.platform_archive_dir),
                     "archive_qc": self._archive_qc_receipt(),
                     "scheduler": scheduler,
+                    **self._archive_state_receipt(
+                        items,
+                        acquisition_state=str(scheduler.get("state") or "unknown"),
+                    ),
                     "provider_cost_usd": 0.0,
                 },
             )
-            if scheduler.get("state") in {"unavailable", "blocked_disk_pressure"}:
-                batch.receipt.state = SourceState.DEGRADED
-                batch.receipt.error_code = str(
-                    scheduler.get("error_code") or "scheduler_unavailable"
-                )
-                batch.receipt.error_detail = str(scheduler.get("error", ""))[:1000]
             batch.query_attempts = self._load_query_attempts()
             return batch
         except Exception as error:
@@ -117,6 +114,10 @@ class LocalResearchSource(MarketSource):
                 metadata={
                     "archive_dir": str(self.platform_archive_dir),
                     "archive_qc": self._archive_qc_receipt(),
+                    **self._archive_state_receipt(
+                        items,
+                        acquisition_state="not_requested_archive_refresh",
+                    ),
                     "provider_cost_usd": 0.0,
                 },
             )
@@ -254,6 +255,39 @@ class LocalResearchSource(MarketSource):
             **self._archive_qc,
             "precision": round(accepted / evaluated, 6) if evaluated else None,
             "policy": "niche-token-overlap-v1",
+        }
+
+    def _archive_state_receipt(
+        self,
+        items: Sequence[MarketContent],
+        *,
+        acquisition_state: str,
+    ) -> Dict[str, Any]:
+        files = (
+            list(self.platform_archive_dir.glob("*.json"))
+            if self.platform_archive_dir.is_dir() else []
+        )
+        artifact_timestamps: List[datetime] = []
+        for path in files:
+            try:
+                artifact_timestamps.append(
+                    datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                )
+            except OSError:
+                continue
+        latest_artifact = max(artifact_timestamps, default=None)
+        latest_observed = max((item.observed_at for item in items), default=None)
+        now = utc_now()
+        return {
+            "data_mode": "archive_replay",
+            "archive_readable": self.platform_archive_dir.is_dir(),
+            "latest_artifact_at": isoformat(latest_artifact),
+            "latest_observed_at": isoformat(latest_observed),
+            "archive_age_seconds": (
+                round(max(0.0, (now - latest_artifact).total_seconds()), 3)
+                if latest_artifact else None
+            ),
+            "acquisition_state": acquisition_state,
         }
 
     def _load_query_attempts(self) -> List[QueryAttempt]:

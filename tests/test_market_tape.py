@@ -37,6 +37,7 @@ from services.market_tape.models import (
 )
 from services.market_tape.sources.base import sanitize
 from services.market_tape.sources.local_research import LocalResearchSource
+from services.market_tape.sources.social import MetaGraphSource
 from services.market_tape.sources.youtube import YouTubeSource
 from services.market_tape.sinks.supabase import ENTITY_SYNC_ORDER, ENTITY_TABLES, SupabaseSink
 from services.market_tape.store import MarketTapeStore
@@ -58,6 +59,12 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/research/status":
             self._json({"currentJob": None, "recentJobs": []})
+            return
+        if (
+            parsed.path == "/123/videos"
+            and self.headers.get("Authorization") == "Bearer invalid-token"
+        ):
+            self._json({"error": "invalid access token"}, status=401)
             return
         if parsed.path.startswith("/api/research/status/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
@@ -980,6 +987,171 @@ def test_provider_circuit_breaker_prevents_repeated_http_calls(provider_server, 
     assert retry["consecutive_failures"] == 1
 
 
+def test_custom_credential_preflight_blocks_facebook_before_http_then_reopens(
+    provider_server,
+    market_config,
+    monkeypatch,
+):
+    monkeypatch.delenv("FACEBOOK_PAGE_ID", raising=False)
+    monkeypatch.delenv("FACEBOOK_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    config = replace(
+        market_config,
+        platforms=["facebook"],
+        topics=["creator economy"],
+        daily_unique_target=10,
+        platform_daily_targets={"facebook": 10},
+        source_auth_backoff_seconds=3600,
+    )
+
+    def source_builder(runtime_config, run_id, budget_for):
+        return [MetaGraphSource(
+            runtime_config,
+            run_id,
+            budget_for("facebook-graph-authorized", 10),
+            platform="facebook",
+            account_env="FACEBOOK_PAGE_ID",
+            token_envs=("FACEBOOK_ACCESS_TOKEN", "META_ACCESS_TOKEN"),
+            source_id="facebook-graph-authorized",
+            edge="videos",
+            fields="id,title,description,created_time",
+            base_url=provider_server,
+        )]
+
+    store = MarketTapeStore(config)
+    collector = MarketTapeCollector(config, store, source_builder=source_builder)
+    first = collector.run_cycle("discovery")
+    assert first["receipts"][0]["state"] == "blocked_credential"
+    assert first["receipts"][0]["error_code"] == "credential_missing"
+    assert ProviderTestHandler.received_gets == []
+
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123")
+    monkeypatch.setenv("FACEBOOK_ACCESS_TOKEN", "rotated-token")
+    second = collector.run_cycle("discovery")
+    assert second["receipts"][0]["error_code"] == "provider_http_error"
+    assert [row["path"] for row in ProviderTestHandler.received_gets] == [
+        "/123/videos"
+    ]
+
+
+def test_invalid_facebook_credential_circuit_retries_only_after_token_rotation(
+    provider_server,
+    market_config,
+    monkeypatch,
+):
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123")
+    monkeypatch.setenv("FACEBOOK_ACCESS_TOKEN", "invalid-token")
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    config = replace(
+        market_config,
+        platforms=["facebook"],
+        topics=["creator economy"],
+        daily_unique_target=10,
+        platform_daily_targets={"facebook": 10},
+        source_auth_backoff_seconds=3600,
+    )
+
+    def source_builder(runtime_config, run_id, budget_for):
+        return [MetaGraphSource(
+            runtime_config,
+            run_id,
+            budget_for("facebook-auth-integration", 10),
+            platform="facebook",
+            account_env="FACEBOOK_PAGE_ID",
+            token_envs=("FACEBOOK_ACCESS_TOKEN",),
+            source_id="facebook-auth-integration",
+            edge="videos",
+            fields="id,title,description,created_time",
+            base_url=provider_server,
+        )]
+
+    store = MarketTapeStore(config)
+    collector = MarketTapeCollector(config, store, source_builder=source_builder)
+    first = collector.run_cycle("discovery")
+    request_count = len(ProviderTestHandler.received_gets)
+    second = collector.run_cycle("discovery")
+
+    assert first["receipts"][0]["error_code"] == "provider_authentication_failed"
+    assert second["receipts"][0]["error_code"] == "circuit_open"
+    assert len(ProviderTestHandler.received_gets) == request_count == 1
+
+    monkeypatch.setenv("FACEBOOK_ACCESS_TOKEN", "rotated-token")
+    third = collector.run_cycle("discovery")
+    assert third["receipts"][0]["error_code"] == "provider_http_error"
+    assert len(ProviderTestHandler.received_gets) == 2
+    database_bytes = config.db_path.read_bytes()
+    assert b"invalid-token" not in database_bytes
+    assert b"rotated-token" not in database_bytes
+
+
+def test_local_archive_duplicate_replay_reports_no_watermark_advance(
+    market_config,
+    tmp_path,
+):
+    archive = tmp_path / "research" / "twitter"
+    archive.mkdir(parents=True)
+    observed_at = datetime.now(timezone.utc).isoformat()
+    archive.joinpath("creator-economy.json").write_text(json.dumps({
+        "results": [{
+            "niche": "creator economy",
+            "query": "creator economy",
+            "collectionFinished": observed_at,
+            "tweets": [{
+                "id": "archive-watermark-1",
+                "url": "https://x.com/creator/status/archive-watermark-1",
+                "author": "creator",
+                "text": "Creator economy systems and creator revenue",
+                "views": 1000,
+                "likes": 100,
+            }],
+        }],
+    }), encoding="utf-8")
+    config = replace(
+        market_config,
+        platforms=["x"],
+        topics=["creator economy"],
+        local_research_dir=tmp_path / "research",
+        local_research_trigger_enabled=False,
+        daily_unique_target=10,
+        platform_daily_targets={"x": 10},
+    )
+
+    def source_builder(runtime_config, run_id, budget_for):
+        return [LocalResearchSource(
+            runtime_config,
+            run_id,
+            budget_for("safari-local-research-x", 10),
+            platform="x",
+            api_platform="twitter",
+            archive_root=tmp_path / "research",
+        )]
+
+    store = MarketTapeStore(config)
+    collector = MarketTapeCollector(config, store, source_builder=source_builder)
+    first = collector.run_cycle("discovery")
+    second = collector.run_cycle("discovery")
+    first_metadata = first["receipts"][0]["metadata"]
+    second_metadata = second["receipts"][0]["metadata"]
+
+    assert first["receipts"][0]["state"] == "ready"
+    assert first_metadata["data_mode"] == "archive_replay"
+    assert first_metadata["acquisition_state"] == "disabled"
+    assert first_metadata["new_observation_count"] == 1
+    assert first_metadata["new_unique_count"] == 1
+    assert first_metadata["watermark_advanced"] is True
+    assert second_metadata["new_observation_count"] == 0
+    assert second_metadata["new_unique_count"] == 0
+    assert second_metadata["watermark_advanced"] is False
+    source_health = next(
+        row for row in store.status()["sources"]
+        if row["source_id"] == "safari-local-research-x"
+    )
+    assert source_health["operation_state"] == "ready"
+    assert source_health["data_mode"] == "archive_replay"
+    assert source_health["acquisition_state"] == "disabled"
+    assert source_health["watermark_advanced"] is False
+
+
 def test_local_research_archive_source_normalizes_and_schedules(provider_server, market_config, tmp_path):
     archive = tmp_path / "research" / "twitter"
     archive.mkdir(parents=True)
@@ -1215,8 +1387,11 @@ def test_local_research_dispatch_blocks_before_browser_when_disk_is_low(
     scheduler = batch.receipt.metadata["scheduler"]
     assert scheduler["state"] == "blocked_disk_pressure"
     assert scheduler["free_bytes"] < scheduler["minimum_free_bytes"]
-    assert batch.receipt.state == SourceState.DEGRADED
-    assert batch.receipt.error_code == "insufficient_temporary_disk"
+    assert batch.receipt.state == SourceState.READY
+    assert batch.receipt.error_code == ""
+    assert batch.receipt.metadata["data_mode"] == "archive_replay"
+    assert batch.receipt.metadata["archive_readable"] is True
+    assert batch.receipt.metadata["acquisition_state"] == "blocked_disk_pressure"
     assert ProviderTestHandler.received_posts == []
 
 

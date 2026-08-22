@@ -47,6 +47,9 @@ class YouTubeSource(MarketSource):
     def missing_credentials(self) -> List[str]:
         return [] if self.api_key else ["YOUTUBE_API_KEY"]
 
+    def credential_material(self) -> Sequence[str]:
+        return (self.api_key,)
+
     def discover_performance(
         self,
         query: str,

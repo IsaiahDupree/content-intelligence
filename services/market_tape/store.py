@@ -2506,13 +2506,22 @@ class MarketTapeStore:
         with self.connect() as connection:
             row = connection.execute(
                 """SELECT source_id, platform, state, checked_at, last_success_at,
-                          consecutive_failures, next_retry_at, error_code
+                          consecutive_failures, next_retry_at, error_code,
+                          receipt_json
                    FROM mt_source_health WHERE source_id = ?""",
                 (source_id,),
             ).fetchone()
         if row is None:
             return {"source_id": source_id, "blocked": False}
         result = dict(row)
+        try:
+            receipt = json.loads(result.pop("receipt_json") or "{}")
+        except (TypeError, ValueError):
+            receipt = {}
+        metadata = receipt.get("metadata") if isinstance(receipt.get("metadata"), dict) else {}
+        result["credential_fingerprint"] = str(
+            metadata.get("credential_fingerprint") or ""
+        )
         retry_at = datetime.fromisoformat(result["next_retry_at"]) if result.get("next_retry_at") else None
         result["blocked"] = bool(retry_at and retry_at > utc_now())
         return result
@@ -3391,6 +3400,24 @@ class MarketTapeStore:
                 "SELECT * FROM mt_sink_health WHERE sink_id = 'supabase'"
             ).fetchone()
         by_platform = {row["platform"]: int(row["count"]) for row in platform_rows}
+        for source in sources:
+            try:
+                receipt = json.loads(source.get("receipt_json") or "{}")
+            except (TypeError, ValueError):
+                receipt = {}
+            metadata = receipt.get("metadata") if isinstance(receipt.get("metadata"), dict) else {}
+            source["operation_state"] = source.get("state")
+            for field in (
+                "data_mode",
+                "acquisition_state",
+                "archive_readable",
+                "latest_artifact_at",
+                "latest_observed_at",
+                "watermark_advanced",
+                "new_unique_count",
+                "new_observation_count",
+            ):
+                source[field] = metadata.get(field)
         target_status = {
             platform: {
                 "target": self.config.target_for(platform),

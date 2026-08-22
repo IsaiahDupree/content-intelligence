@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from abc import ABC, abstractmethod
@@ -87,10 +88,26 @@ class MarketSource(ABC):
     def missing_credentials(self) -> List[str]:
         return [name for name in self.credential_names if not os.getenv(name, "").strip()]
 
+    def credential_material(self) -> Sequence[str]:
+        """Resolved secret material used only to derive a non-reversible digest."""
+
+        return tuple(os.getenv(name, "").strip() for name in self.credential_names)
+
+    def credential_fingerprint(self) -> str:
+        material = tuple(self.credential_material())
+        if not any(material):
+            return ""
+        digest = hashlib.sha256()
+        for value in (self.source_id, *material):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
     def preflight(self) -> None:
         if self.platform not in self.config.platforms:
             raise SourceError(f"platform {self.platform} is disabled")
-        if self.credential_names and not self.credentials_available():
+        if not self.credentials_available():
             raise SourceCredentialError("missing " + ", ".join(self.missing_credentials()))
         if self.metered and not self.config.allow_metered_reads:
             raise SourceApprovalError("metered provider reads are disabled")
@@ -161,7 +178,10 @@ class MarketSource(ABC):
             quota_remaining=max(0, self.request_budget - self.request_count),
             error_code=getattr(error, "code", "source_error"),
             error_detail=sanitize(error),
-            metadata={"metered": self.metered},
+            metadata={
+                "metered": self.metered,
+                "credential_fingerprint": self.credential_fingerprint(),
+            },
         ))
 
     def success_batch(
@@ -187,7 +207,12 @@ class MarketSource(ABC):
             refreshed_count=len(items) if operation == "refresh" else 0,
             quota_remaining=max(0, self.request_budget - self.request_count),
             cursor=cursor,
-            metadata={"metered": self.metered, "operation": operation, **(metadata or {})},
+            metadata={
+                "metered": self.metered,
+                "operation": operation,
+                **(metadata or {}),
+                "credential_fingerprint": self.credential_fingerprint(),
+            },
         ))
 
     def _operation_request_count(self) -> int:
