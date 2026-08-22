@@ -98,7 +98,7 @@ class PerformancePolicy:
 
 
 DEFAULT_POLICIES = {
-    "youtube": PerformancePolicy(10_000, 0.005, maximum_duration_seconds=600.0),
+    "youtube": PerformancePolicy(10_000, 0.005, maximum_duration_seconds=720.0),
     "tiktok": PerformancePolicy(100_000, 0.02),
     "instagram": PerformancePolicy(50_000, 0.015),
     "facebook": PerformancePolicy(25_000, 0.01),

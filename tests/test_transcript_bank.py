@@ -16,6 +16,49 @@ from services.market_tape.models import MarketContent, MetricCounters
 from services.market_tape.store import MarketTapeStore
 
 
+def test_youtube_backfill_accepts_twelve_minutes_but_not_longer(tmp_path):
+    config = MarketTapeConfig(
+        db_path=tmp_path / "market.sqlite3",
+        object_dir=tmp_path / "objects",
+        heartbeat_path=tmp_path / "heartbeat.json",
+        lock_path=tmp_path / "market.lock",
+        platforms=["youtube"],
+        topics=["AI automation"],
+        supabase_sync_enabled=False,
+    )
+    store = MarketTapeStore(config)
+    store.start_run("duration-policy-run", "integration")
+    observed_at = datetime.now(timezone.utc)
+    for external_id, duration in (("accepted-603", 603), ("rejected-721", 721)):
+        store.ingest(
+            MarketContent(
+                platform="youtube",
+                external_id=external_id,
+                creator_external_id=f"creator-{external_id}",
+                published_at=observed_at - timedelta(days=1),
+                observed_at=observed_at,
+                source_id="duration-policy-integration",
+                metrics=MetricCounters(views=250_000, likes=12_000, comments=500),
+                title="What happens when AI automation can think?",
+                description="A measured review of AI automation and agents.",
+                url=f"https://www.youtube.com/watch?v={external_id}",
+                duration_seconds=duration,
+                raw_payload={"duration_seconds": duration},
+            ),
+            "duration-policy-run",
+        )
+    store.finish_run("duration-policy-run")
+
+    bank = TranscriptBank(config.db_path, tmp_path / "transcript-bank")
+    candidates = bank.select_backfill_candidates(
+        topic="AI automation",
+        limit=5,
+        platforms=["youtube"],
+    )
+
+    assert [candidate.external_id for candidate in candidates] == ["accepted-603"]
+
+
 def test_real_files_are_hash_bound_and_bad_script_claim_fails_closed(tmp_path):
     config = MarketTapeConfig(
         db_path=tmp_path / "market.sqlite3",
