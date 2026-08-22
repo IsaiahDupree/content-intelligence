@@ -25,6 +25,7 @@ from .store import ClosingSQLiteConnection, MarketTapeStore
 DATASET_CONTRACT = "market_tape_daily_dataset_v1"
 SNAPSHOT_CONSISTENCY_CONTRACT = "market_tape_dataset_snapshot_consistency_v1"
 EXCLUDED_EXPORT_TABLES = {"mt_sync_outbox"}
+SNAPSHOT_VALIDATION_READ_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 class DatasetSnapshotIntegrityError(RuntimeError):
@@ -547,6 +548,13 @@ class MarketTapeDatasetManager:
 
     def _validate_snapshot(self, plain: Path) -> Dict[str, Any]:
         try:
+            expected_identity = self._snapshot_file_identity(plain.stat())
+        except OSError as error:
+            raise DatasetSnapshotIntegrityError(
+                f"staged SQLite snapshot prewarm failed: {error}"
+            ) from error
+        prewarm = self._prewarm_snapshot_validation(plain, expected_identity)
+        try:
             connection = sqlite3.connect(
                 f"{plain.resolve().as_uri()}?mode=ro",
                 uri=True,
@@ -560,10 +568,15 @@ class MarketTapeDatasetManager:
                 )
             finally:
                 connection.close()
+            validated_identity = self._snapshot_file_identity(plain.stat())
         except (OSError, sqlite3.DatabaseError) as error:
             raise DatasetSnapshotIntegrityError(
                 f"staged SQLite snapshot is unreadable: {error}"
             ) from error
+        if validated_identity != expected_identity:
+            raise DatasetSnapshotIntegrityError(
+                "staged SQLite snapshot changed during integrity validation"
+            )
         if quick_check != "ok":
             raise DatasetSnapshotIntegrityError(
                 f"staged SQLite snapshot failed quick_check: {quick_check}"
@@ -571,7 +584,92 @@ class MarketTapeDatasetManager:
         return {
             "quick_check": quick_check,
             "foreign_key_errors": foreign_key_errors,
+            "validation_prewarm": prewarm,
         }
+
+    def _prewarm_snapshot_validation(
+        self,
+        plain: Path,
+        expected_identity: tuple[int, int, int, int, int],
+    ) -> Dict[str, Any]:
+        """Sequentially read one stable staged file before SQLite checks it.
+
+        The read is deliberately bounded to a small reusable buffer.  It warms
+        the operating-system file cache without making another database copy,
+        which avoids random external-drive reads during ``quick_check`` while
+        retaining SQLite's full structural and foreign-key validation.
+        """
+        try:
+            path_before = plain.stat()
+            expected_bytes = int(path_before.st_size)
+            if self._snapshot_file_identity(path_before) != expected_identity:
+                raise DatasetSnapshotIntegrityError(
+                    "staged SQLite snapshot changed before validation prewarm"
+                )
+            if expected_bytes <= 0:
+                raise DatasetSnapshotIntegrityError(
+                    "staged SQLite snapshot is empty before integrity validation"
+                )
+
+            bytes_read = 0
+            buffer = bytearray(
+                min(SNAPSHOT_VALIDATION_READ_CHUNK_BYTES, expected_bytes)
+            )
+            buffer_view = memoryview(buffer)
+            with plain.open("rb", buffering=0) as source:
+                opened_before = self._snapshot_file_identity(os.fstat(source.fileno()))
+                if opened_before != expected_identity:
+                    raise DatasetSnapshotIntegrityError(
+                        "staged SQLite snapshot changed before validation prewarm"
+                    )
+                while bytes_read < expected_bytes:
+                    requested = min(
+                        SNAPSHOT_VALIDATION_READ_CHUNK_BYTES,
+                        expected_bytes - bytes_read,
+                    )
+                    actual = source.readinto(buffer_view[:requested])
+                    if actual != requested:
+                        raise DatasetSnapshotIntegrityError(
+                            "staged SQLite snapshot returned a short validation read: "
+                            f"expected={requested}, actual={actual}, "
+                            f"offset={bytes_read}"
+                        )
+                    bytes_read += actual
+                if source.readinto(buffer_view[:1]):
+                    raise DatasetSnapshotIntegrityError(
+                        "staged SQLite snapshot grew during validation prewarm"
+                    )
+                opened_after = self._snapshot_file_identity(os.fstat(source.fileno()))
+
+            path_after = self._snapshot_file_identity(plain.stat())
+        except DatasetSnapshotIntegrityError:
+            raise
+        except OSError as error:
+            raise DatasetSnapshotIntegrityError(
+                f"staged SQLite snapshot prewarm failed: {error}"
+            ) from error
+
+        if opened_after != expected_identity or path_after != expected_identity:
+            raise DatasetSnapshotIntegrityError(
+                "staged SQLite snapshot changed during validation prewarm"
+            )
+        return {
+            "method": "bounded_sequential_read_v1",
+            "bytes": bytes_read,
+            "chunk_bytes": SNAPSHOT_VALIDATION_READ_CHUNK_BYTES,
+        }
+
+    @staticmethod
+    def _snapshot_file_identity(
+        status: os.stat_result,
+    ) -> tuple[int, int, int, int, int]:
+        return (
+            int(status.st_dev),
+            int(status.st_ino),
+            int(status.st_size),
+            int(status.st_mtime_ns),
+            int(status.st_ctime_ns),
+        )
 
     def _compress_snapshot(self, capture: Dict[str, Any]) -> Dict[str, Any]:
         plain = Path(str(capture["source_path"]))
@@ -586,6 +684,7 @@ class MarketTapeDatasetManager:
             "sha256": _file_sha256(compressed),
             "quick_check": capture["quick_check"],
             "foreign_key_errors": capture["foreign_key_errors"],
+            "validation_prewarm": capture["validation_prewarm"],
             "captured_at": capture["captured_at"],
             "capture_method": capture["capture_method"],
             "destination_pragmas": capture["destination_pragmas"],
@@ -921,6 +1020,7 @@ class MarketTapeDatasetManager:
             "integrity": {
                 "sqlite_quick_check": snapshot["quick_check"],
                 "foreign_key_errors": snapshot["foreign_key_errors"],
+                "sqlite_validation_prewarm": snapshot["validation_prewarm"],
                 "raw_archive_state": raw_archive["state"],
                 "raw_objects_registered": raw_archive["registered"],
                 "raw_objects_verified": raw_archive["verified"],

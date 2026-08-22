@@ -25,6 +25,7 @@ from services.market_tape.config import MarketTapeConfig
 from services.market_tape.dataset import (
     DatasetSnapshotIntegrityError,
     MarketTapeDatasetManager,
+    SNAPSHOT_VALIDATION_READ_CHUNK_BYTES,
 )
 from services.market_tape.models import MarketContent, MetricCounters, QueryAttempt
 from services.market_tape.store import MarketTapeStore
@@ -202,6 +203,11 @@ def test_daily_passport_dataset_is_recoverable_and_prediction_scored(tmp_path):
     result = manager.certify(base.date())
     assert result["state"] in {"partial", "certified"}
     assert result["quality"]["integrity"]["sqlite_quick_check"] == "ok"
+    assert result["quality"]["integrity"]["sqlite_validation_prewarm"] == {
+        "method": "bounded_sequential_read_v1",
+        "bytes": result["artifacts"]["sqlite_snapshot"]["validation_prewarm"]["bytes"],
+        "chunk_bytes": SNAPSHOT_VALIDATION_READ_CHUNK_BYTES,
+    }
     assert result["quality"]["integrity"]["raw_objects_missing"] == 0
     assert result["quality"]["query_coverage"]["coverage_ratio"] == 1.0
     assert result["quality"]["query_coverage"]["queries_attempted"] == 2
@@ -392,15 +398,82 @@ def test_unsafe_staging_pragmas_require_a_recoverable_snapshot(tmp_path):
         "synchronous": "OFF",
         "temp_store": "MEMORY",
     }
-    assert manager._validate_snapshot(Path(capture["source_path"])) == {
+    snapshot_path = Path(capture["source_path"])
+    assert manager._validate_snapshot(snapshot_path) == {
         "quick_check": "ok",
         "foreign_key_errors": 0,
+        "validation_prewarm": {
+            "method": "bounded_sequential_read_v1",
+            "bytes": snapshot_path.stat().st_size,
+            "chunk_bytes": SNAPSHOT_VALIDATION_READ_CHUNK_BYTES,
+        },
     }
     assert not Path(str(capture["source_path"]) + "-journal").exists()
 
-    corrupt = staging / "corrupt.sqlite3"
-    corrupt.write_bytes(b"not a sqlite database")
-    with pytest.raises(DatasetSnapshotIntegrityError):
+
+def test_snapshot_validation_prewarms_all_real_sqlite_bytes_and_detects_change(tmp_path):
+    config = _config(tmp_path)
+    manager = MarketTapeDatasetManager(config, MarketTapeStore(config))
+    snapshot = tmp_path / "prewarm.sqlite3"
+    connection = sqlite3.connect(snapshot)
+    try:
+        connection.execute(
+            "CREATE TABLE prewarm_probe (id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO prewarm_probe(payload) VALUES (zeroblob(?))",
+            (SNAPSHOT_VALIDATION_READ_CHUNK_BYTES + 1,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    snapshot_bytes = snapshot.stat().st_size
+    assert snapshot_bytes > SNAPSHOT_VALIDATION_READ_CHUNK_BYTES
+    result = manager._validate_snapshot(snapshot)
+    assert result == {
+        "quick_check": "ok",
+        "foreign_key_errors": 0,
+        "validation_prewarm": {
+            "method": "bounded_sequential_read_v1",
+            "bytes": snapshot_bytes,
+            "chunk_bytes": SNAPSHOT_VALIDATION_READ_CHUNK_BYTES,
+        },
+    }
+
+    expected_identity = manager._snapshot_file_identity(snapshot.stat())
+    with snapshot.open("ab", buffering=0) as handle:
+        handle.write(b"changed-after-validation-start")
+    with pytest.raises(DatasetSnapshotIntegrityError, match="changed before"):
+        manager._prewarm_snapshot_validation(snapshot, expected_identity)
+
+
+def test_snapshot_validation_still_rejects_corrupt_real_sqlite(tmp_path):
+    config = _config(tmp_path)
+    manager = MarketTapeDatasetManager(config, MarketTapeStore(config))
+    corrupt = tmp_path / "corrupt.sqlite3"
+    connection = sqlite3.connect(corrupt)
+    try:
+        connection.execute(
+            "CREATE TABLE corruption_probe (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO corruption_probe(payload) VALUES (?)",
+            ((f"payload-{index}" * 64,) for index in range(500)),
+        )
+        connection.commit()
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        root_page = int(
+            connection.execute(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'corruption_probe'"
+            ).fetchone()[0]
+        )
+    finally:
+        connection.close()
+    with corrupt.open("r+b", buffering=0) as handle:
+        handle.seek((root_page - 1) * page_size)
+        handle.write(b"\xff" * min(256, page_size))
+    with pytest.raises(DatasetSnapshotIntegrityError, match="quick_check|unreadable"):
         manager._validate_snapshot(corrupt)
 
 
