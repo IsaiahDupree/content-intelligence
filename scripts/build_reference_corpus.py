@@ -18,6 +18,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.content_quality.reference_corpus import ReferenceCorpusService
+from services.content_quality.marketing_scripts import (
+    MarketingScriptCompiler,
+    render_package_markdown,
+)
 
 
 def emit(value: Any) -> None:
@@ -134,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--target-viewer", default="")
     audit.add_argument("--target-seconds", type=int, default=60)
     audit.set_defaults(handler=run_audit)
+
+    write_script = commands.add_parser("write-script")
+    write_script.add_argument("--request-file", required=True)
+    write_script.add_argument("--output")
+    write_script.add_argument("--markdown-output")
+    write_script.set_defaults(handler=run_write_script)
+
+    get_script = commands.add_parser("get-script")
+    get_script.add_argument("--script-id", required=True)
+    get_script.set_defaults(handler=run_get_script)
 
     snapshot = commands.add_parser("snapshot")
     snapshot.add_argument("--corpus-id", required=True)
@@ -255,6 +269,44 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         target_viewer=args.target_viewer,
         target_seconds=args.target_seconds,
     )
+
+
+def run_write_script(args: argparse.Namespace) -> dict[str, Any]:
+    request_path = Path(args.request_file).expanduser()
+    payload = json.loads(request_path.read_text(encoding="utf-8"))
+    package = MarketingScriptCompiler(service(args)).compile(payload)
+    artifacts: dict[str, str] = {}
+    if args.output:
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(package, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        artifacts["json"] = str(output)
+    if args.markdown_output:
+        markdown_output = Path(args.markdown_output).expanduser()
+        markdown_output.parent.mkdir(parents=True, exist_ok=True)
+        markdown_output.write_text(
+            render_package_markdown(package), encoding="utf-8"
+        )
+        artifacts["markdown"] = str(markdown_output)
+    if not artifacts:
+        return package
+    return {
+        "status": package["status"],
+        "contract": "reference_marketing_script_write_receipt_v1",
+        "script_id": package["script_id"],
+        "result_sha256": package["result_sha256"],
+        "artifacts": artifacts,
+    }
+
+
+def run_get_script(args: argparse.Namespace) -> dict[str, Any]:
+    package = MarketingScriptCompiler(service(args)).get(args.script_id)
+    if package is None:
+        raise ValueError(f"unknown reference script: {args.script_id}")
+    return package
 
 
 def run_snapshot(args: argparse.Namespace) -> dict[str, Any]:

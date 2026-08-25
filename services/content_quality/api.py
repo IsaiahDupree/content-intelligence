@@ -17,6 +17,7 @@ from flask import Flask, jsonify, request
 from .contracts import SCRIPT_INTELLIGENCE_BRIEF_CONTRACT
 from .demand_client import MarketTapeDemandClient
 from .engine import ContentQualityEngine
+from .marketing_scripts import MarketingScriptCompiler
 from .narrative_coherence import default_llm_runner, openai_llm_runner
 from .reference_corpus import (
     MAX_CORPUS_ITEMS,
@@ -71,6 +72,8 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         source_reader=reference_reader,
     )
     app.extensions["reference_corpus"] = reference_corpus
+    marketing_script_compiler = MarketingScriptCompiler(reference_corpus)
+    app.extensions["marketing_script_compiler"] = marketing_script_compiler
 
     @app.errorhandler(ValueError)
     def invalid_request(error: ValueError):
@@ -480,6 +483,59 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             "reference_corpus_audit", payload, result, started_at=started
         )
 
+    @app.post("/api/reference-corpus/write-script")
+    def reference_corpus_write_script():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = marketing_script_compiler.compile(payload)
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_write_script", payload, error, started
+            )
+        except KeyError:
+            result = {
+                "status": "error",
+                "code": "REFERENCE_CORPUS_NOT_FOUND",
+                "corpus_id": str(payload.get("corpus_id") or ""),
+            }
+            return audited_agent_response(
+                "reference_corpus_write_script", payload, result, 404, started
+            )
+        return audited_agent_response(
+            "reference_corpus_write_script", payload, result, started_at=started
+        )
+
+    @app.get("/api/reference-corpus/scripts/<script_id>")
+    def reference_corpus_script(script_id: str):
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        try:
+            result = marketing_script_compiler.get(script_id)
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_script", {"script_id": script_id}, error, started
+            )
+        if result is None:
+            return audited_agent_response(
+                "reference_corpus_script",
+                {"script_id": script_id},
+                {"status": "error", "code": "REFERENCE_SCRIPT_NOT_FOUND"},
+                404,
+                started,
+            )
+        return audited_agent_response(
+            "reference_corpus_script",
+            {"script_id": script_id},
+            result,
+            started_at=started,
+        )
+
     @app.post("/api/reference-corpus/acquire")
     def reference_corpus_acquire():
         denied = require_agent_auth()
@@ -631,6 +687,25 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                         "title", "objective", "target_viewer", "target_seconds",
                     ],
                     "rights_gate": "patterns_only_no_copy_or_identity_imitation",
+                },
+                "write_reference_marketing_script": {
+                    "method": "POST",
+                    "path": "/api/reference-corpus/write-script",
+                    "contract": "reference_marketing_script_request_v1",
+                    "required": [
+                        "corpus_id", "title", "topic", "audience",
+                        "objective", "target_seconds", "narrative",
+                    ],
+                    "effect": (
+                        "compile a deterministic spoken script, audit the exact "
+                        "draft, and persist an immutable package receipt"
+                    ),
+                    "rights_gate": "patterns_only_no_copy_or_identity_imitation",
+                },
+                "get_reference_marketing_script": {
+                    "method": "GET",
+                    "path": "/api/reference-corpus/scripts/{script_id}",
+                    "required": ["script_id"],
                 },
                 "acquire_reference_corpus": {
                     "method": "POST",

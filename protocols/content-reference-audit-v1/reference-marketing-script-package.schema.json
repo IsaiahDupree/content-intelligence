@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:reference-marketing-script-package:v1",
+  "title": "Reference Marketing Script Package",
+  "type": "object",
+  "required": [
+    "status",
+    "contract",
+    "script_id",
+    "corpus_id",
+    "context_id",
+    "request_sha256",
+    "marketing_logic",
+    "script",
+    "quality",
+    "corpus_audit",
+    "reference_context",
+    "rights",
+    "lineage",
+    "created_at",
+    "result_sha256"
+  ],
+  "properties": {
+    "status": {"enum": ["approved", "revise"]},
+    "contract": {"const": "reference_marketing_script_package_v1"},
+    "script_id": {"type": "string", "minLength": 1},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "context_id": {"type": "string", "minLength": 1},
+    "request_contract": {"const": "reference_marketing_script_request_v1"},
+    "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "request": {
+      "$ref": "./reference-marketing-script-request.schema.json"
+    },
+    "marketing_logic": {
+      "type": "object",
+      "required": ["objective", "angle", "audience", "value_sequence"]
+    },
+    "script": {
+      "type": "object",
+      "required": [
+        "title",
+        "target_seconds",
+        "word_count",
+        "estimated_seconds_at_reference_pace",
+        "required_words_per_second",
+        "transcript",
+        "beats"
+      ],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "target_seconds": {"type": "integer", "minimum": 15, "maximum": 1800},
+        "word_count": {"type": "integer", "minimum": 1},
+        "estimated_seconds_at_reference_pace": {"type": "number", "minimum": 0},
+        "required_words_per_second": {"type": "number", "minimum": 0},
+        "transcript": {"type": "string", "minLength": 1},
+        "beats": {
+          "type": "array",
+          "minItems": 8,
+          "items": {
+            "type": "object",
+            "required": [
+              "node_id",
+              "block",
+              "purpose",
+              "text",
+              "start_seconds",
+              "end_seconds",
+              "word_count"
+            ]
+          }
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["status", "score", "checks", "failed_checks"]
+    },
+    "corpus_audit": {
+      "$ref": "./content-creation-audit.schema.json"
+    },
+    "reference_context": {"type": "object"},
+    "rights": {
+      "type": "object",
+      "required": [
+        "state",
+        "source_clips_used",
+        "direct_use_allowed",
+        "identity_imitation_allowed",
+        "voice_imitation_allowed",
+        "exact_draft_copy_gate_passed"
+      ],
+      "properties": {
+        "state": {"const": "public_reference_analysis_only"},
+        "source_clips_used": {"const": false},
+        "direct_use_allowed": {"const": false},
+        "identity_imitation_allowed": {"const": false},
+        "voice_imitation_allowed": {"const": false},
+        "exact_draft_copy_gate_passed": {"type": "boolean"}
+      }
+    },
+    "lineage": {"type": "object"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "result_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  },
+  "additionalProperties": true
+}

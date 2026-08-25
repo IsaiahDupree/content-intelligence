@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:reference-marketing-script-request:v1",
+  "title": "Reference Marketing Script Request",
+  "type": "object",
+  "required": [
+    "contract",
+    "corpus_id",
+    "title",
+    "topic",
+    "audience",
+    "objective",
+    "angle",
+    "target_seconds",
+    "narrative"
+  ],
+  "properties": {
+    "contract": {"const": "reference_marketing_script_request_v1"},
+    "corpus_id": {"type": "string", "minLength": 1, "maxLength": 240},
+    "title": {"type": "string", "minLength": 1, "maxLength": 240},
+    "topic": {"type": "string", "minLength": 1, "maxLength": 500},
+    "audience": {"type": "string", "minLength": 1, "maxLength": 500},
+    "objective": {
+      "enum": ["awareness", "educate", "engage", "convert"]
+    },
+    "angle": {
+      "enum": ["contrast", "problem_first", "how_to", "myth"]
+    },
+    "target_seconds": {"type": "integer", "minimum": 15, "maximum": 1800},
+    "narrative": {
+      "type": "object",
+      "required": [
+        "hook",
+        "problem",
+        "stakes",
+        "reframe",
+        "steps",
+        "proof",
+        "takeaway",
+        "cta"
+      ],
+      "properties": {
+        "hook": {"type": "string", "minLength": 1, "maxLength": 400},
+        "problem": {"type": "string", "minLength": 1, "maxLength": 700},
+        "stakes": {"type": "string", "minLength": 1, "maxLength": 700},
+        "reframe": {"type": "string", "minLength": 1, "maxLength": 700},
+        "steps": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": {"type": "string", "minLength": 1, "maxLength": 500}
+        },
+        "proof": {
+          "type": "object",
+          "required": ["statement", "evidence_type"],
+          "properties": {
+            "statement": {"type": "string", "minLength": 1, "maxLength": 1200},
+            "evidence_type": {
+              "enum": [
+                "worked_example",
+                "experience",
+                "owned_measurement",
+                "sourced_fact",
+                "hypothesis"
+              ]
+            },
+            "source_receipt_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1}
+            }
+          },
+          "additionalProperties": false
+        },
+        "takeaway": {"type": "string", "minLength": 1, "maxLength": 700},
+        "cta": {
+          "type": "object",
+          "required": ["text", "action"],
+          "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 400},
+            "action": {"type": "string", "minLength": 1, "maxLength": 80},
+            "destination": {"type": "string", "maxLength": 500}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "offer": {
+      "type": "object",
+      "properties": {
+        "offer_id": {"type": "string", "maxLength": 160},
+        "name": {"type": "string", "maxLength": 240}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

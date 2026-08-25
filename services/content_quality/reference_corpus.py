@@ -404,6 +404,32 @@ class ReferenceCorpusService:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(corpus_id) REFERENCES reference_corpora(corpus_id)
                 );
+                CREATE TABLE IF NOT EXISTS reference_script_packages (
+                    script_id TEXT PRIMARY KEY,
+                    corpus_id TEXT NOT NULL,
+                    contract TEXT NOT NULL,
+                    request_sha256 TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    audit_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    package_json TEXT NOT NULL,
+                    result_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(corpus_id) REFERENCES reference_corpora(corpus_id),
+                    FOREIGN KEY(audit_id) REFERENCES reference_audit_receipts(audit_id)
+                );
+                CREATE INDEX IF NOT EXISTS reference_script_packages_corpus_idx
+                    ON reference_script_packages(corpus_id, created_at DESC);
+                CREATE TRIGGER IF NOT EXISTS reference_script_packages_no_update
+                BEFORE UPDATE ON reference_script_packages
+                BEGIN
+                    SELECT RAISE(ABORT, 'reference script packages are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reference_script_packages_no_delete
+                BEFORE DELETE ON reference_script_packages
+                BEGIN
+                    SELECT RAISE(ABORT, 'reference script packages are immutable');
+                END;
                 """
             )
             connection.commit()
@@ -1797,6 +1823,10 @@ class ReferenceCorpusService:
                 "SELECT COUNT(*) FROM reference_audit_receipts WHERE corpus_id=?",
                 (corpus_id,),
             ).fetchone()[0])
+            script_count = int(connection.execute(
+                "SELECT COUNT(*) FROM reference_script_packages WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()[0])
         corpus = dict(corpus_row)
         corpus["profile"] = json.loads(corpus.pop("profile_json") or "{}")
         states = {str(row["extraction_state"]): int(row["count"]) for row in state_rows}
@@ -1810,6 +1840,7 @@ class ReferenceCorpusService:
                 "raw_receipts": raw_count,
                 "failures": failure_count,
                 "audits": audit_count,
+                "script_packages": script_count,
                 "extraction_states": states,
             },
             "coverage": round(
@@ -1818,6 +1849,66 @@ class ReferenceCorpusService:
             "source_clips_retained": False,
             "checked_at": utc_now(),
         }
+
+    def get_script_package(self, script_id: str) -> dict[str, Any] | None:
+        clean_id = str(script_id or "").strip()
+        if not clean_id:
+            raise ValueError("script_id is required")
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT package_json, result_sha256 FROM reference_script_packages WHERE script_id=?",
+                (clean_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        package = json.loads(str(row["package_json"]))
+        hash_input = dict(package)
+        claimed_hash = str(hash_input.pop("result_sha256", ""))
+        actual_hash = canonical_sha256(hash_input)
+        if claimed_hash != actual_hash or claimed_hash != str(row["result_sha256"]):
+            raise RuntimeError(f"reference script package hash mismatch: {clean_id}")
+        return package
+
+    def put_script_package(self, package: dict[str, Any]) -> dict[str, Any]:
+        required = {
+            "script_id", "corpus_id", "contract", "request_sha256",
+            "context_id", "status", "corpus_audit", "created_at",
+            "result_sha256",
+        }
+        missing = sorted(required - package.keys())
+        if missing:
+            raise ValueError(
+                "script package is missing required fields: " + ", ".join(missing)
+            )
+        audit_id = str((package.get("corpus_audit") or {}).get("audit_id") or "")
+        if not audit_id:
+            raise ValueError("script package corpus_audit.audit_id is required")
+        hash_input = dict(package)
+        claimed_hash = str(hash_input.pop("result_sha256") or "")
+        actual_hash = canonical_sha256(hash_input)
+        if claimed_hash != actual_hash:
+            raise ValueError("script package result_sha256 is invalid")
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO reference_script_packages(
+                       script_id, corpus_id, contract, request_sha256,
+                       context_id, audit_id, status, package_json,
+                       result_sha256, created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(package["script_id"]), str(package["corpus_id"]),
+                    str(package["contract"]), str(package["request_sha256"]),
+                    str(package["context_id"]), audit_id,
+                    str(package["status"]),
+                    json.dumps(package, sort_keys=True), claimed_hash,
+                    str(package["created_at"]),
+                ),
+            )
+            connection.commit()
+        stored = self.get_script_package(str(package["script_id"]))
+        if stored is None or stored.get("request_sha256") != package.get("request_sha256"):
+            raise RuntimeError("reference script package idempotency conflict")
+        return stored
 
     def health(self) -> dict[str, Any]:
         with closing(self.connect()) as connection:

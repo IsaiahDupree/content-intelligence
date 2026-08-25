@@ -1,0 +1,1727 @@
+{
+  "context_id": "refctx_3bb8dd965eec7485ef00adea",
+  "contract": "reference_marketing_script_package_v1",
+  "corpus_audit": {
+    "audit_id": "refaudit_95ef7c6b784c13fd08fd5c25",
+    "contract": "content_creation_audit_v1",
+    "copy_gate": {
+      "maximum_five_word_overlap": 0.0,
+      "nearest_item_id": "",
+      "passed": true
+    },
+    "corpus_coverage": 100.0,
+    "corpus_id": "instagram-personalbrandlaunch-reference-v1",
+    "corpus_item_count": 150,
+    "created_at": "2026-08-25T19:03:53.867295+00:00",
+    "evidence": [
+      {
+        "caption_excerpt": "If I Had to Implement AI, into My Content Workflow From Scratch This is What I Would Do. \n\nIf you want a more in-depth breakdown on how to do this, comment “AI” and I'll send you my video breaking this down.",
+        "comments": 1596,
+        "direct_use_allowed": false,
+        "item_id": "refitem_d632f49e724c981efa81f461",
+        "likes": 2119,
+        "match_score": 34.653,
+        "matched_terms": [
+          "action",
+          "agent",
+          "agents",
+          "before",
+          "but",
+          "clear",
+          "example",
+          "give",
+          "how",
+          "keep",
+          "more",
+          "next",
+          "not",
+          "one",
+          "problem",
+          "real",
+          "run",
+          "software",
+          "test",
+          "three",
+          "way",
+          "what",
+          "workflow",
+          "workflows"
+        ],
+        "published_at": "2026-07-18T12:01:39+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "But if you want more in depth breakdown on it, just comment AI and I will send you a YouTube video on myself explaining this",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 2",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "How would you implement AI in your content workflow",
+            "Number one, break down your content workflow into a step-by-step process, all the way from start to finish",
+            "For example, it might look like this, research, ideation, scripting, filming, editing, and uploading",
+            "Step number two, break down each step into workflows",
+            "Think of your workflows like SOPs",
+            "You might have five plus SOPs for one step slash part of the process",
+            "Step number three, break down each workflow slash SOP into their individual steps",
+            "For each workflow, just like you would in an SOP, break down every single step you would take to complete it from start to finish"
+          ],
+          "on_screen_hook": "If I Had to Implement AI, into My Content Workflow From Scratch This is What I Would Do. \n\nIf you want a more in-depth breakdown on how to do this, comment “AI” and I'll send you m",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "If I Had to Implement AI, into My Content Workflow From Scratch This is What I Would Do.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "how would you implement ai in your content workflow number one break down your content workflow into a step-by-step process all the way from",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/Da7vej6l6VX/",
+        "transcript_opening": "How would you implement AI in your content workflow? Number one, break down your content workflow into a step-by-step process, all the way from start to finish. For example, it might look like this, research, ideation, scripting, filming, e",
+        "views": 101397
+      },
+      {
+        "caption_excerpt": "Weekly Diary - Episode #25",
+        "comments": 16,
+        "direct_use_allowed": false,
+        "item_id": "refitem_21f47d81e33e160c042b51ef",
+        "likes": 397,
+        "match_score": 33.707,
+        "matched_terms": [
+          "action",
+          "bad",
+          "before",
+          "business",
+          "but",
+          "clear",
+          "costs",
+          "how",
+          "keep",
+          "money",
+          "more",
+          "much",
+          "next",
+          "not",
+          "one",
+          "person",
+          "problem",
+          "read",
+          "real",
+          "run",
+          "then",
+          "three",
+          "what",
+          "working"
+        ],
+        "published_at": "2026-07-26T19:00:05+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 2",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "It's the 4th of July",
+            "Just finished work for the day",
+            "Let's get festive",
+            "Boom",
+            "Not super festive",
+            "This is all I got though",
+            "And I'm gonna go film a video real quick for social",
+            "And then I'm gonna get some stuff ready for the four"
+          ],
+          "on_screen_hook": "Weekly Diary - Episode #25",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Weekly Diary - Episode #25",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "it's the 4th of july just finished work for the day let's get festive boom not super festive this is all i got though",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbRF4aih0Jj/",
+        "transcript_opening": "It's the 4th of July. Just finished work for the day. Let's get festive. Boom. Not super festive. This is all I got though. And I'm gonna go film a video real quick for social. And then I'm gonna get some stuff ready for the four. Good. Thi",
+        "views": 39211
+      },
+      {
+        "caption_excerpt": "I Cracked Facebook Ads.\n\nFollow for more social media marketing education.",
+        "comments": 102,
+        "direct_use_allowed": false,
+        "item_id": "refitem_67792487f51082fd5116ebec",
+        "likes": 4676,
+        "match_score": 33.07,
+        "matched_terms": [
+          "action",
+          "add",
+          "before",
+          "but",
+          "change",
+          "clear",
+          "convert",
+          "data",
+          "how",
+          "keep",
+          "money",
+          "more",
+          "need",
+          "never",
+          "next",
+          "not",
+          "one",
+          "run",
+          "test",
+          "then",
+          "three",
+          "way"
+        ],
+        "published_at": "2026-06-11T12:02:12+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "But I hope this helped and follow from our social media marketing education",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 4",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "So I've like never successfully run Facebook ads before in my life",
+            "Yeah, I've failed every single time until now",
+            "You see, you're girls in organic growing",
+            "I've only forgotten my leads from organic social media",
+            "Until I got this advice from Hermosey on probably the best way to run ads",
+            "Here's exactly how",
+            "Step number one, you need to find posts",
+            "Go on your account and find your best performing posts, preferably the ones you get the most saves or leads on"
+          ],
+          "on_screen_hook": "I Cracked Facebook Ads.\n\nFollow for more social media marketing education.",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "I Cracked Facebook Ads.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "so i've like never successfully run facebook ads before in my life yeah i've failed every single time until now you see you're girls",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DZcdwj4hvg2/",
+        "transcript_opening": "So I've like never successfully run Facebook ads before in my life. Yeah, I've failed every single time until now. You see, you're girls in organic growing. I've only forgotten my leads from organic social media. Until I got this advice fro",
+        "views": 144000
+      },
+      {
+        "caption_excerpt": "Creative Reels That Inspired Me This Week. \n\nFollow for more social media marketing education!",
+        "comments": 9,
+        "direct_use_allowed": false,
+        "item_id": "refitem_205f7f7b3d9e5e839a98783c",
+        "likes": 426,
+        "match_score": 32.571,
+        "matched_terms": [
+          "action",
+          "add",
+          "before",
+          "business",
+          "but",
+          "clear",
+          "give",
+          "keep",
+          "more",
+          "much",
+          "needs",
+          "not",
+          "one",
+          "person",
+          "real",
+          "showing",
+          "them",
+          "then",
+          "three",
+          "way",
+          "what",
+          "who",
+          "working"
+        ],
+        "published_at": "2026-07-30T12:00:04+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 4",
+            "low frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "Here are some creative rules that were Lanes Power Game this week",
+            "Okay, number one, we got the series Recap video",
+            "Remember Lewis, my eight year's best mate",
+            "Three months ago, we finished the 12-week alpha course together",
+            "If you've ever done a series, it's been really good for you",
+            "But it's basically just a recap of that series, where you're at now, what's changed from the start, a recap of the results, and so on",
+            "Number two, we got the person highlight videos",
+            "Imagine starting your life over at 62, and that's pretty much what my mom just did"
+          ],
+          "on_screen_hook": "Creative Reels That Inspired Me This Week. \n\nFollow for more social media marketing education!",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Creative Reels That Inspired Me This Week.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "here are some creative rules that were lanes power game this week okay number one we got the series recap video remember lewis my",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbapAqahjWZ/",
+        "transcript_opening": "Here are some creative rules that were Lanes Power Game this week. Okay, number one, we got the series Recap video. Remember Lewis, my eight year's best mate. Three months ago, we finished the 12-week alpha course together. If you've ever d",
+        "views": 33042
+      },
+      {
+        "caption_excerpt": "Who Will Get More Leads? \n\nWant an example of a freebie that has generated over 100,000+ leads for my business? Comment “HOOK” and I’ll send it over.",
+        "comments": 261,
+        "direct_use_allowed": false,
+        "item_id": "refitem_41668520bdac82cce4920e1a",
+        "likes": 830,
+        "match_score": 32.158,
+        "matched_terms": [
+          "action",
+          "add",
+          "before",
+          "business",
+          "but",
+          "clear",
+          "email",
+          "example",
+          "how",
+          "keep",
+          "more",
+          "need",
+          "next",
+          "not",
+          "one",
+          "problem",
+          "real",
+          "them",
+          "then",
+          "three",
+          "way",
+          "who"
+        ],
+        "published_at": "2026-07-22T12:07:21+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "If you want an example of my freebie that has gotten me over 100,000 leads, comment, hook, and I'll go ahead and send it over",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 2",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "frequent visual resets",
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "Two business owners are trying to get leads on social media",
+            "Business owner A, post 10-14 reals a week, seven stories a week, and five care cells per week, but 75% of their posts having CTA's to their paid offer mining page",
+            "Business owner B, posts five to seven reals per week, five stories per week, and two care cells per week with 50% of CTA's leading to their lead magnet freebie",
+            "So who got more leads after one month",
+            "They both actually got thousands of leads, but this is how more of those leads converted into paid clients, even though they used a freebie",
+            "But why",
+            "Eva, isn't this just a hypothetical situation",
+            "Actually, no, because this has happened to me personally and a ton of my clients"
+          ],
+          "on_screen_hook": "Who Will Get More Leads? \n\nWant an example of a freebie that has generated over 100,000+ leads for my business? Comment “HOOK” and I’ll send it over.",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Who Will Get More Leads?",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast",
+            "rapid cuts"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "two business owners are trying to get leads on social media business owner a post 10-14 reals a week seven stories a week and",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbGC_57szLC/",
+        "transcript_opening": "Two business owners are trying to get leads on social media. Business owner A, post 10-14 reals a week, seven stories a week, and five care cells per week, but 75% of their posts having CTA's to their paid offer mining page. Business owner ",
+        "views": 57623
+      },
+      {
+        "caption_excerpt": "What Your Follower Count Says About You. \n\nBusiness owners looking to grow and sell on social media, if you want to get to the next level up, comment “SMM”.",
+        "comments": 187,
+        "direct_use_allowed": false,
+        "item_id": "refitem_39f678179f959ce47eff163e",
+        "likes": 2491,
+        "match_score": 31.728,
+        "matched_terms": [
+          "action",
+          "before",
+          "business",
+          "but",
+          "change",
+          "give",
+          "how",
+          "keep",
+          "more",
+          "much",
+          "need",
+          "never",
+          "next",
+          "not",
+          "one",
+          "them",
+          "then",
+          "three",
+          "way",
+          "what",
+          "working"
+        ],
+        "published_at": "2026-06-10T12:02:14+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 7",
+            "low frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "You just started a new account and you've been posting for maybe a few weeks or maybe a few months",
+            "Either way, I know every post you make probably gets incredibly low views and it is so discouraging and you are about to give up",
+            "But keep pushing because one day out of nowhere you will get a video that works and it will build your momentum so whatever you do do not give up",
+            "Fun fact, on this account I posted for three months in that incredibly low views till one day, one video about 1 million views and I never looked back but those three months of incredibly low views were humbling but almost necessary on a new account",
+            "You've probably been posting for a few months and just got out of the hard phase of growing an account",
+            "Congrats, your videos are probably getting a couple hundred to a couple thousand views",
+            "Stay consistent on the topic you're posting about and try not to jump all over the place",
+            "Also, research viral hooks and topics in your niche and iterate off of those because they're properly proven and they have a good shot of working for you"
+          ],
+          "on_screen_hook": "What Your Follower Count Says About You. \n\nBusiness owners looking to grow and sell on social media, if you want to get to the next level up, comment “SMM”.",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "What Your Follower Count Says About You.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "you just started a new account and you've been posting for maybe a few weeks or maybe a few months either way i know",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DZZ5HdSBwqt/",
+        "transcript_opening": "You just started a new account and you've been posting for maybe a few weeks or maybe a few months. Either way, I know every post you make probably gets incredibly low views and it is so discouraging and you are about to give up. But keep p",
+        "views": 98665
+      }
+    ],
+    "notes": [],
+    "objective": "convert",
+    "overall_score": 87.247,
+    "request_sha256": "cede8ae6953ee4bb8baef4d1cd17bff6b659523069392c6f37786b7701f8a966",
+    "result_sha256": "9b4e65f7afb49816d365fd9847f7b31b6ad68493d60e3995646faef9b5cca48b",
+    "rights": {
+      "direct_use_allowed": false,
+      "identity_imitation_allowed": false,
+      "state": "public_reference_analysis_only"
+    },
+    "scores": {
+      "call_to_action": 81.0,
+      "duration_fit": 82.979,
+      "hook_clarity": 71.0,
+      "narrative_flow": 96.0,
+      "originality": 100.0,
+      "source_evidence": 95.0
+    },
+    "status": "pass",
+    "target_seconds": 60,
+    "target_viewer": "software founders adding AI agents to real business workflows",
+    "title": "Your AI Agent Needs a Kill Switch",
+    "word_count": 165
+  },
+  "corpus_id": "instagram-personalbrandlaunch-reference-v1",
+  "created_at": "2026-08-25T19:03:53.871671+00:00",
+  "lineage": {
+    "audit_result_sha256": "9b4e65f7afb49816d365fd9847f7b31b6ad68493d60e3995646faef9b5cca48b",
+    "compiler": "reference_marketing_script_compiler_v1",
+    "context_result_sha256": "b87b252009ef034946d0e14a7f74b015959ab65f1d229d6b407ff2c6483683da",
+    "request_sha256": "ca1de432d83522e77b9428e03f847449739ff0a8d72d42dc258ca2e2298ab841",
+    "writer_mode": "deterministic_no_model"
+  },
+  "marketing_logic": {
+    "angle": "problem_first",
+    "audience": "software founders adding AI agents to real business workflows",
+    "objective": "convert",
+    "offer_id": "ai-automation-audit-build",
+    "value_sequence": [
+      "recognition",
+      "stakes",
+      "reframe",
+      "steps",
+      "proof",
+      "takeaway",
+      "call_to_action"
+    ]
+  },
+  "quality": {
+    "checks": {
+      "claim_evidence": {
+        "evidence_type": "worked_example",
+        "passed": true,
+        "score": 100.0,
+        "source_receipt_ids": []
+      },
+      "direct_audience_language": {
+        "direct_address_count": 4,
+        "passed": true,
+        "score": 100.0
+      },
+      "duration_fit": {
+        "actual_words": 165,
+        "passed": true,
+        "score": 82.979,
+        "target_words": 141
+      },
+      "hook": {
+        "passed": true,
+        "score": 100.0,
+        "word_count": 15
+      },
+      "plain_language": {
+        "average_sentence_words": 12.692,
+        "jargon_hits": [],
+        "maximum_sentence_words": 17,
+        "passed": true,
+        "score": 100.0
+      },
+      "single_cta": {
+        "action": "book an audit",
+        "passed": true,
+        "score": 100.0,
+        "word_count": 17
+      },
+      "useful_steps": {
+        "count": 3,
+        "passed": true,
+        "score": 100.0
+      },
+      "value_before_offer": {
+        "passed": true,
+        "score": 100.0
+      }
+    },
+    "failed_checks": [],
+    "score": 96.596,
+    "status": "pass"
+  },
+  "reference_context": {
+    "context_id": "refctx_3bb8dd965eec7485ef00adea",
+    "contract": "content_reference_agent_context_v1",
+    "coverage": {
+      "extracted_count": 150,
+      "item_count": 150,
+      "semantic_count": 150,
+      "transcript_count": 150,
+      "visual_count": 150
+    },
+    "descriptive_associations": {
+      "corpus_views_midpoint": 61073.0,
+      "cut_rate_bands": [
+        {
+          "count": 73,
+          "engagement_rate_midpoint": 0.019319,
+          "value": "under_5_per_minute",
+          "view_lift_vs_corpus_midpoint": 0.9324,
+          "views_average": 129791.055,
+          "views_midpoint": 56946.0
+        },
+        {
+          "count": 50,
+          "engagement_rate_midpoint": 0.020969,
+          "value": "5_to_12_per_minute",
+          "view_lift_vs_corpus_midpoint": 0.8902,
+          "views_average": 63378.08,
+          "views_midpoint": 54369.0
+        },
+        {
+          "count": 27,
+          "engagement_rate_midpoint": 0.024934,
+          "value": "over_12_per_minute",
+          "view_lift_vs_corpus_midpoint": 1.2846,
+          "views_average": 138159.185,
+          "views_midpoint": 78456.0
+        }
+      ],
+      "duration_bands": [
+        {
+          "count": 23,
+          "engagement_rate_midpoint": 0.018181,
+          "value": "up_to_30_seconds",
+          "view_lift_vs_corpus_midpoint": 1.1494,
+          "views_average": 94268.783,
+          "views_midpoint": 70198.0
+        },
+        {
+          "count": 61,
+          "engagement_rate_midpoint": 0.021186,
+          "value": "31_to_60_seconds",
+          "view_lift_vs_corpus_midpoint": 1.0202,
+          "views_average": 91214.066,
+          "views_midpoint": 62305.0
+        },
+        {
+          "count": 37,
+          "engagement_rate_midpoint": 0.024448,
+          "value": "61_to_90_seconds",
+          "view_lift_vs_corpus_midpoint": 1.2498,
+          "views_average": 187761.27,
+          "views_midpoint": 76332.0
+        },
+        {
+          "count": 29,
+          "engagement_rate_midpoint": 0.018933,
+          "value": "over_90_seconds",
+          "view_lift_vs_corpus_midpoint": 0.8882,
+          "views_average": 58432.483,
+          "views_midpoint": 54245.0
+        }
+      ],
+      "editing_devices": [
+        {
+          "count": 27,
+          "engagement_rate_midpoint": 0.024934,
+          "value": "frequent visual resets",
+          "view_lift_vs_corpus_midpoint": 1.2846,
+          "views_average": 138159.185,
+          "views_midpoint": 78456.0
+        },
+        {
+          "count": 150,
+          "engagement_rate_midpoint": 0.020969,
+          "value": "on-screen text",
+          "view_lift_vs_corpus_midpoint": 1.0,
+          "views_average": 109159.66,
+          "views_midpoint": 61073.0
+        },
+        {
+          "count": 76,
+          "engagement_rate_midpoint": 0.020042,
+          "value": "active framing",
+          "view_lift_vs_corpus_midpoint": 0.9027,
+          "views_average": 82247.013,
+          "views_midpoint": 55133.5
+        }
+      ],
+      "formats": [
+        {
+          "count": 69,
+          "engagement_rate_midpoint": 0.022185,
+          "value": "presenter-led explainer",
+          "view_lift_vs_corpus_midpoint": 1.1106,
+          "views_average": 137683.377,
+          "views_midpoint": 67830.0
+        },
+        {
+          "count": 81,
+          "engagement_rate_midpoint": 0.020021,
+          "value": "contrast-led skit",
+          "view_lift_vs_corpus_midpoint": 0.9324,
+          "views_average": 84861.679,
+          "views_midpoint": 56942.0
+        }
+      ],
+      "linear_links_to_log_views": {
+        "cut_rate_per_minute": 0.216879,
+        "duration_seconds": -0.18163,
+        "spoken_words_per_second": -0.190568
+      },
+      "retention_devices": [
+        {
+          "count": 27,
+          "engagement_rate_midpoint": 0.024934,
+          "value": "rapid cuts",
+          "view_lift_vs_corpus_midpoint": 1.2846,
+          "views_average": 138159.185,
+          "views_midpoint": 78456.0
+        },
+        {
+          "count": 67,
+          "engagement_rate_midpoint": 0.022095,
+          "value": "questions",
+          "view_lift_vs_corpus_midpoint": 1.0852,
+          "views_average": 93105.522,
+          "views_midpoint": 66275.0
+        },
+        {
+          "count": 54,
+          "engagement_rate_midpoint": 0.020205,
+          "value": "contrast",
+          "view_lift_vs_corpus_midpoint": 0.8946,
+          "views_average": 84035.611,
+          "views_midpoint": 54635.5
+        }
+      ],
+      "warning": "single observed counter snapshots show association, not causation"
+    },
+    "evidence": [
+      {
+        "caption_excerpt": "If I Had to Implement AI, into My Content Workflow From Scratch This is What I Would Do. \n\nIf you want a more in-depth breakdown on how to do this, comment “AI” and I'll send you my video breaking this down.",
+        "comments": 1596,
+        "direct_use_allowed": false,
+        "item_id": "refitem_d632f49e724c981efa81f461",
+        "likes": 2119,
+        "match_score": 41.471,
+        "matched_terms": [
+          "agents",
+          "before",
+          "can",
+          "control",
+          "give",
+          "how",
+          "real",
+          "software",
+          "three",
+          "workflow",
+          "workflows",
+          "write"
+        ],
+        "published_at": "2026-07-18T12:01:39+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "But if you want more in depth breakdown on it, just comment AI and I will send you a YouTube video on myself explaining this",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 2",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "How would you implement AI in your content workflow",
+            "Number one, break down your content workflow into a step-by-step process, all the way from start to finish",
+            "For example, it might look like this, research, ideation, scripting, filming, editing, and uploading",
+            "Step number two, break down each step into workflows",
+            "Think of your workflows like SOPs",
+            "You might have five plus SOPs for one step slash part of the process",
+            "Step number three, break down each workflow slash SOP into their individual steps",
+            "For each workflow, just like you would in an SOP, break down every single step you would take to complete it from start to finish"
+          ],
+          "on_screen_hook": "If I Had to Implement AI, into My Content Workflow From Scratch This is What I Would Do. \n\nIf you want a more in-depth breakdown on how to do this, comment “AI” and I'll send you m",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "If I Had to Implement AI, into My Content Workflow From Scratch This is What I Would Do.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "how would you implement ai in your content workflow number one break down your content workflow into a step-by-step process all the way from",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/Da7vej6l6VX/",
+        "transcript_opening": "How would you implement AI in your content workflow? Number one, break down your content workflow into a step-by-step process, all the way from start to finish. For example, it might look like this, research, ideation, scripting, filming, e",
+        "views": 101397
+      },
+      {
+        "caption_excerpt": "Who Will Get More Leads? \n\nWant an example of a freebie that has generated over 100,000+ leads for my business? Comment “HOOK” and I’ll send it over.",
+        "comments": 261,
+        "direct_use_allowed": false,
+        "item_id": "refitem_41668520bdac82cce4920e1a",
+        "likes": 830,
+        "match_score": 38.408,
+        "matched_terms": [
+          "access",
+          "add",
+          "before",
+          "business",
+          "can",
+          "email",
+          "how",
+          "real",
+          "them",
+          "then",
+          "three"
+        ],
+        "published_at": "2026-07-22T12:07:21+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "If you want an example of my freebie that has gotten me over 100,000 leads, comment, hook, and I'll go ahead and send it over",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 2",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "frequent visual resets",
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "Two business owners are trying to get leads on social media",
+            "Business owner A, post 10-14 reals a week, seven stories a week, and five care cells per week, but 75% of their posts having CTA's to their paid offer mining page",
+            "Business owner B, posts five to seven reals per week, five stories per week, and two care cells per week with 50% of CTA's leading to their lead magnet freebie",
+            "So who got more leads after one month",
+            "They both actually got thousands of leads, but this is how more of those leads converted into paid clients, even though they used a freebie",
+            "But why",
+            "Eva, isn't this just a hypothetical situation",
+            "Actually, no, because this has happened to me personally and a ton of my clients"
+          ],
+          "on_screen_hook": "Who Will Get More Leads? \n\nWant an example of a freebie that has generated over 100,000+ leads for my business? Comment “HOOK” and I’ll send it over.",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Who Will Get More Leads?",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast",
+            "rapid cuts"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "two business owners are trying to get leads on social media business owner a post 10-14 reals a week seven stories a week and",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbGC_57szLC/",
+        "transcript_opening": "Two business owners are trying to get leads on social media. Business owner A, post 10-14 reals a week, seven stories a week, and five care cells per week, but 75% of their posts having CTA's to their paid offer mining page. Business owner ",
+        "views": 57623
+      },
+      {
+        "caption_excerpt": "What’s the Viral Script Structure, Short Form Content Technique? \n\nFollow for more social media marketing education!",
+        "comments": 33,
+        "direct_use_allowed": false,
+        "item_id": "refitem_8310e7e9a263f29c8df6b547",
+        "likes": 515,
+        "match_score": 37.967,
+        "matched_terms": [
+          "add",
+          "adding",
+          "before",
+          "can",
+          "how",
+          "real",
+          "software",
+          "successful",
+          "then",
+          "three",
+          "write"
+        ],
+        "published_at": "2026-07-14T12:09:33+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 4",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "Ava, what's the viral script structure, short form content technique",
+            "Yeah, script structures are basically like film-blink script templates",
+            "There are easy script structures, for example",
+            "If you drink apple cider vinegar with lemon, your belly feels flatter and less puffy",
+            "Complex script structures, for example",
+            "Did you know if you take a white best star, a black best star, a white shirt, a blue striped shirt, and you can mix and match these pieces",
+            "Educational script structures, for example",
+            "Three levels of tomato pasta"
+          ],
+          "on_screen_hook": "What’s the Viral Script Structure, Short Form Content Technique? \n\nFollow for more social media marketing education!",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "What’s the Viral Script Structure, Short Form Content Technique?",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "ava what's the viral script structure short form content technique yeah script structures are basically like film-blink script templates there are easy script structures",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DaxccxlBfwP/",
+        "transcript_opening": "Ava, what's the viral script structure, short form content technique? Yeah, script structures are basically like film-blink script templates. There are easy script structures, for example. If you drink apple cider vinegar with lemon, your b",
+        "views": 36963
+      },
+      {
+        "caption_excerpt": "What Pinned Posts Should You Have On Your Profile? \n\nBusiness owners looking to grow and sell on social media comment “SMM” for more information!",
+        "comments": 117,
+        "direct_use_allowed": false,
+        "item_id": "refitem_2043b062bd15b93ca11afc23",
+        "likes": 1679,
+        "match_score": 33.831,
+        "matched_terms": [
+          "before",
+          "business",
+          "can",
+          "customer",
+          "how",
+          "real",
+          "successful",
+          "then",
+          "three"
+        ],
+        "published_at": "2026-07-19T19:01:58+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 3",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "frequent visual resets",
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "What post should you pin on your profile",
+            "Yeah, there are different types of pin post formulas for different types of creators",
+            "So if you are a service based business owner here, the pin post I recommend",
+            "Pin number one, a my story slash founder story",
+            "So how you got into slash star of your business",
+            "Here are some of my favorite templates to create this for pin number two, a how we work together type of real",
+            "This is a step by step process of how you work with a client slash customer",
+            "This can show your process, a real client example, or your own before and after"
+          ],
+          "on_screen_hook": "What Pinned Posts Should You Have On Your Profile? \n\nBusiness owners looking to grow and sell on social media comment “SMM” for more information!",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "What Pinned Posts Should You Have On Your Profile?",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast",
+            "rapid cuts"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "what post should you pin on your profile yeah there are different types of pin post formulas for different types of creators so if",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/Da_EXdbigkD/",
+        "transcript_opening": "What post should you pin on your profile? Yeah, there are different types of pin post formulas for different types of creators. So if you are a service based business owner here, the pin post I recommend. Pin number one, a my story slash fo",
+        "views": 88089
+      },
+      {
+        "caption_excerpt": "Business owners looking to grow and sell on social media, and want done for you monthly research, ideation, scripting, editing, and uploading, comment SMM for more information.",
+        "comments": 221,
+        "direct_use_allowed": false,
+        "item_id": "refitem_1d9f34349c148bfac7e8238b",
+        "likes": 1126,
+        "match_score": 33.471,
+        "matched_terms": [
+          "add",
+          "before",
+          "business",
+          "can",
+          "how",
+          "them",
+          "then",
+          "three",
+          "write"
+        ],
+        "published_at": "2026-07-23T12:25:24+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "And if you want me and my team to just do this for you, comment SMM for more information",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 9",
+            "low frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "If I wanted to grow my Instagram from zero to 10,000 followers, this is how I'd do it",
+            "Sub number one, determine account niche and subtopics",
+            "Number one, your niche, your overall broad industry, and number two, your subtopics",
+            "So small sub niches, you create content around within your niche",
+            "And third, just write out your occupation name slash title because with all of these, we're actually gonna create a list of keywords you can search for a future step",
+            "Sub number two, optimize your profile",
+            "I'm gonna show you the wrong versus right version, link in bio, username, tagline, profile picture, and bio",
+            "Sub number three, determine your posting amount and schedule"
+          ],
+          "on_screen_hook": "Business owners looking to grow and sell on social media, and want done for you monthly research, ideation, scripting, editing, and uploading, comment SMM for more information.",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Business owners looking to grow and sell on social media, and want done for you monthly research, ideation, scripting, editing, and uploading, comment SMM for more information.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "if i wanted to grow my instagram from zero to 10 000 followers this is how i'd do it sub number one determine account",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbIo3i_vwp1/",
+        "transcript_opening": "If I wanted to grow my Instagram from zero to 10,000 followers, this is how I'd do it. Sub number one, determine account niche and subtopics. Number one, your niche, your overall broad industry, and number two, your subtopics. So small sub ",
+        "views": 61357
+      },
+      {
+        "caption_excerpt": "How to Create a My Story Video. \n\nIf you want a more in-depth breakdown on how to create the most important video you’ll ever post on your profile, just comment “MY STORY” and I’ll send it over.",
+        "comments": 1400,
+        "direct_use_allowed": false,
+        "item_id": "refitem_444aa587310f7862aef4561f",
+        "likes": 789,
+        "match_score": 33.155,
+        "matched_terms": [
+          "add",
+          "adding",
+          "before",
+          "business",
+          "can",
+          "how",
+          "them",
+          "three",
+          "write"
+        ],
+        "published_at": "2026-07-20T12:16:59+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "Now, if you want more in depth guide on how to create your own My Story video, comment My Story and I'll go ahead and send that over",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 6",
+            "high frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text",
+            "active framing"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "If I could create one video to try to get the most amount of views and leads for my business, it would be the My Story slash founder story type of video",
+            "Guys, I'm sure you've seen these before",
+            "These are these stable videos on your profile that you should 100% pin and put the most amount of time, effort and thought into",
+            "Here's how to create yours",
+            "Step number one, choose your storytelling structure",
+            "Because I'm a nerd, I've transcribed incredible My Story videos that have gone viral and made them into fill-up link templates that you've used",
+            "Choose one",
+            "Step number two, write your script"
+          ],
+          "on_screen_hook": "How to Create a My Story Video. \n\nIf you want a more in-depth breakdown on how to create the most important video you’ll ever post on your profile, just comment “MY STORY” and I’ll",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "How to Create a My Story Video.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast.",
+            "End with one explicit next step."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "if i could create one video to try to get the most amount of views and leads for my business it would be the",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbA6MuXhSBa/",
+        "transcript_opening": "If I could create one video to try to get the most amount of views and leads for my business, it would be the My Story slash founder story type of video. Guys, I'm sure you've seen these before. These are these stable videos on your profile",
+        "views": 44680
+      },
+      {
+        "caption_excerpt": "Creative Reels That Inspired Me This Week. \n\nFollow for more social media marketing education!",
+        "comments": 9,
+        "direct_use_allowed": false,
+        "item_id": "refitem_205f7f7b3d9e5e839a98783c",
+        "likes": 426,
+        "match_score": 32.855,
+        "matched_terms": [
+          "add",
+          "before",
+          "business",
+          "can",
+          "give",
+          "real",
+          "them",
+          "then",
+          "three"
+        ],
+        "published_at": "2026-07-30T12:00:04+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 4",
+            "low frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "Here are some creative rules that were Lanes Power Game this week",
+            "Okay, number one, we got the series Recap video",
+            "Remember Lewis, my eight year's best mate",
+            "Three months ago, we finished the 12-week alpha course together",
+            "If you've ever done a series, it's been really good for you",
+            "But it's basically just a recap of that series, where you're at now, what's changed from the start, a recap of the results, and so on",
+            "Number two, we got the person highlight videos",
+            "Imagine starting your life over at 62, and that's pretty much what my mom just did"
+          ],
+          "on_screen_hook": "Creative Reels That Inspired Me This Week. \n\nFollow for more social media marketing education!",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Creative Reels That Inspired Me This Week.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "here are some creative rules that were lanes power game this week okay number one we got the series recap video remember lewis my",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbapAqahjWZ/",
+        "transcript_opening": "Here are some creative rules that were Lanes Power Game this week. Okay, number one, we got the series Recap video. Remember Lewis, my eight year's best mate. Three months ago, we finished the 12-week alpha course together. If you've ever d",
+        "views": 33042
+      },
+      {
+        "caption_excerpt": "Humble Yourself. \n\nFollow for more social media marketing education.",
+        "comments": 156,
+        "direct_use_allowed": false,
+        "item_id": "refitem_525fd79cc3167d49c1976854",
+        "likes": 7997,
+        "match_score": 32.088,
+        "matched_terms": [
+          "before",
+          "business",
+          "give",
+          "how",
+          "successful",
+          "them",
+          "then",
+          "three"
+        ],
+        "published_at": "2026-07-27T11:51:25+00:00",
+        "rights_state": "public_reference_analysis_only",
+        "semantic": {
+          "analysis_source": "local_semantic_v1",
+          "call_to_action": "",
+          "camera_and_framing": [
+            "720:1280",
+            "peak sampled face count 8",
+            "low frame movement"
+          ],
+          "caption_style": "text visible in sampled frames",
+          "claims_needing_verification": [],
+          "confidence": 0.64,
+          "content_format": "contrast-led skit",
+          "do_not_copy": [
+            "verbatim hook or script",
+            "presenter identity, likeness, or voice",
+            "source footage or branded art"
+          ],
+          "editing_devices": [
+            "on-screen text"
+          ],
+          "emotional_progression": [],
+          "narrative_beats": [
+            "Guys, this video is awesome",
+            "Watch this",
+            "How many people do you know would post 400 times with 50 followers and keep on posting",
+            "I don't know many",
+            "I posted 400 times on Instagram and I had 50 followers",
+            "That's one of the things that really separated ourselves",
+            "And honestly, anybody in business is just that willingness to not take no for an answer",
+            "You should check them out"
+          ],
+          "on_screen_hook": "Humble Yourself. \n\nFollow for more social media marketing education.",
+          "opening_visual": "face-led vertical frame with text",
+          "presenter_delivery": "fast",
+          "primary_topic": "Humble Yourself.",
+          "proof_and_b_roll": [
+            "visual changes detected"
+          ],
+          "retention_devices": [
+            "questions",
+            "contrast"
+          ],
+          "reusable_principles": [
+            "Make the opening promise observable before teaching the steps.",
+            "Keep each claim distinct from the evidence used to support it.",
+            "Use a clear before-and-after or weak-and-strong contrast."
+          ],
+          "setting": "observable only from the saved contact sheet",
+          "spoken_hook": "guys this video is awesome watch this how many people do you know would post 400 times with 50 followers and keep on posting",
+          "target_viewer": "viewer interested in the stated topic"
+        },
+        "source_url": "https://www.instagram.com/reel/DbS5MDDPMgB/",
+        "transcript_opening": "Guys, this video is awesome. Watch this. How many people do you know would post 400 times with 50 followers and keep on posting? I don't know many. I posted 400 times on Instagram and I had 50 followers. That's one of the things that really",
+        "views": 188449
+      }
+    ],
+    "numeric_profile": {
+      "average_cut_rate_per_minute": 6.979,
+      "average_duration_seconds": 63.987,
+      "average_transcript_words": 256.02,
+      "views_sum_at_latest_observation": 16373949
+    },
+    "observed_patterns": {
+      "caption_styles": [
+        {
+          "count": 150,
+          "value": "text visible in sampled frames"
+        }
+      ],
+      "editing_devices": [
+        {
+          "count": 150,
+          "value": "on-screen text"
+        },
+        {
+          "count": 76,
+          "value": "active framing"
+        },
+        {
+          "count": 27,
+          "value": "frequent visual resets"
+        }
+      ],
+      "formats": [
+        {
+          "count": 81,
+          "value": "contrast-led skit"
+        },
+        {
+          "count": 69,
+          "value": "presenter-led explainer"
+        }
+      ],
+      "openings": [
+        {
+          "count": 150,
+          "value": "face-led vertical frame with text"
+        }
+      ],
+      "presenter_delivery": [
+        {
+          "count": 135,
+          "value": "fast"
+        },
+        {
+          "count": 13,
+          "value": "steady"
+        },
+        {
+          "count": 2,
+          "value": "measured"
+        }
+      ],
+      "retention_devices": [
+        {
+          "count": 67,
+          "value": "questions"
+        },
+        {
+          "count": 54,
+          "value": "contrast"
+        },
+        {
+          "count": 27,
+          "value": "rapid cuts"
+        }
+      ],
+      "reusable_principles": [
+        {
+          "count": 150,
+          "value": "Make the opening promise observable before teaching the steps."
+        },
+        {
+          "count": 150,
+          "value": "Keep each claim distinct from the evidence used to support it."
+        },
+        {
+          "count": 85,
+          "value": "End with one explicit next step."
+        },
+        {
+          "count": 54,
+          "value": "Use a clear before-and-after or weak-and-strong contrast."
+        }
+      ],
+      "topics": [
+        {
+          "count": 3,
+          "value": "Visual Hooks 101"
+        },
+        {
+          "count": 3,
+          "value": "The 3 Levels of Writing Short Form Content Scripts."
+        },
+        {
+          "count": 2,
+          "value": "Storytelling Hooks."
+        },
+        {
+          "count": 2,
+          "value": "Weekly Diary - Episode #28"
+        },
+        {
+          "count": 2,
+          "value": "Did You Know That Every Viral Video Has 7 Different Components 🤔"
+        },
+        {
+          "count": 2,
+          "value": "If you’re a business owner looking to grow and get leads on social media, comment “SMM” for more information!"
+        },
+        {
+          "count": 2,
+          "value": "Telling a Story vs. Storytelling."
+        },
+        {
+          "count": 2,
+          "value": "We All Know Those Creators That Just Have the Perfect Branding 👀"
+        },
+        {
+          "count": 2,
+          "value": "Business owners looking to grow and sell on social media, and want done for you monthly research, ideation, scripting, editing, and uploading, comment SMM for more information."
+        },
+        {
+          "count": 2,
+          "value": "Following vs. Personal Brand"
+        },
+        {
+          "count": 2,
+          "value": "How to Plan a Full Month of Content in 45 Minutes ⏰"
+        },
+        {
+          "count": 2,
+          "value": "100 Views vs. 1M Views 📊"
+        },
+        {
+          "count": 1,
+          "value": "Normal vs. Smart Business Owner Using AI for Content."
+        },
+        {
+          "count": 1,
+          "value": "Boring vs. Fun and Engaging Hook"
+        },
+        {
+          "count": 1,
+          "value": "Same Format, Different Niches, Both Viral."
+        }
+      ]
+    },
+    "query": "How software founders can control AI agents before granting write access software founders adding AI agents to real business workflows Teams connect agents to email, customer data, or production tools, then judge them by a successful demo So before you add another ability, give the workflow three simple controls",
+    "result_sha256": "b87b252009ef034946d0e14a7f74b015959ab65f1d229d6b407ff2c6483683da"
+  },
+  "request": {
+    "angle": "problem_first",
+    "audience": "software founders adding AI agents to real business workflows",
+    "contract": "reference_marketing_script_request_v1",
+    "corpus_id": "instagram-personalbrandlaunch-reference-v1",
+    "narrative": {
+      "cta": {
+        "action": "book an audit",
+        "destination": "https://isaiahdupree.com/audit",
+        "text": "Book an AI Automation Audit to map one risky workflow before you use it with write access"
+      },
+      "hook": "Your AI agent does not need more freedom. It needs a clear way to stop",
+      "problem": "Teams connect agents to email, customer data, or production tools, then judge them by a successful demo",
+      "proof": {
+        "evidence_type": "worked_example",
+        "source_receipt_ids": [],
+        "statement": "run one bad-input test. If the agent pauses, explains the problem, and leaves a useful receipt, your controls are working"
+      },
+      "reframe": "So before you add another ability, give the workflow three simple controls",
+      "stakes": "But the real test is a vague instruction, bad data, or an action that costs money",
+      "steps": [
+        "define what it may read, what it may change, and how much it may spend",
+        "require a person to approve actions that reach a customer, move money, or delete data",
+        "keep a receipt showing the input, decision, action, result, and person who approved it"
+      ],
+      "takeaway": "A trustworthy agent is not one that never fails. It is one that fails visibly and can be stopped"
+    },
+    "objective": "convert",
+    "offer": {
+      "name": "AI Automation Audit",
+      "offer_id": "ai-automation-audit-build"
+    },
+    "target_seconds": 60,
+    "title": "Your AI Agent Needs a Kill Switch",
+    "topic": "How software founders can control AI agents before granting write access"
+  },
+  "request_contract": "reference_marketing_script_request_v1",
+  "request_sha256": "ca1de432d83522e77b9428e03f847449739ff0a8d72d42dc258ca2e2298ab841",
+  "result_sha256": "1d52d8413007e065864d4a1cc3d3badec28afca63bd1cbace7d919f08a2b37dd",
+  "rights": {
+    "direct_use_allowed": false,
+    "exact_draft_copy_gate_passed": true,
+    "identity_imitation_allowed": false,
+    "source_clips_used": false,
+    "state": "public_reference_analysis_only",
+    "voice_imitation_allowed": false
+  },
+  "script": {
+    "beats": [
+      {
+        "block": "hook",
+        "end_seconds": 5.455,
+        "node_id": "hook",
+        "purpose": "earn attention",
+        "start_seconds": 0.0,
+        "text": "Your AI agent does not need more freedom. It needs a clear way to stop.",
+        "word_count": 15
+      },
+      {
+        "block": "problem",
+        "end_seconds": 11.636,
+        "node_id": "problem",
+        "purpose": "create recognition",
+        "start_seconds": 5.455,
+        "text": "Teams connect agents to email, customer data, or production tools, then judge them by a successful demo.",
+        "word_count": 17
+      },
+      {
+        "block": "stakes",
+        "end_seconds": 17.455,
+        "node_id": "stakes",
+        "purpose": "make the consequence concrete",
+        "start_seconds": 11.636,
+        "text": "But the real test is a vague instruction, bad data, or an action that costs money.",
+        "word_count": 16
+      },
+      {
+        "block": "reframe",
+        "end_seconds": 21.818,
+        "node_id": "reframe",
+        "purpose": "replace the weak mental model",
+        "start_seconds": 17.455,
+        "text": "So before you add another ability, give the workflow three simple controls.",
+        "word_count": 12
+      },
+      {
+        "block": "teaching_step",
+        "end_seconds": 27.636,
+        "node_id": "step_1",
+        "purpose": "give a usable action",
+        "start_seconds": 21.818,
+        "text": "First, define what it may read, what it may change, and how much it may spend.",
+        "word_count": 16
+      },
+      {
+        "block": "teaching_step",
+        "end_seconds": 33.455,
+        "node_id": "step_2",
+        "purpose": "give a usable action",
+        "start_seconds": 27.636,
+        "text": "Next, require a person to approve actions that reach a customer, move money, or delete data.",
+        "word_count": 16
+      },
+      {
+        "block": "teaching_step",
+        "end_seconds": 38.909,
+        "node_id": "step_3",
+        "purpose": "give a usable action",
+        "start_seconds": 33.455,
+        "text": "Then, keep a receipt showing the input, decision, action, result, and person who approved it.",
+        "word_count": 15
+      },
+      {
+        "block": "proof",
+        "end_seconds": 46.909,
+        "node_id": "proof",
+        "purpose": "make the lesson believable",
+        "start_seconds": 38.909,
+        "text": "For example, run one bad-input test. If the agent pauses, explains the problem, and leaves a useful receipt, your controls are working.",
+        "word_count": 22
+      },
+      {
+        "block": "takeaway",
+        "end_seconds": 53.818,
+        "node_id": "takeaway",
+        "purpose": "compress the lesson",
+        "start_seconds": 46.909,
+        "text": "A trustworthy agent is not one that never fails. It is one that fails visibly and can be stopped.",
+        "word_count": 19
+      },
+      {
+        "block": "call_to_action",
+        "end_seconds": 60.0,
+        "node_id": "cta",
+        "purpose": "give one relevant next step",
+        "start_seconds": 53.818,
+        "text": "Book an AI Automation Audit to map one risky workflow before you use it with write access.",
+        "word_count": 17
+      }
+    ],
+    "estimated_seconds_at_reference_pace": 70.213,
+    "required_words_per_second": 2.75,
+    "target_seconds": 60,
+    "title": "Your AI Agent Needs a Kill Switch",
+    "transcript": "Your AI agent does not need more freedom. It needs a clear way to stop. Teams connect agents to email, customer data, or production tools, then judge them by a successful demo. But the real test is a vague instruction, bad data, or an action that costs money. So before you add another ability, give the workflow three simple controls. First, define what it may read, what it may change, and how much it may spend. Next, require a person to approve actions that reach a customer, move money, or delete data. Then, keep a receipt showing the input, decision, action, result, and person who approved it. For example, run one bad-input test. If the agent pauses, explains the problem, and leaves a useful receipt, your controls are working. A trustworthy agent is not one that never fails. It is one that fails visibly and can be stopped. Book an AI Automation Audit to map one risky workflow before you use it with write access.",
+    "word_count": 165
+  },
+  "script_id": "refscript_0a278b9f77d712afc3386ec4",
+  "status": "approved"
+}

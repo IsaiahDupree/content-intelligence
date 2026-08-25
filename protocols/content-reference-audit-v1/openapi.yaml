@@ -118,6 +118,42 @@ paths:
             application/json:
               schema:
                 $ref: ./content-creation-audit.schema.json
+  /api/reference-corpus/write-script:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./reference-marketing-script-request.schema.json
+      responses:
+        "200":
+          description: Immutable script package with quality and copy audits.
+          content:
+            application/json:
+              schema:
+                $ref: ./reference-marketing-script-package.schema.json
+        "400": {description: Typed brief or claim evidence is invalid.}
+        "404": {description: Reference corpus does not exist.}
+  /api/reference-corpus/scripts/{script_id}:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: script_id
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Previously compiled immutable script package.
+          content:
+            application/json:
+              schema:
+                $ref: ./reference-marketing-script-package.schema.json
+        "404": {description: Script package does not exist.}
   /api/reference-corpus/acquire:
     post:
       security:
