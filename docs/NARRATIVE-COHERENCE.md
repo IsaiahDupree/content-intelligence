@@ -58,8 +58,9 @@ truthy-but-not-boolean `coherent` value is never a pass.
 
 Every audit is persisted to `cq_audits` with `audit_type = "narrative_coherence"`,
 so `GET /api/scripts/{script_id}` reports it in `gates.latest_audits` and it
-participates in `gates.ready_for_render` (a fourth required `PASS` alongside
-`relatability_script`, `attention_script`, `attention_video_preflight`).
+participates in `gates.ready_for_render` as one of six required decisions,
+including the separately named qualitative relatability decision and the
+immutable transcript-cohort comparison.
 
 ## Endpoints
 
@@ -142,8 +143,16 @@ fix the judge (see Configuration); do not retry expecting a different answer.
 ## The script-generation pathway (for agents)
 
 The full evidence-first pathway on `:6010`, in order. Nothing renders without
-all four gates; nothing publishes without the foundry dispatcher's separate
+all six gates; nothing publishes without the foundry dispatcher's separate
 auto-approval policy on top.
+
+The integrated workflow currently emits
+`generation_contract = "evidence_bound_category_script_v9"`. That contract
+binds each generated script to its immutable brief, selected source moment,
+performance-qualified cohort manifest, transcript payload snapshots, and the
+six persisted pre-render gate decisions. A consumer must treat a different
+generation-contract value as a different script contract, not silently coerce
+it to v9.
 
 ```bash
 BASE=http://127.0.0.1:6010
@@ -175,15 +184,20 @@ curl -s -X POST $BASE/api/scripts/generate \
 # -> script with timeline, evidence_summary, narrative_coherence, script_id
 # Conversion objectives additionally require "owned_proof": ["..."].
 
-# 4. Remaining render gates.
+# 4. Remaining render gates. The integrated script-intelligence workflow also
+#    persists the separately named qualitative relatability decision and the
+#    immutable transcript-cohort verdict. Direct generation cannot satisfy
+#    that cohort gate and therefore remains ineligible for rendering.
 curl -s -X POST $BASE/api/relatability/script-audit  -H 'content-type: application/json' -d @script.json
 curl -s -X POST $BASE/api/attention/script-audit     -H 'content-type: application/json' -d @script.json
 curl -s -X POST $BASE/api/attention/video-preflight  -H 'content-type: application/json' -d @script.json
 
-# 5. Handoff check — all four gates must be PASS.
+# 5. Handoff check — all six gates must be accepted and hash-bound.
 curl -s $BASE/api/scripts/{script_id}
 # -> {"gates": {"ready_for_render": true, "required_decisions": {
 #      "narrative_coherence": "PASS", "relatability_script": "PASS",
+#      "relatability_ai_qualitative": "PASS",
+#      "relatability_transcript_cohort": "PASS",
 #      "attention_script": "PASS", "attention_video_preflight": "PASS"}}}
 ```
 
@@ -194,6 +208,100 @@ Generation reject codes an agent must handle: `REJECT_NO_RECEIPTS`,
 All are 422 with `status: "rejected"`. Rejections are fail-closed by design;
 fix the input (or the judge), never bypass the gate.
 
+### Source-bound script variants
+
+The integrated brief and run endpoints accept an optional integer
+`variant_index` from 0 through 7, defaulting to 0. It selects a text-distinct
+human moment already stored in the same verified Whisper cohort. The selector
+and source moment IDs are part of the immutable brief identity, while sibling
+variants retain the same cohort ID and evidence hash. A missing source variant
+returns `SCRIPT_VARIANT_INDEX_NOT_AVAILABLE` without starting acquisition; an
+invalid type or fixed-bound violation returns an audited `INVALID_REQUEST`.
+Variants 0, 1, and 2 therefore produce three source-backed scripts, each of
+which must independently satisfy the same six hash-bound gates.
+
+Human-moment extraction never paraphrases the source. It evaluates contiguous
+windows no longer than 10 words, records source offsets and immutable transcript
+lineage, rejects CTA/numeric fragments, and favors complete lived-context
+phrasing. `source_selection_score` and the separate audience-adjusted score are
+deterministic ranking signals, not probabilities or audience-outcome
+measurements. Off-audience context is scored from the full source sentence so a
+short excerpt cannot hide that it came from an unrelated job-seeker scenario.
+
+Situation/stakes pairing uses
+`source_context_substantive_or_self_v2`. The stakes excerpt may come from the
+same source video, or from another verified cohort transcript only when the two
+excerpts share substantive non-audience context. Broad category or audience
+words such as `software`, `app`, `founder`, and `automation` do not establish a
+relationship. When no substantive relationship exists, the source moment is
+self-paired; the service does not splice together unrelated creator stories.
+
+### Separate AI relatability verdict
+
+The separately named AI decision uses
+`human_relatability_qualitative_verdict_v3`. It runs only after the deterministic
+relatability evidence checks pass and remains a prediction: views demonstrate
+exposure, not measured relatability, retention, or conversion. The structured
+100-point rubric is:
+
+| Dimension | Maximum |
+|---|---:|
+| Concrete lived moment | 25 |
+| Clear personal stakes | 20 |
+| Visible input/action/output | 20 |
+| Supplied source-language support | 15 |
+| Direct audience perspective | 10 |
+| Non-alienating framing | 10 |
+
+The six rubric values must be integers within their maxima and must sum exactly
+to the top-level score. `relatable` must equal `score >= 70`; a passing verdict
+must name at least one supported source term and give a non-empty human reason.
+The provider gets one initial attempt and, only when its response fails the
+semantic verdict contract, one bounded retry in the same audit. A provider
+error, or a second invalid response, yields `JUDGE_UNAVAILABLE`; it is never
+converted into an AI pass. Scores are capped at 90 until post-publication
+outcomes exist.
+
+### Immutable transcript payload verification
+
+New transcript acquisition writes an append-only row to
+`mt_transcript_payload_snapshots`. The script/cohort audit loads that local
+SQLite payload snapshot, recomputes its canonical payload hash, substitutes the
+current atomic Market Tape transcript text, and verifies the resulting hash
+against the acquisition hash. A missing or mismatched snapshot fails the cohort
+gate closed, including edits that preserve the original word count.
+
+Legacy payloads are migrated only through the explicit bounded command:
+
+```bash
+python3 scripts/backfill_transcript_payload_snapshots.py \
+  --cohort-manifest /absolute/path/to/cohort.json \
+  --limit 5
+```
+
+The command accepts either an exact cohort manifest or repeated exact
+`--transcript-id` values, reads at most the requested bounded set, verifies each
+Passport payload against both its acquisition hash and the SQLite transcript,
+and records an append-only backfill-run receipt. Brief generation and normal
+script auditing never call this backfill and never read transcript files from
+the Passport. Their normal latency path reads the local cohort manifest,
+immutable SQLite payload snapshots, and atomic Market Tape rows only.
+
+### Owned outcomes and retention curve identity
+
+Owned outcome readiness requires one exact-scope, time-ordered
+`click -> install -> trial -> purchase` journey plus at least two measured
+retention points within one `measurement_id` for the same
+content/campaign/offer/source scope. A non-null retention `journey_id` is part
+of the curve identity: that curve can link only to the exact same journey. A
+NULL `journey_id` is intentionally aggregate-scope and may describe the exact
+content/campaign/offer/source scope without claiming an individual journey.
+NULL and non-null curves are never merged into one measurement curve.
+
+Retention points and drops are descriptive observations. The service reports
+`causal_drop_reasons_available = false`; it does not fabricate millisecond
+drop-off explanations or infer causality from a curve.
+
 ## Configuration
 
 Environment of the service process (sourced by
@@ -202,8 +310,17 @@ Environment of the service process (sourced by
 | Variable | Default | Meaning |
 |---|---|---|
 | `NARRATIVE_COHERENCE_LLM` | `openai` | judge provider: `openai`, `claude` (local CLI), or `off` (rules-only) |
-| `NARRATIVE_JUDGE_MODEL` | `gpt-4o-mini` | OpenAI model for the judgment pass |
+| `NARRATIVE_JUDGE_MODEL` | `gpt-5-nano` | OpenAI model for the narrative judgment pass |
+| `RELATABILITY_JUDGE` | `openai` | qualitative relatability provider: `openai` or `off` |
+| `RELATABILITY_JUDGE_MODEL` | `gpt-5-nano` | OpenAI model for the separate qualitative relatability verdict |
 | `OPENAI_API_KEY` | — | required for the `openai` provider; never stored in source control |
+
+Content Quality stores its small cohort manifests under its local runtime data
+directory. Immutable source audio and Whisper transcript artifacts remain at
+the absolute Passport paths recorded in Market Tape. Acquisition and the
+explicit legacy snapshot backfill may read those files. Normal brief generation
+and script auditing instead use local immutable payload snapshots and atomic
+Market Tape rows, so they perform no removable-volume reads or writes.
 
 Rules and the repair loop are NOT configurable — only the judgment pass is.
 Flask test configs may inject `NARRATIVE_LLM_RUNNER` (a callable) or set

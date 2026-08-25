@@ -8,7 +8,6 @@ import json
 import math
 import re
 import sqlite3
-from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -30,7 +29,7 @@ from .predictor import (
 )
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 15
 COUNTER_REGRESSION_FLAG_PREFIX = "counter-regression:"
 ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT = (
     "market_tape_accepted_observation_evidence_v1"
@@ -49,6 +48,9 @@ SCRIPT_LANGUAGE_DEMAND_CONTRACT = "market_tape_script_language_demand_v1"
 SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT = (
     "market_tape_script_language_demand_event_v1"
 )
+SCRIPT_LANGUAGE_DEMAND_SNAPSHOT_LINEAGE_CONTRACT = (
+    "market_tape_script_language_demand_snapshot_lineage_v1"
+)
 SCRIPT_LANGUAGE_DEMAND_EVENT_TYPES = {
     "requested",
     "claimed",
@@ -63,6 +65,42 @@ SCRIPT_LANGUAGE_DEMAND_TERMINAL_EVENTS = {
     "blocked",
     "failed",
 }
+# ``partial`` finishes exactly one bounded acquisition attempt but leaves the
+# demand eligible for another explicitly triggered run.  Only these events
+# close the demand itself.
+SCRIPT_LANGUAGE_DEMAND_FINAL_EVENTS = {
+    "completed",
+    "blocked",
+    "failed",
+}
+
+
+class ScriptLanguageDemandClaimConflict(ValueError):
+    """A caller-bound demand is not the next atomically claimable demand."""
+
+    def __init__(
+        self,
+        expected_demand_id: str,
+        next_demand_id: str | None,
+    ) -> None:
+        self.expected_demand_id = expected_demand_id
+        self.next_demand_id = next_demand_id
+        super().__init__(
+            "expected_demand_id does not match the next claimable demand"
+        )
+
+    def payload(self) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "state": "conflict",
+            "code": "SCRIPT_LANGUAGE_DEMAND_CLAIM_CONFLICT",
+            "error": str(self),
+            "expected_demand_id": self.expected_demand_id,
+            "next_demand_id": self.next_demand_id,
+            "mutation_applied": False,
+        }
+
+
 TREND_OUTCOME_COVERAGE_TOLERANCE = timedelta(minutes=30)
 TREND_OUTCOME_COVERAGE_GRACE = timedelta(hours=2)
 ACTIONABLE_TREND_STATES = {"discovering", "emerging", "breakout", "recurring"}
@@ -532,6 +570,44 @@ class MarketTapeStore:
                 CREATE INDEX IF NOT EXISTS mt_transcript_artifacts_platform_idx
                     ON mt_transcript_artifacts(platform, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS mt_transcript_payload_snapshots (
+                    transcript_id TEXT PRIMARY KEY,
+                    transcript_sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS mt_transcript_payload_snapshots_no_update
+                BEFORE UPDATE ON mt_transcript_payload_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshots are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS mt_transcript_payload_snapshots_no_delete
+                BEFORE DELETE ON mt_transcript_payload_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshots are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_payload_snapshot_backfill_runs (
+                    run_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    requested_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_transcript_payload_snapshot_backfill_runs_no_update
+                BEFORE UPDATE ON mt_transcript_payload_snapshot_backfill_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshot backfills are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_transcript_payload_snapshot_backfill_runs_no_delete
+                BEFORE DELETE ON mt_transcript_payload_snapshot_backfill_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshot backfills are append-only');
+                END;
+
                 CREATE TABLE IF NOT EXISTS mt_transcript_cohorts (
                     cohort_id TEXT PRIMARY KEY,
                     topic TEXT NOT NULL,
@@ -999,6 +1075,83 @@ class MarketTapeStore:
                     );
                 END;
 
+                CREATE TABLE IF NOT EXISTS mt_script_language_demand_semantics (
+                    semantic_key TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    normalized_topic TEXT NOT NULL,
+                    normalized_audience TEXT NOT NULL,
+                    normalized_objective TEXT NOT NULL,
+                    targets_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_script_language_demand_semantics_no_update
+                BEFORE UPDATE ON mt_script_language_demand_semantics
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'script language demand semantics are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_script_language_demand_semantics_no_delete
+                BEFORE DELETE ON mt_script_language_demand_semantics
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'script language demand semantics are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS
+                    mt_script_language_demand_snapshot_lineage (
+                        lineage_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        lineage_id TEXT NOT NULL UNIQUE,
+                        demand_id TEXT NOT NULL,
+                        semantic_key TEXT NOT NULL,
+                        snapshot_id TEXT NOT NULL,
+                        request_sha256 TEXT NOT NULL,
+                        source_service TEXT NOT NULL,
+                        source_receipt_id TEXT NOT NULL,
+                        evidence_trend_id TEXT NOT NULL DEFAULT '',
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL,
+                        UNIQUE(demand_id, request_sha256)
+                    );
+
+                CREATE INDEX IF NOT EXISTS
+                    mt_script_language_demand_snapshot_lineage_demand_idx
+                    ON mt_script_language_demand_snapshot_lineage(
+                        demand_id, lineage_sequence
+                    );
+                CREATE INDEX IF NOT EXISTS
+                    mt_script_language_demand_snapshot_lineage_semantic_idx
+                    ON mt_script_language_demand_snapshot_lineage(
+                        semantic_key, lineage_sequence
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_script_language_demand_snapshot_lineage_no_update
+                BEFORE UPDATE ON mt_script_language_demand_snapshot_lineage
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'script language demand snapshot lineage is append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_script_language_demand_snapshot_lineage_no_delete
+                BEFORE DELETE ON mt_script_language_demand_snapshot_lineage
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'script language demand snapshot lineage is append-only'
+                    );
+                END;
+
                 CREATE TABLE IF NOT EXISTS mt_sync_outbox (
                     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_type TEXT NOT NULL,
@@ -1025,6 +1178,7 @@ class MarketTapeStore:
                 );
                 """
             )
+            _backfill_script_language_demand_lineage(connection)
             transcript_attempt_columns = {
                 row[1]
                 for row in connection.execute(
@@ -5506,11 +5660,9 @@ class MarketTapeStore:
     ) -> Dict[str, Any]:
         """Append one deterministic script-language demand request.
 
-        A demand's identity is deliberately narrower than its provenance. The
-        contract, normalized topic/audience/objective, immutable evidence
-        snapshot, and normalized output targets form ``demand_id``. Source
-        receipts, trend ids, and run ids remain lineage, so replaying the same
-        evidence snapshot cannot create duplicate work.
+        One non-final demand represents each normalized semantic request.
+        Refreshed evidence snapshots append lineage to that active demand.
+        After it becomes final, a later snapshot can create new bounded work.
         """
 
         if not isinstance(payload, dict):
@@ -5575,7 +5727,14 @@ class MarketTapeStore:
         requested_at = _script_demand_timestamp(
             payload.get("requested_at") or payload.get("created_at") or utc_now()
         )
-        identity = {
+        semantic_key = _script_language_demand_semantic_key(
+            contract=contract,
+            topic=topic,
+            audience=audience,
+            objective=objective,
+            targets=targets,
+        )
+        new_demand_identity = {
             "contract": contract,
             "topic": _normalize_script_demand_identity_text(topic),
             "audience": _normalize_script_demand_identity_text(audience),
@@ -5583,7 +5742,9 @@ class MarketTapeStore:
             "snapshot_id": snapshot_id,
             "targets": targets,
         }
-        demand_id = f"script-language-demand:{stable_hash(identity)}"
+        candidate_demand_id = (
+            f"script-language-demand:{stable_hash(new_demand_identity)}"
+        )
         request_payload = dict(payload)
         request_payload.update({
             "contract": contract,
@@ -5602,10 +5763,54 @@ class MarketTapeStore:
         request_hash_payload.pop("requested_at", None)
         request_hash_payload.pop("created_at", None)
         request_sha256 = stable_hash(request_hash_payload)
+        demand_id = candidate_demand_id
         event_id = _script_language_demand_event_id(
             demand_id, "requested", 0
         )
         with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO mt_script_language_demand_semantics(
+                       semantic_key, contract, normalized_topic,
+                       normalized_audience, normalized_objective,
+                       targets_json, created_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(semantic_key) DO NOTHING""",
+                (
+                    semantic_key,
+                    contract,
+                    _normalize_script_demand_identity_text(topic),
+                    _normalize_script_demand_identity_text(audience),
+                    _normalize_script_demand_identity_text(objective),
+                    json.dumps(targets, sort_keys=True, default=str),
+                    requested_at,
+                ),
+            )
+            coalesced_demand_id = (
+                _queued_script_language_demand_for_semantic_connection(
+                    connection, semantic_key
+                )
+            )
+            demand_id = coalesced_demand_id or candidate_demand_id
+            if coalesced_demand_id is None:
+                prior_generation = connection.execute(
+                    """SELECT request_sha256
+                       FROM mt_script_language_demand_events
+                       WHERE demand_id = ? AND event_type = 'requested'
+                       LIMIT 1""",
+                    (candidate_demand_id,),
+                ).fetchone()
+                if (
+                    prior_generation is not None
+                    and str(prior_generation["request_sha256"])
+                    != request_sha256
+                ):
+                    demand_id = "script-language-demand:" + stable_hash({
+                        "base_demand_id": candidate_demand_id,
+                        "request_sha256": request_sha256,
+                    })
+            event_id = _script_language_demand_event_id(
+                demand_id, "requested", 0
+            )
             cursor = connection.execute(
                 """INSERT INTO mt_script_language_demand_events(
                        event_id, demand_id, event_type, attempt_no,
@@ -5633,15 +5838,48 @@ class MarketTapeStore:
                     requested_at,
                 ),
             )
+            lineage_id = (
+                "script-language-demand-snapshot-lineage:"
+                + stable_hash({
+                    "contract": (
+                        SCRIPT_LANGUAGE_DEMAND_SNAPSHOT_LINEAGE_CONTRACT
+                    ),
+                    "demand_id": demand_id,
+                    "request_sha256": request_sha256,
+                })
+            )
+            lineage_cursor = connection.execute(
+                """INSERT INTO mt_script_language_demand_snapshot_lineage(
+                       lineage_id, demand_id, semantic_key, snapshot_id,
+                       request_sha256, source_service, source_receipt_id,
+                       evidence_trend_id, payload_json, created_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(demand_id, request_sha256) DO NOTHING""",
+                (
+                    lineage_id,
+                    demand_id,
+                    semantic_key,
+                    snapshot_id,
+                    request_sha256,
+                    source_service,
+                    source_receipt_id,
+                    evidence_trend_id,
+                    json.dumps(request_payload, sort_keys=True, default=str),
+                    requested_at,
+                ),
+            )
             result = _script_language_demand_from_connection(
                 connection, demand_id, requested_at
             )
             inserted = bool(cursor.rowcount == 1)
+            lineage_appended = bool(lineage_cursor.rowcount == 1)
         if result is None:
             raise RuntimeError("script language demand enqueue was not durable")
         result["enqueued"] = inserted
         result["deduplicated"] = not result["enqueued"]
-        result["idempotent"] = result["deduplicated"]
+        result["idempotent"] = bool(not inserted and not lineage_appended)
+        result["coalesced"] = bool(coalesced_demand_id)
+        result["snapshot_lineage_appended"] = lineage_appended
         return result
 
     def script_language_demand(
@@ -5681,7 +5919,7 @@ class MarketTapeStore:
         measured_at = _script_demand_timestamp(as_of or utc_now())
         with self.connect() as connection:
             demand_ids = [str(row["demand_id"]) for row in connection.execute(
-                """WITH terminal AS (
+                """WITH final AS (
                        SELECT demand_id, event_type,
                               ROW_NUMBER() OVER (
                                   PARTITION BY demand_id
@@ -5689,11 +5927,18 @@ class MarketTapeStore:
                                            event_id DESC
                               ) AS row_number
                        FROM mt_script_language_demand_events
-                       WHERE event_type IN (
-                           'completed', 'partial', 'blocked', 'failed'
-                       )
+                       WHERE event_type IN ('completed', 'blocked', 'failed')
+                   ), latest_partial AS (
+                       SELECT demand_id, attempt_no,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY demand_id
+                                  ORDER BY attempt_no DESC, created_at DESC,
+                                           event_id DESC
+                              ) AS row_number
+                       FROM mt_script_language_demand_events
+                       WHERE event_type = 'partial'
                    ), latest_claim AS (
-                       SELECT demand_id, lease_until,
+                       SELECT demand_id, attempt_no, lease_until,
                               ROW_NUMBER() OVER (
                                   PARTITION BY demand_id
                                   ORDER BY attempt_no DESC, created_at DESC,
@@ -5704,16 +5949,28 @@ class MarketTapeStore:
                    ), current AS (
                        SELECT request.demand_id, request.created_at,
                               CASE
-                                  WHEN terminal.event_type IS NOT NULL
-                                      THEN terminal.event_type
+                                  WHEN final.event_type IS NOT NULL
+                                      THEN final.event_type
                                   WHEN latest_claim.lease_until > ?
+                                   AND (
+                                       latest_partial.attempt_no IS NULL
+                                       OR latest_partial.attempt_no <
+                                          latest_claim.attempt_no
+                                   )
                                       THEN 'claimed'
+                                  WHEN latest_partial.attempt_no IS NOT NULL
+                                   AND latest_partial.attempt_no =
+                                       latest_claim.attempt_no
+                                      THEN 'partial'
                                   ELSE 'requested'
                               END AS state
                        FROM mt_script_language_demand_events request
-                       LEFT JOIN terminal
-                         ON terminal.demand_id = request.demand_id
-                        AND terminal.row_number = 1
+                       LEFT JOIN final
+                         ON final.demand_id = request.demand_id
+                        AND final.row_number = 1
+                       LEFT JOIN latest_partial
+                         ON latest_partial.demand_id = request.demand_id
+                        AND latest_partial.row_number = 1
                        LEFT JOIN latest_claim
                          ON latest_claim.demand_id = request.demand_id
                         AND latest_claim.row_number = 1
@@ -5741,10 +5998,90 @@ class MarketTapeStore:
                 ) is not None
             ]
 
+    def script_language_demand_acquisition_history(
+        self,
+        demand_id: str,
+    ) -> Dict[str, Any]:
+        """Return terminal acquisition results across one semantic lineage.
+
+        A refreshed database snapshot may create a new authoritative demand
+        generation for the same topic/audience/objective/targets.  Query-frontier
+        history belongs to that semantic request, not only to its newest demand
+        ID; otherwise every refresh starts again at the base query and can repeat
+        provider reads indefinitely.
+        """
+
+        canonical_id = str(demand_id or "").strip()
+        if not canonical_id:
+            raise ValueError("demand_id is required")
+        with self.connect() as connection:
+            lineage = connection.execute(
+                """SELECT semantic_key
+                   FROM mt_script_language_demand_snapshot_lineage
+                   WHERE demand_id = ?
+                   ORDER BY lineage_sequence DESC
+                   LIMIT 1""",
+                (canonical_id,),
+            ).fetchone()
+            if lineage is None:
+                return {
+                    "contract": (
+                        "market_tape_script_language_demand_"
+                        "acquisition_history_v1"
+                    ),
+                    "semantic_key": "",
+                    "demand_ids": [],
+                    "events": [],
+                }
+            semantic_key = str(lineage["semantic_key"])
+            demand_ids = [
+                str(row["demand_id"])
+                for row in connection.execute(
+                    """SELECT DISTINCT demand_id
+                       FROM mt_script_language_demand_snapshot_lineage
+                       WHERE semantic_key = ?
+                       ORDER BY demand_id""",
+                    (semantic_key,),
+                ).fetchall()
+            ]
+            rows = connection.execute(
+                """SELECT event.*
+                   FROM mt_script_language_demand_events event
+                   WHERE event.demand_id IN (
+                       SELECT DISTINCT peer.demand_id
+                       FROM mt_script_language_demand_snapshot_lineage peer
+                       WHERE peer.semantic_key = ?
+                   )
+                     AND event.event_type IN (
+                         'completed', 'partial', 'blocked', 'failed'
+                     )
+                   ORDER BY event.created_at, event.event_id""",
+                (semantic_key,),
+            ).fetchall()
+        events: List[Dict[str, Any]] = []
+        for raw in rows:
+            event = dict(raw)
+            raw_payload = event.pop("payload_json", "{}")
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {"invalid_payload_json": True}
+            event["payload"] = payload
+            events.append(event)
+        return {
+            "contract": (
+                "market_tape_script_language_demand_acquisition_history_v1"
+            ),
+            "semantic_key": semantic_key,
+            "demand_ids": demand_ids,
+            "events": events,
+        }
+
     def claim_next_script_language_demand(
         self,
         lease_seconds: int = 300,
         *,
+        expected_demand_id: str | None = None,
         as_of: Optional[datetime] = None,
         source_service: str = "script-language-demand-worker",
         source_receipt_id: str = "",
@@ -5755,13 +6092,16 @@ class MarketTapeStore:
         """Atomically claim the oldest available demand.
 
         An expired claim is never mutated. It becomes historical lineage and
-        the reclaim is appended with the next attempt number.
+        the reclaim is appended with the next attempt number. When an expected
+        ID is supplied, selection and comparison happen inside the same
+        ``BEGIN IMMEDIATE`` transaction and a mismatch appends no claim event.
         """
 
         ttl = max(1, min(86400, int(lease_seconds)))
         claimed_at = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
         claimed_at_iso = isoformat(claimed_at)
         lease_until = isoformat(claimed_at + timedelta(seconds=ttl))
+        expected_id = " ".join(str(expected_demand_id or "").split())
         claim_context = dict(payload or {})
         claim_source_service = " ".join(str(
             source_service
@@ -5774,12 +6114,28 @@ class MarketTapeStore:
                 """SELECT request.*
                    FROM mt_script_language_demand_events request
                    WHERE request.event_type = 'requested'
+                     AND request.demand_id = COALESCE((
+                         SELECT candidate.demand_id
+                         FROM mt_script_language_demand_snapshot_lineage
+                              candidate
+                         WHERE candidate.semantic_key = (
+                             SELECT own.semantic_key
+                             FROM mt_script_language_demand_snapshot_lineage own
+                             WHERE own.demand_id = request.demand_id
+                             ORDER BY own.lineage_sequence DESC
+                             LIMIT 1
+                         )
+                         GROUP BY candidate.demand_id
+                         ORDER BY MAX(candidate.lineage_sequence) DESC,
+                                  candidate.demand_id DESC
+                         LIMIT 1
+                     ), request.demand_id)
                      AND NOT EXISTS (
                          SELECT 1
-                         FROM mt_script_language_demand_events terminal
-                         WHERE terminal.demand_id = request.demand_id
-                           AND terminal.event_type IN (
-                               'completed', 'partial', 'blocked', 'failed'
+                         FROM mt_script_language_demand_events final
+                         WHERE final.demand_id = request.demand_id
+                           AND final.event_type IN (
+                               'completed', 'blocked', 'failed'
                            )
                      )
                      AND NOT EXISTS (
@@ -5788,14 +6144,37 @@ class MarketTapeStore:
                          WHERE active_claim.demand_id = request.demand_id
                            AND active_claim.event_type = 'claimed'
                            AND active_claim.lease_until > ?
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM mt_script_language_demand_events resolved
+                               WHERE resolved.demand_id =
+                                     active_claim.demand_id
+                                 AND resolved.attempt_no =
+                                     active_claim.attempt_no
+                                 AND resolved.event_type IN (
+                                     'completed', 'partial', 'blocked', 'failed'
+                                 )
+                           )
                      )
                    ORDER BY request.created_at, request.demand_id
                    LIMIT 1""",
                 (claimed_at_iso,),
             ).fetchone()
+            next_demand_id = (
+                str(request["demand_id"]) if request is not None else None
+            )
+            if expected_id and next_demand_id != expected_id:
+                raise ScriptLanguageDemandClaimConflict(
+                    expected_id, next_demand_id
+                )
             if request is None:
                 return None
-            demand_id = str(request["demand_id"])
+            demand_id = next_demand_id
+            queued_request = _script_language_demand_from_connection(
+                connection, demand_id, claimed_at_iso
+            )
+            if queued_request is None:
+                raise RuntimeError("queued demand lost its request")
             prior_claim = connection.execute(
                 """SELECT *
                    FROM mt_script_language_demand_events
@@ -5812,10 +6191,32 @@ class MarketTapeStore:
                 or claim_context.get("source_receipt_id")
                 or f"claim:{demand_id}:{attempt_no}"
             ).split())[:500]
+            latest_snapshot_lineage = dict(
+                queued_request.get("latest_snapshot_lineage") or {}
+            )
+            request_lineage_binding = {
+                field: latest_snapshot_lineage.get(field)
+                for field in (
+                    "lineage_sequence",
+                    "lineage_id",
+                    "semantic_key",
+                    "snapshot_id",
+                    "request_sha256",
+                    "source_service",
+                    "source_receipt_id",
+                    "evidence_trend_id",
+                    "created_at",
+                )
+            }
             event_payload = {
                 "contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
                 "event_type": "claimed",
                 "lease_seconds": ttl,
+                "snapshot_lineage_count": queued_request[
+                    "snapshot_lineage_count"
+                ],
+                "snapshot_id": queued_request["snapshot_id"],
+                "request_lineage": request_lineage_binding,
                 "reclaimed_expired_lease": bool(prior_claim),
                 "prior_attempt_no": (
                     int(prior_claim["attempt_no"]) if prior_claim else None
@@ -5838,17 +6239,25 @@ class MarketTapeStore:
                     event_id,
                     demand_id,
                     attempt_no,
-                    request["request_sha256"],
+                    queued_request["request_sha256"],
                     claim_source_service,
                     claim_source_receipt,
-                    request["topic"],
-                    request["audience"],
-                    request["objective"],
-                    request["evidence_trend_id"],
-                    request["snapshot_id"],
+                    queued_request["topic"],
+                    queued_request["audience"],
+                    queued_request["objective"],
+                    queued_request["evidence_trend_id"],
+                    queued_request["snapshot_id"],
                     lease_until,
-                    str(collection_run_id or request["collection_run_id"] or "")[:500],
-                    str(transcript_run_id or request["transcript_run_id"] or "")[:500],
+                    str(
+                        collection_run_id
+                        or queued_request["collection_run_id"]
+                        or ""
+                    )[:500],
+                    str(
+                        transcript_run_id
+                        or queued_request["transcript_run_id"]
+                        or ""
+                    )[:500],
                     json.dumps(event_payload, sort_keys=True, default=str),
                     claimed_at_iso,
                 ),
@@ -5870,7 +6279,12 @@ class MarketTapeStore:
         collection_run_id: str = "",
         transcript_run_id: str = "",
     ) -> Dict[str, Any]:
-        """Append one idempotent terminal event for the active lease."""
+        """Append one idempotent attempt result for the active lease.
+
+        ``partial`` resolves this attempt while deliberately keeping the
+        demand claimable by a later explicit worker call.  Completed, blocked,
+        and failed results close the demand.
+        """
 
         canonical_id = str(demand_id or "").strip()
         if not canonical_id:
@@ -5887,21 +6301,19 @@ class MarketTapeStore:
         terminal_payload = dict(payload or {})
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
+            existing_final = connection.execute(
                 """SELECT *
                    FROM mt_script_language_demand_events
                    WHERE demand_id = ?
-                     AND event_type IN (
-                         'completed', 'partial', 'blocked', 'failed'
-                     )
+                     AND event_type IN ('completed', 'blocked', 'failed')
                    ORDER BY attempt_no DESC, created_at DESC, event_id DESC
                    LIMIT 1""",
                 (canonical_id,),
             ).fetchone()
-            if existing is not None:
+            if existing_final is not None:
                 if (
-                    str(existing["event_type"]) == canonical_event_type
-                    and int(existing["attempt_no"]) == canonical_attempt
+                    str(existing_final["event_type"]) == canonical_event_type
+                    and int(existing_final["attempt_no"]) == canonical_attempt
                 ):
                     result = _script_language_demand_from_connection(
                         connection, canonical_id, finished_at
@@ -5913,7 +6325,47 @@ class MarketTapeStore:
                     result["appended"] = False
                     result["deduplicated"] = True
                     return result
-                raise ValueError("script language demand is already terminal")
+                raise ValueError("script language demand is already final")
+            existing_attempt = connection.execute(
+                """SELECT *
+                   FROM mt_script_language_demand_events
+                   WHERE demand_id = ? AND attempt_no = ?
+                     AND event_type IN (
+                         'completed', 'partial', 'blocked', 'failed'
+                     )
+                   ORDER BY created_at DESC, event_id DESC
+                   LIMIT 1""",
+                (canonical_id, canonical_attempt),
+            ).fetchone()
+            if existing_attempt is not None:
+                try:
+                    existing_attempt_payload = json.loads(str(
+                        existing_attempt["payload_json"] or "{}"
+                    ))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_attempt_payload = {}
+                coerced_request_type = (
+                    existing_attempt_payload.get("result", {}).get(
+                        "requested_terminal_event_type"
+                    )
+                    if isinstance(existing_attempt_payload.get("result"), dict)
+                    else None
+                )
+                if (
+                    str(existing_attempt["event_type"]) == canonical_event_type
+                    or coerced_request_type == canonical_event_type
+                ):
+                    result = _script_language_demand_from_connection(
+                        connection, canonical_id, finished_at
+                    )
+                    if result is None:
+                        raise RuntimeError(
+                            "finished script language demand lost its request"
+                        )
+                    result["appended"] = False
+                    result["deduplicated"] = True
+                    return result
+                raise ValueError("script language demand attempt is already finished")
             claim = connection.execute(
                 """SELECT *
                    FROM mt_script_language_demand_events
@@ -5928,9 +6380,92 @@ class MarketTapeStore:
                 raise ValueError("attempt_no does not own the latest claim")
             if not claim["lease_until"] or claim["lease_until"] <= finished_at:
                 raise ValueError("script language demand claim lease has expired")
+            try:
+                claim_payload = json.loads(str(claim["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                claim_payload = {}
+            claimed_request_lineage = claim_payload.get("request_lineage")
+            claimed_request_lineage = (
+                claimed_request_lineage
+                if isinstance(claimed_request_lineage, dict)
+                else {}
+            )
+            current_snapshot_lineage = (
+                _script_language_demand_snapshot_lineage_from_connection(
+                    connection, canonical_id
+                )
+            )
+            latest_request_lineage = max(
+                current_snapshot_lineage,
+                key=lambda item: int(item["lineage_sequence"]),
+                default={},
+            )
+            if not claimed_request_lineage.get("lineage_id"):
+                matching_claim_lineage = [
+                    item for item in current_snapshot_lineage
+                    if str(item.get("request_sha256") or "")
+                    == str(claim["request_sha256"] or "")
+                    and str(item.get("snapshot_id") or "")
+                    == str(claim["snapshot_id"] or "")
+                ]
+                if matching_claim_lineage:
+                    matched = max(
+                        matching_claim_lineage,
+                        key=lambda item: int(item["lineage_sequence"]),
+                    )
+                    claimed_request_lineage = {
+                        field: matched.get(field)
+                        for field in (
+                            "lineage_sequence",
+                            "lineage_id",
+                            "semantic_key",
+                            "snapshot_id",
+                            "request_sha256",
+                            "source_service",
+                            "source_receipt_id",
+                            "evidence_trend_id",
+                            "created_at",
+                        )
+                    }
+            claimed_lineage_id = str(
+                claimed_request_lineage.get("lineage_id") or ""
+            )
+            latest_lineage_id = str(
+                latest_request_lineage.get("lineage_id") or ""
+            )
+            requested_terminal_event_type = canonical_event_type
+            if latest_lineage_id and claimed_lineage_id != latest_lineage_id:
+                canonical_event_type = "partial"
+                terminal_payload.update({
+                    "goal_met": False,
+                    "retry_required": True,
+                    "failure_code": (
+                        "NEWER_SNAPSHOT_QUEUED_DURING_CLAIM"
+                    ),
+                    "requested_terminal_event_type": (
+                        requested_terminal_event_type
+                    ),
+                    "claimed_snapshot_lineage_id": claimed_lineage_id,
+                    "latest_snapshot_lineage_id": latest_lineage_id,
+                })
             event_payload = {
                 "contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
                 "event_type": canonical_event_type,
+                "request_lineage": claimed_request_lineage,
+                "latest_request_lineage_at_finish": {
+                    field: latest_request_lineage.get(field)
+                    for field in (
+                        "lineage_sequence",
+                        "lineage_id",
+                        "semantic_key",
+                        "snapshot_id",
+                        "request_sha256",
+                        "source_service",
+                        "source_receipt_id",
+                        "evidence_trend_id",
+                        "created_at",
+                    )
+                },
                 "result": terminal_payload,
             }
             event_id = _script_language_demand_event_id(
@@ -6073,7 +6608,7 @@ class MarketTapeStore:
                 "due_polls": connection.execute("SELECT COUNT(*) FROM mt_poll_queue WHERE due_at <= ?", (isoformat(utc_now()),)).fetchone()[0],
             }
             demand_state_rows = connection.execute(
-                """WITH terminal AS (
+                """WITH final AS (
                        SELECT demand_id, event_type,
                               ROW_NUMBER() OVER (
                                   PARTITION BY demand_id
@@ -6081,11 +6616,18 @@ class MarketTapeStore:
                                            event_id DESC
                               ) AS row_number
                        FROM mt_script_language_demand_events
-                       WHERE event_type IN (
-                           'completed', 'partial', 'blocked', 'failed'
-                       )
+                       WHERE event_type IN ('completed', 'blocked', 'failed')
+                   ), latest_partial AS (
+                       SELECT demand_id, attempt_no,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY demand_id
+                                  ORDER BY attempt_no DESC, created_at DESC,
+                                           event_id DESC
+                              ) AS row_number
+                       FROM mt_script_language_demand_events
+                       WHERE event_type = 'partial'
                    ), latest_claim AS (
-                       SELECT demand_id, lease_until,
+                       SELECT demand_id, attempt_no, lease_until,
                               ROW_NUMBER() OVER (
                                   PARTITION BY demand_id
                                   ORDER BY attempt_no DESC, created_at DESC,
@@ -6096,16 +6638,28 @@ class MarketTapeStore:
                    ), current AS (
                        SELECT request.demand_id,
                               CASE
-                                  WHEN terminal.event_type IS NOT NULL
-                                      THEN terminal.event_type
+                                  WHEN final.event_type IS NOT NULL
+                                      THEN final.event_type
                                   WHEN latest_claim.lease_until > ?
+                                   AND (
+                                       latest_partial.attempt_no IS NULL
+                                       OR latest_partial.attempt_no <
+                                          latest_claim.attempt_no
+                                   )
                                       THEN 'claimed'
+                                  WHEN latest_partial.attempt_no IS NOT NULL
+                                   AND latest_partial.attempt_no =
+                                       latest_claim.attempt_no
+                                      THEN 'partial'
                                   ELSE 'requested'
                               END AS state
                        FROM mt_script_language_demand_events request
-                       LEFT JOIN terminal
-                         ON terminal.demand_id = request.demand_id
-                        AND terminal.row_number = 1
+                       LEFT JOIN final
+                         ON final.demand_id = request.demand_id
+                        AND final.row_number = 1
+                       LEFT JOIN latest_partial
+                         ON latest_partial.demand_id = request.demand_id
+                        AND latest_partial.row_number = 1
                        LEFT JOIN latest_claim
                          ON latest_claim.demand_id = request.demand_id
                         AND latest_claim.row_number = 1
@@ -7224,6 +7778,25 @@ def _normalize_script_demand_identity_text(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def _script_language_demand_semantic_key(
+    *,
+    contract: str,
+    topic: str,
+    audience: str,
+    objective: str,
+    targets: Any,
+) -> str:
+    """Identify equivalent bounded work without snapshot provenance."""
+
+    return "script-language-demand-semantic:" + stable_hash({
+        "contract": contract,
+        "topic": _normalize_script_demand_identity_text(topic),
+        "audience": _normalize_script_demand_identity_text(audience),
+        "objective": _normalize_script_demand_identity_text(objective),
+        "targets": _normalize_script_demand_targets(targets),
+    })
+
+
 def _normalize_script_demand_targets(value: Any) -> Any:
     """Canonicalize targets as a set while retaining structured settings."""
 
@@ -7283,6 +7856,164 @@ def _script_language_demand_event_id(
     })
 
 
+def _backfill_script_language_demand_lineage(
+    connection: sqlite3.Connection,
+) -> int:
+    """Seed the additive lineage registry from immutable V12 requests."""
+
+    rows = connection.execute(
+        """SELECT request.*
+           FROM mt_script_language_demand_events request
+           WHERE request.event_type = 'requested'
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM mt_script_language_demand_snapshot_lineage lineage
+                 WHERE lineage.demand_id = request.demand_id
+                   AND lineage.request_sha256 = request.request_sha256
+             )
+           ORDER BY request.created_at, request.demand_id"""
+    ).fetchall()
+    inserted = 0
+    for row in rows:
+        raw_payload = str(row["payload_json"] or "{}")
+        try:
+            request_payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(request_payload, dict):
+            continue
+        targets = _normalize_script_demand_targets(
+            request_payload.get("targets")
+        )
+        semantic_key = _script_language_demand_semantic_key(
+            contract=SCRIPT_LANGUAGE_DEMAND_CONTRACT,
+            topic=str(row["topic"]),
+            audience=str(row["audience"]),
+            objective=str(row["objective"]),
+            targets=targets,
+        )
+        connection.execute(
+            """INSERT INTO mt_script_language_demand_semantics(
+                   semantic_key, contract, normalized_topic,
+                   normalized_audience, normalized_objective,
+                   targets_json, created_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(semantic_key) DO NOTHING""",
+            (
+                semantic_key,
+                SCRIPT_LANGUAGE_DEMAND_CONTRACT,
+                _normalize_script_demand_identity_text(row["topic"]),
+                _normalize_script_demand_identity_text(row["audience"]),
+                _normalize_script_demand_identity_text(row["objective"]),
+                json.dumps(targets, sort_keys=True, default=str),
+                str(row["created_at"]),
+            ),
+        )
+        lineage_id = (
+            "script-language-demand-snapshot-lineage:"
+            + stable_hash({
+                "contract": SCRIPT_LANGUAGE_DEMAND_SNAPSHOT_LINEAGE_CONTRACT,
+                "demand_id": str(row["demand_id"]),
+                "request_sha256": str(row["request_sha256"]),
+            })
+        )
+        result = connection.execute(
+            """INSERT INTO mt_script_language_demand_snapshot_lineage(
+                   lineage_id, demand_id, semantic_key, snapshot_id,
+                   request_sha256, source_service, source_receipt_id,
+                   evidence_trend_id, payload_json, created_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(demand_id, request_sha256) DO NOTHING""",
+            (
+                lineage_id,
+                str(row["demand_id"]),
+                semantic_key,
+                str(row["snapshot_id"]),
+                str(row["request_sha256"]),
+                str(row["source_service"]),
+                str(row["source_receipt_id"]),
+                str(row["evidence_trend_id"]),
+                raw_payload,
+                str(row["created_at"]),
+            ),
+        )
+        inserted += int(result.rowcount == 1)
+    return inserted
+
+
+def _queued_script_language_demand_for_semantic_connection(
+    connection: sqlite3.Connection,
+    semantic_key: str,
+) -> Optional[str]:
+    """Return the authoritative semantic generation only while unresolved.
+
+    V12 could create one demand per snapshot.  V13 backfills all of those
+    requests into the semantic lineage registry.  Selecting only among
+    unresolved rows would let an older duplicate resurrect after the newest
+    generation closes, so authority is first resolved across *all* generations
+    and only then checked for a final event.
+    """
+
+    latest = _latest_script_language_demand_for_semantic_connection(
+        connection, semantic_key
+    )
+    if latest is None:
+        return None
+    demand_id = str(latest["demand_id"])
+    final = connection.execute(
+        """SELECT 1
+           FROM mt_script_language_demand_events
+           WHERE demand_id = ?
+             AND event_type IN ('completed', 'blocked', 'failed')
+           LIMIT 1""",
+        (demand_id,),
+    ).fetchone()
+    return demand_id if final is None else None
+
+
+def _latest_script_language_demand_for_semantic_connection(
+    connection: sqlite3.Connection,
+    semantic_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve the newest append-only lineage generation for one semantic."""
+
+    row = connection.execute(
+        """SELECT demand_id, semantic_key,
+                  MAX(lineage_sequence) AS latest_lineage_sequence
+           FROM mt_script_language_demand_snapshot_lineage
+           WHERE semantic_key = ?
+           GROUP BY demand_id, semantic_key
+           ORDER BY latest_lineage_sequence DESC, demand_id DESC
+           LIMIT 1""",
+        (semantic_key,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _script_language_demand_snapshot_lineage_from_connection(
+    connection: sqlite3.Connection,
+    demand_id: str,
+) -> List[Dict[str, Any]]:
+    rows = connection.execute(
+        """SELECT *
+           FROM mt_script_language_demand_snapshot_lineage
+           WHERE demand_id = ?
+           ORDER BY lineage_sequence""",
+        (demand_id,),
+    ).fetchall()
+    lineage: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        raw_payload = item.pop("payload_json", "{}")
+        try:
+            parsed_payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_payload = {"invalid_payload_json": True}
+        item["payload"] = parsed_payload
+        lineage.append(item)
+    return lineage
+
+
 def _script_language_demand_from_connection(
     connection: sqlite3.Connection,
     demand_id: str,
@@ -7317,10 +8048,15 @@ def _script_language_demand_from_connection(
         event for event in events if event["event_type"] == "requested"
     )
     claims = [event for event in events if event["event_type"] == "claimed"]
-    terminal_events = [
+    attempt_results = [
         event
         for event in events
         if event["event_type"] in SCRIPT_LANGUAGE_DEMAND_TERMINAL_EVENTS
+    ]
+    final_events = [
+        event
+        for event in attempt_results
+        if event["event_type"] in SCRIPT_LANGUAGE_DEMAND_FINAL_EVENTS
     ]
     latest_claim = max(
         claims,
@@ -7331,8 +8067,17 @@ def _script_language_demand_from_connection(
         ),
         default=None,
     )
-    latest_terminal = max(
-        terminal_events,
+    latest_attempt_result = max(
+        attempt_results,
+        key=lambda event: (
+            int(event["attempt_no"]),
+            str(event["created_at"]),
+            str(event["event_id"]),
+        ),
+        default=None,
+    )
+    latest_final = max(
+        final_events,
         key=lambda event: (
             int(event["attempt_no"]),
             str(event["created_at"]),
@@ -7341,51 +8086,197 @@ def _script_language_demand_from_connection(
         default=None,
     )
     measured_at = _script_demand_timestamp(as_of)
+    latest_claim_resolved = bool(
+        latest_claim
+        and latest_attempt_result
+        and int(latest_attempt_result["attempt_no"])
+            == int(latest_claim["attempt_no"])
+    )
     lease_active = bool(
         latest_claim
         and latest_claim.get("lease_until")
         and str(latest_claim["lease_until"]) > measured_at
-        and latest_terminal is None
+        and latest_final is None
+        and not latest_claim_resolved
     )
     lease_expired = bool(
         latest_claim
         and not lease_active
-        and latest_terminal is None
+        and latest_final is None
+        and not latest_claim_resolved
     )
-    if latest_terminal is not None:
-        state = str(latest_terminal["event_type"])
+    if latest_final is not None:
+        state = str(latest_final["event_type"])
     elif lease_active:
         state = "claimed"
+    elif (
+        latest_attempt_result is not None
+        and latest_attempt_result["event_type"] == "partial"
+        and latest_claim is not None
+        and int(latest_attempt_result["attempt_no"])
+            == int(latest_claim["attempt_no"])
+    ):
+        state = "partial"
     else:
         state = "requested"
-    request_payload = request.get("payload")
+    snapshot_lineage = (
+        _script_language_demand_snapshot_lineage_from_connection(
+            connection, demand_id
+        )
+    )
+    latest_snapshot = max(
+        snapshot_lineage,
+        key=lambda item: int(item["lineage_sequence"]),
+        default=None,
+    )
+    semantic_key = str(
+        latest_snapshot["semantic_key"] if latest_snapshot else ""
+    )
+    semantic_authority = (
+        _latest_script_language_demand_for_semantic_connection(
+            connection, semantic_key
+        )
+        if semantic_key else None
+    )
+    semantic_authority_demand_id = str(
+        semantic_authority["demand_id"]
+        if semantic_authority else demand_id
+    )
+    superseded = semantic_authority_demand_id != demand_id
+    supersession = (
+        {
+            "contract": "market_tape_script_language_demand_supersession_v1",
+            "reason": "newer_semantic_snapshot_lineage",
+            "semantic_key": semantic_key,
+            "superseded_demand_id": demand_id,
+            "authoritative_demand_id": semantic_authority_demand_id,
+            "authoritative_lineage_sequence": int(
+                semantic_authority["latest_lineage_sequence"]
+            ),
+        }
+        if superseded and semantic_authority else None
+    )
+    original_request_payload = request.get("payload")
+    latest_request_payload = (
+        latest_snapshot.get("payload") if latest_snapshot else None
+    )
+    request_payload = (
+        latest_request_payload
+        if isinstance(latest_request_payload, dict)
+        and not latest_request_payload.get("invalid_payload_json")
+        else original_request_payload
+    )
     targets = request_payload.get("targets", []) if isinstance(
         request_payload, dict
     ) else []
-    latest_lineage = latest_terminal or latest_claim or request
+    latest_lineage = max(
+        [event for event in (latest_attempt_result, latest_claim) if event],
+        key=lambda event: (
+            int(event["attempt_no"]),
+            str(event["created_at"]),
+            str(event["event_id"]),
+        ),
+        default=request,
+    )
     return {
         "contract": SCRIPT_LANGUAGE_DEMAND_CONTRACT,
         "event_contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
         "demand_id": demand_id,
         "state": state,
-        "request_sha256": str(request["request_sha256"]),
-        "source_service": str(request["source_service"]),
-        "source_receipt_id": str(request["source_receipt_id"]),
-        "topic": str(request["topic"]),
-        "audience": str(request["audience"]),
-        "objective": str(request["objective"]),
-        "evidence_trend_id": str(request["evidence_trend_id"]),
-        "snapshot_id": str(request["snapshot_id"]),
+        "request_sha256": str(
+            latest_snapshot["request_sha256"]
+            if latest_snapshot else request["request_sha256"]
+        ),
+        "source_service": str(
+            latest_snapshot["source_service"]
+            if latest_snapshot else request["source_service"]
+        ),
+        "source_receipt_id": str(
+            latest_snapshot["source_receipt_id"]
+            if latest_snapshot else request["source_receipt_id"]
+        ),
+        "topic": str(
+            request_payload.get("topic")
+            if isinstance(request_payload, dict)
+            and request_payload.get("topic")
+            else request["topic"]
+        ),
+        "audience": str(
+            request_payload.get("audience")
+            if isinstance(request_payload, dict)
+            and request_payload.get("audience")
+            else request["audience"]
+        ),
+        "objective": str(
+            request_payload.get("objective")
+            if isinstance(request_payload, dict)
+            and request_payload.get("objective")
+            else request["objective"]
+        ),
+        "evidence_trend_id": str(
+            latest_snapshot["evidence_trend_id"]
+            if latest_snapshot else request["evidence_trend_id"]
+        ),
+        "snapshot_id": str(
+            latest_snapshot["snapshot_id"]
+            if latest_snapshot else request["snapshot_id"]
+        ),
+        "latest_snapshot_id": str(
+            latest_snapshot["snapshot_id"]
+            if latest_snapshot else request["snapshot_id"]
+        ),
+        "latest_source_service": str(
+            latest_snapshot["source_service"]
+            if latest_snapshot else request["source_service"]
+        ),
+        "latest_source_receipt_id": str(
+            latest_snapshot["source_receipt_id"]
+            if latest_snapshot else request["source_receipt_id"]
+        ),
+        "latest_evidence_trend_id": str(
+            latest_snapshot["evidence_trend_id"]
+            if latest_snapshot else request["evidence_trend_id"]
+        ),
+        "semantic_key": semantic_key,
+        "semantic_generation_role": (
+            "superseded" if superseded else "authoritative"
+        ),
+        "semantic_authority_demand_id": semantic_authority_demand_id,
+        "semantic_authority_lineage_sequence": (
+            int(semantic_authority["latest_lineage_sequence"])
+            if semantic_authority else None
+        ),
+        "superseded": superseded,
+        "superseded_by_demand_id": (
+            semantic_authority_demand_id if superseded else None
+        ),
+        "supersession": supersession,
+        "effective_state": "superseded" if superseded else state,
         "targets": targets,
         "collection_run_id": str(
             latest_lineage.get("collection_run_id")
+            or (
+                request_payload.get("collection_run_id")
+                if isinstance(request_payload, dict) else ""
+            )
             or request["collection_run_id"]
         ),
         "transcript_run_id": str(
             latest_lineage.get("transcript_run_id")
+            or (
+                request_payload.get("transcript_run_id")
+                if isinstance(request_payload, dict) else ""
+            )
             or request["transcript_run_id"]
         ),
         "requested_at": str(request["created_at"]),
+        "latest_snapshot_at": (
+            str(latest_snapshot["created_at"]) if latest_snapshot else None
+        ),
+        "latest_request_payload": request_payload,
+        "latest_snapshot_lineage": latest_snapshot,
+        "snapshot_lineage": snapshot_lineage,
+        "snapshot_lineage_count": len(snapshot_lineage),
         "attempt_count": len(claims),
         "attempt_no": (
             int(latest_claim["attempt_no"]) if latest_claim else 0
@@ -7395,8 +8286,18 @@ def _script_language_demand_from_connection(
         ),
         "lease_active": lease_active,
         "lease_expired": lease_expired,
+        "retry_eligible": (
+            not superseded and state in {"requested", "partial"}
+        ),
+        "claimable": (
+            not superseded and state in {"requested", "partial"}
+        ),
         "terminal_at": (
-            str(latest_terminal["created_at"]) if latest_terminal else None
+            str(latest_final["created_at"]) if latest_final else None
+        ),
+        "last_attempt_at": (
+            str(latest_attempt_result["created_at"])
+            if latest_attempt_result else None
         ),
         "events": events,
     }

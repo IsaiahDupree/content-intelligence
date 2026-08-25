@@ -7,18 +7,24 @@ import os
 import re
 import sqlite3
 import subprocess
+import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .ai_relatability import AIRelatabilityAdjudicator, NON_AI_PASS_DECISION
 from .contracts import is_supported_transcript_audit_contract
 from .narrative_coherence import NarrativeCoherenceService
 from .script_intelligence import ScriptIntelligenceService
 
 
 UTC = timezone.utc
+OWNED_ATTRIBUTION_EVENT_CONTRACT = "owned_attribution_event_v1"
+OWNED_RETENTION_SAMPLE_CONTRACT = "owned_retention_sample_v1"
+OWNED_OUTCOME_SUMMARY_CONTRACT = "owned_outcome_summary_v1"
+OWNED_OUTCOME_EVENT_TYPES = ("click", "install", "trial", "purchase")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 STOP_WORDS = {
@@ -41,12 +47,99 @@ CHANGE_WORDS = {
     "but", "except", "here's", "instead", "look", "now", "proof", "so", "then",
     "watch", "yet",
 }
-HUMAN_EXPERIENCE_WORDS = {
-    "alone", "anxious", "anxiety", "burned", "burnout", "burnt", "care",
-    "exhausted", "fear", "feel", "feeling", "frustrated", "hard", "hate",
-    "hopeless", "overwhelmed", "pressure", "quit", "struggle", "struggling",
-    "stuck", "tired", "trying", "worry", "worse",
+MAX_SOURCE_EXCERPT_WORDS = 10
+MIN_HUMAN_MOMENT_SOURCE_SCORE = 55
+EVERYDAY_HUMAN_LANGUAGE_BY_CATEGORY = {
+    "problem": {
+        "alone", "anxious", "anxiety", "burned", "burnout", "burnt",
+        "challenge", "challenges", "difficult", "exhausted", "fail", "failed",
+        "failing", "fear", "feel", "feeling", "frustrated", "hard", "hate",
+        "hopeless", "issue", "issues", "mistake", "mistakes", "overwhelmed",
+        "pressure", "problem", "problems", "quit", "scattered", "struggle",
+        "struggling", "stuck", "tired", "worry", "worse",
+    },
+    "need": {
+        "can't", "cannot", "care", "don't", "must", "need", "needed", "needs",
+        "solution", "solutions", "trying", "wish",
+    },
+    "time": {
+        "daily", "deadline", "deadlines", "hour", "hours", "late",
+        "minute", "minutes", "morning", "mornings", "night", "nights", "time",
+        "week", "weeks",
+    },
+    "work": {
+        "client", "clients", "customer", "customers", "email", "emails", "job",
+        "jobs", "form", "forms", "invoice", "invoices", "lead", "leads",
+        "meeting", "meetings", "quote", "quotes", "sales", "support", "task",
+        "tasks", "team", "teams", "work", "working",
+    },
 }
+HUMAN_EXPERIENCE_WORDS = set().union(
+    *EVERYDAY_HUMAN_LANGUAGE_BY_CATEGORY.values()
+)
+HUMAN_MOMENT_CATEGORY_WEIGHTS = {
+    "problem": 40,
+    "time": 35,
+    "need": 30,
+    "work": 20,
+}
+HUMAN_MOMENT_PROMOTIONAL_WORDS = {
+    "bio", "buy", "check", "click", "comment", "download", "follow", "free",
+    "guide", "link", "save", "subscribe",
+}
+HUMAN_MOMENT_LIVED_CONTEXT_WORDS = {
+    "i", "i'm", "i've", "me", "my", "we", "we're", "you", "you're", "your",
+}
+HUMAN_MOMENT_NEGATION_WORDS = {
+    "can't", "cannot", "don't", "failed", "failing", "hard", "not", "worse",
+}
+HUMAN_MOMENT_WEAK_OPENERS = {
+    "and", "but", "so", "that", "the", "then", "thing", "this",
+}
+HUMAN_MOMENT_INCOMPLETE_OPENERS = {
+    "a", "also", "am", "an", "any", "are", "can", "could", "from", "in", "is",
+    "of", "on", "to", "was", "were", "which",
+}
+HUMAN_MOMENT_WEAK_ENDINGS = {
+    "a", "am", "an", "and", "are", "be", "been", "but", "can", "can't",
+    "could", "don't", "every", "for", "from", "i'm", "i've", "in", "is",
+    "my", "of", "on", "our", "should", "that", "the", "their", "this", "to", "was",
+    "we're", "were",
+    "when", "where", "which", "who", "will", "with", "workflow", "workflows",
+    "would", "your", "you're",
+}
+HUMAN_MOMENT_INCOMPLETE_BIGRAMS = {
+    ("i", "and"), ("we", "and"), ("you", "and"), ("you", "into"),
+}
+AUDIENCE_CONTEXT_BY_TERM = {
+    "founder": {
+        "business", "client", "customer", "customers", "form", "forms",
+        "invoice", "invoices", "lead", "leads", "meeting", "meetings",
+        "product", "quote", "quotes", "revenue", "sales", "support", "team",
+        "user", "users", "website", "websites",
+    },
+    "software": {
+        "app", "apps", "build", "code", "coding", "developer", "product",
+        "software",
+    },
+}
+AUDIENCE_OFF_CONTEXT_BY_TERM = {
+    "founder": {"applying", "job", "jobs", "resume"},
+    "software": {"applying", "job", "jobs", "resume"},
+}
+
+
+def audience_context_vocabulary(audience: str) -> tuple[set[str], set[str]]:
+    audience_tokens = {
+        normalized_source_word(token) for token in words(audience)
+    }
+    context = set(audience_tokens)
+    off_context: set[str] = set()
+    for audience_term in audience_tokens:
+        singular = audience_term[:-1] if audience_term.endswith("s") else audience_term
+        context.update(AUDIENCE_CONTEXT_BY_TERM.get(singular, set()))
+        off_context.update(AUDIENCE_OFF_CONTEXT_BY_TERM.get(singular, set()))
+    return context, off_context
 
 
 def utc_now() -> str:
@@ -58,8 +151,223 @@ def stable_id(prefix: str, *parts: Any) -> str:
     return f"{prefix}_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]}"
 
 
+SCRIPT_IDENTITY_FIELDS = (
+    "topic", "audience", "objective", "brief_id", "trend_id",
+    "parent_script_id", "variant_index", "variant_selection_contract",
+    "source_receipt_ids", "human_moment",
+    "evidence_summary", "timeline", "text",
+)
+
+
+def script_identity_payload(script: dict[str, Any]) -> dict[str, Any]:
+    return {field: script.get(field) for field in SCRIPT_IDENTITY_FIELDS}
+
+
+class IdempotencyConflict(ValueError):
+    """The same provider key was reused for a different immutable fact."""
+
+
 def words(text: str) -> list[str]:
     return WORD_RE.findall(text or "")
+
+
+def normalized_source_word(value: str) -> str:
+    return value.casefold().replace("’", "'")
+
+
+def source_exact_everyday_excerpt(
+    source_span: str,
+    max_words: int = MAX_SOURCE_EXCERPT_WORDS,
+    *,
+    audience_vocabulary: set[str] | None = None,
+    audience_off_context: set[str] | None = None,
+    source_audience_terms: Sequence[str] | None = None,
+    source_off_context_terms: Sequence[str] | None = None,
+) -> dict[str, Any] | None:
+    """Return a cue-bearing contiguous substring without paraphrasing it."""
+
+    token_matches = list(WORD_RE.finditer(source_span or ""))
+    if not token_matches:
+        return None
+    cue_indexes = [
+        index
+        for index, match in enumerate(token_matches)
+        if normalized_source_word(match.group(0)) in HUMAN_EXPERIENCE_WORDS
+    ]
+    if not cue_indexes:
+        return None
+    bounded_words = max(1, min(int(max_words), MAX_SOURCE_EXCERPT_WORDS))
+    audience_vocabulary = set(audience_vocabulary or ())
+    audience_off_context = set(audience_off_context or ())
+    source_audience_terms = sorted(set(source_audience_terms or ()))
+    source_off_context_terms = set(source_off_context_terms or ())
+    candidates: list[dict[str, Any]] = []
+    seen_windows: set[tuple[int, int]] = set()
+    for cue_index in cue_indexes:
+        minimum_window_words = min(5, len(token_matches))
+        first_min = max(0, cue_index - bounded_words + 1)
+        first_max = cue_index
+        for first_index in range(first_min, first_max + 1):
+            final_min = max(cue_index, first_index + minimum_window_words - 1)
+            final_max = min(
+                len(token_matches) - 1,
+                first_index + bounded_words - 1,
+            )
+            for final_index in range(final_min, final_max + 1):
+                window_key = (first_index, final_index)
+                if window_key in seen_windows:
+                    continue
+                seen_windows.add(window_key)
+                window = token_matches[first_index:final_index + 1]
+                normalized_tokens = [
+                    normalized_source_word(match.group(0)) for match in window
+                ]
+                excerpt_tokens = set(normalized_tokens)
+                if any(
+                    any(char.isdigit() for char in token)
+                    for token in normalized_tokens
+                ):
+                    continue
+                matched_terms = sorted(
+                    excerpt_tokens & HUMAN_EXPERIENCE_WORDS
+                )
+                categories = sorted(
+                    category
+                    for category, terms
+                    in EVERYDAY_HUMAN_LANGUAGE_BY_CATEGORY.items()
+                    if excerpt_tokens & terms
+                )
+                promotional_terms = sorted(
+                    excerpt_tokens & HUMAN_MOMENT_PROMOTIONAL_WORDS
+                )
+                # A CTA or offer is not a lived audience moment. An actual
+                # problem or time constraint in the same exact excerpt remains
+                # admissible.
+                if promotional_terms and not (
+                    {"problem", "time"} & set(categories)
+                ):
+                    continue
+                lived_terms = sorted(
+                    excerpt_tokens & HUMAN_MOMENT_LIVED_CONTEXT_WORDS
+                )
+                negation_terms = sorted(
+                    excerpt_tokens & HUMAN_MOMENT_NEGATION_WORDS
+                )
+                first_token = normalized_tokens[0]
+                final_token = normalized_tokens[-1]
+                score = (
+                    max(
+                        HUMAN_MOMENT_CATEGORY_WEIGHTS[category]
+                        for category in categories
+                    )
+                    + 5 * max(0, len(categories) - 1)
+                    + 3 * max(0, len(matched_terms) - 1)
+                    + len(normalized_tokens)
+                    + (7 if negation_terms else 0)
+                    + (12 if lived_terms else 0)
+                    + (
+                        15
+                        if first_token
+                        in HUMAN_MOMENT_LIVED_CONTEXT_WORDS
+                        else 0
+                    )
+                    - (
+                        8
+                        if first_token in HUMAN_MOMENT_WEAK_OPENERS
+                        else 0
+                    )
+                    - (
+                        12
+                        if first_token in HUMAN_MOMENT_INCOMPLETE_OPENERS
+                        else 0
+                    )
+                    - (
+                        10
+                        if final_token in HUMAN_MOMENT_WEAK_ENDINGS
+                        else 0
+                    )
+                    - (
+                        20
+                        if len(normalized_tokens) > 1
+                        and tuple(normalized_tokens[:2])
+                        in HUMAN_MOMENT_INCOMPLETE_BIGRAMS
+                        else 0
+                    )
+                    - (
+                        20
+                        if len(normalized_tokens) >= 4
+                        and normalized_tokens[-2:] == ["customer", "support"]
+                        and "a" in normalized_tokens[-4:-2]
+                        else 0
+                    )
+                    - (
+                        20
+                        if final_token == "customer"
+                        and "a" in normalized_tokens[-3:-1]
+                        else 0
+                    )
+                    - (
+                        25
+                        if first_token in {"my", "our", "their", "your"}
+                        and "using" in normalized_tokens
+                        and not (
+                            {"am", "are", "is", "was", "were"}
+                            & set(normalized_tokens)
+                        )
+                        else 0
+                    )
+                )
+                excerpt = source_span[
+                    token_matches[first_index].start():
+                    token_matches[final_index].end()
+                ]
+                audience_match_terms = sorted(
+                    excerpt_tokens & audience_vocabulary
+                )
+                audience_off_context_terms = sorted(
+                    (excerpt_tokens & audience_off_context)
+                    | source_off_context_terms
+                )
+                adjusted_score = (
+                    score
+                    + 15 * min(2, len(audience_match_terms))
+                    + 5 * min(2, len(source_audience_terms))
+                    - 30 * min(1, len(audience_off_context_terms))
+                )
+                candidates.append({
+                    "text": excerpt,
+                    "word_count": final_index - first_index + 1,
+                    "source_span_word_count": len(token_matches),
+                    "truncated": len(token_matches) > bounded_words,
+                    "word_start": first_index,
+                    "word_end_exclusive": final_index + 1,
+                    "categories": categories,
+                    "matched_terms": matched_terms,
+                    "lived_context_terms": lived_terms,
+                    "negation_terms": negation_terms,
+                    "promotional_terms": promotional_terms,
+                    "source_selection_score": max(0, min(100, score)),
+                    "audience_adjusted_selection_score": max(
+                        0, min(100, adjusted_score)
+                    ),
+                    "audience_match_terms": audience_match_terms,
+                    "source_audience_match_terms": source_audience_terms,
+                    "audience_off_context_terms": (
+                        audience_off_context_terms
+                    ),
+                    "score_is_probability": False,
+                })
+    return max(
+        candidates,
+        key=lambda item: (
+            int(item["audience_adjusted_selection_score"]),
+            int(item["source_selection_score"]),
+            len(item["categories"]),
+            len(item["matched_terms"]),
+            -int(item["word_start"]),
+        ),
+        default=None,
+    )
 
 
 def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
@@ -101,6 +409,12 @@ def verified_transcript_patterns(
 
 
 class QualityStore:
+    SCRIPT_AUDIT_FIELDS = (
+        "text", "timeline", "evidence_summary", "source_receipt_ids",
+        "audience", "human_moment", "brief_id", "topic", "objective",
+        "variant_index", "variant_selection_contract",
+    )
+
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,6 +497,46 @@ class QualityStore:
                     duration_ms REAL NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cq_owned_outcome_events (
+                    event_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    event_type TEXT NOT NULL CHECK(
+                        event_type IN ('click', 'install', 'trial', 'purchase')
+                    ),
+                    content_id TEXT NOT NULL,
+                    campaign_id TEXT NOT NULL,
+                    offer_id TEXT NOT NULL,
+                    source_platform TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    journey_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    provider_event_id TEXT,
+                    payload_sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS cq_owned_retention_samples (
+                    sample_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    content_id TEXT NOT NULL,
+                    campaign_id TEXT NOT NULL,
+                    offer_id TEXT NOT NULL,
+                    source_platform TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    measurement_id TEXT NOT NULL,
+                    journey_id TEXT,
+                    observed_at TEXT NOT NULL,
+                    elapsed_ms INTEGER NOT NULL CHECK(elapsed_ms >= 0),
+                    retained_percent REAL NOT NULL CHECK(
+                        retained_percent >= 0 AND retained_percent <= 100
+                    ),
+                    sample_size INTEGER NOT NULL CHECK(sample_size > 0),
+                    payload_sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_cq_receipts_type_created
                     ON cq_receipts(receipt_type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cq_audits_type_created
@@ -193,6 +547,58 @@ class QualityStore:
                     ON cq_workflow_runs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cq_agent_queries_created
                     ON cq_agent_queries(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_cq_owned_events_attribution
+                    ON cq_owned_outcome_events(
+                        content_id, campaign_id, offer_id,
+                        source_platform, source_id, occurred_at
+                    );
+                CREATE INDEX IF NOT EXISTS idx_cq_owned_events_journey
+                    ON cq_owned_outcome_events(journey_id, occurred_at);
+                CREATE INDEX IF NOT EXISTS idx_cq_owned_retention_attribution
+                    ON cq_owned_retention_samples(
+                        content_id, campaign_id, offer_id,
+                        source_platform, source_id, elapsed_ms, observed_at
+                    );
+                CREATE TRIGGER IF NOT EXISTS cq_receipts_no_update
+                BEFORE UPDATE ON cq_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality receipts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_receipts_no_delete
+                BEFORE DELETE ON cq_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality receipts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_scripts_no_update
+                BEFORE UPDATE ON cq_scripts
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality scripts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_scripts_no_delete
+                BEFORE DELETE ON cq_scripts
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality scripts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_audits_no_update
+                BEFORE UPDATE ON cq_audits
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality audits are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_audits_no_delete
+                BEFORE DELETE ON cq_audits
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality audits are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_retention_no_update
+                BEFORE UPDATE ON cq_retention
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality retention receipts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_retention_no_delete
+                BEFORE DELETE ON cq_retention
+                BEGIN
+                    SELECT RAISE(ABORT, 'content quality retention receipts are append-only');
+                END;
                 CREATE TRIGGER IF NOT EXISTS cq_script_briefs_no_update
                 BEFORE UPDATE ON cq_script_briefs
                 BEGIN
@@ -222,6 +628,26 @@ class QualityStore:
                 BEFORE DELETE ON cq_agent_queries
                 BEGIN
                     SELECT RAISE(ABORT, 'agent queries are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_outcome_events_no_update
+                BEFORE UPDATE ON cq_owned_outcome_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned outcome events are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_outcome_events_no_delete
+                BEFORE DELETE ON cq_owned_outcome_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned outcome events are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_retention_samples_no_update
+                BEFORE UPDATE ON cq_owned_retention_samples
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned retention samples are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_retention_samples_no_delete
+                BEFORE DELETE ON cq_owned_retention_samples
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned retention samples are append-only');
                 END;
                 """
             )
@@ -303,7 +729,7 @@ class QualityStore:
             "created_at": row["created_at"],
         }
 
-    def put_script(self, script: dict[str, Any]) -> None:
+    def put_script(self, script: dict[str, Any]) -> dict[str, Any]:
         with closing(self.connect()) as connection:
             connection.execute(
                 """
@@ -323,6 +749,18 @@ class QualityStore:
                 ),
             )
             connection.commit()
+            row = connection.execute(
+                "SELECT script_json FROM cq_scripts WHERE script_id=?",
+                (script["script_id"],),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("script write was not durable")
+        stored = json.loads(row["script_json"])
+        if script_identity_payload(stored) != script_identity_payload(script):
+            raise ValueError(
+                "script_id already exists with different immutable content"
+            )
+        return stored
 
     def script(self, script_id: str) -> dict[str, Any] | None:
         with closing(self.connect()) as connection:
@@ -339,28 +777,119 @@ class QualityStore:
             ).fetchall()
         return [json.loads(row["script_json"]) for row in rows]
 
+    @staticmethod
+    def script_audit_sha256(script: dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(
+            script, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+
+    def bind_script_audit_payload(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Bind a script-scoped audit to the immutable stored script.
+
+        Ad-hoc audits remain available when no script_id is supplied, but only
+        an audit whose payload exactly matches the stored script can affect its
+        render gates.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("a JSON object is required")
+        script_id = str(payload.get("script_id") or "").strip()
+        if not script_id:
+            return dict(payload), {
+                "stored_script_bound": False,
+                "script_id": None,
+                "script_sha256": None,
+            }
+        stored = self.script(script_id)
+        if not isinstance(stored, dict):
+            raise ValueError("script_id was not found")
+        for field in self.SCRIPT_AUDIT_FIELDS:
+            if field not in payload:
+                continue
+            supplied = json.dumps(
+                payload.get(field), sort_keys=True, separators=(",", ":"),
+                default=str,
+            )
+            expected = json.dumps(
+                stored.get(field), sort_keys=True, separators=(",", ":"),
+                default=str,
+            )
+            if supplied != expected:
+                raise ValueError(f"{field} does not match the stored script")
+        if "source_human_moment" in payload:
+            supplied = json.dumps(
+                payload.get("source_human_moment"), sort_keys=True,
+                separators=(",", ":"), default=str,
+            )
+            expected = json.dumps(
+                stored.get("human_moment"), sort_keys=True,
+                separators=(",", ":"), default=str,
+            )
+            if supplied != expected:
+                raise ValueError(
+                    "source_human_moment does not match the stored script"
+                )
+        bound = dict(payload)
+        bound.update({field: stored.get(field) for field in self.SCRIPT_AUDIT_FIELDS})
+        bound["script_id"] = script_id
+        return bound, {
+            "contract": "stored_script_audit_binding_v1",
+            "stored_script_bound": True,
+            "script_id": script_id,
+            "script_sha256": self.script_audit_sha256(stored),
+        }
+
     def script_gate_summary(self, script_id: str) -> dict[str, Any]:
+        stored_script = self.script(script_id)
+        expected_script_sha256 = (
+            self.script_audit_sha256(stored_script)
+            if isinstance(stored_script, dict) else None
+        )
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT audit_type, decision, score, audit_id, created_at
-                FROM cq_audits WHERE subject_id=? ORDER BY created_at DESC
+                SELECT audit_type, decision, score, audit_id, findings_json,
+                       created_at
+                FROM cq_audits
+                WHERE subject_id=?
+                ORDER BY created_at DESC, rowid DESC
                 """,
                 (script_id,),
             ).fetchall()
         latest: dict[str, dict[str, Any]] = {}
         for row in rows:
             if row["audit_type"] not in latest:
-                latest[row["audit_type"]] = dict(row)
-        required = {
-            "narrative_coherence": "PASS",
-            "relatability_script": "PASS",
-            "attention_script": "PASS",
-            "attention_video_preflight": "PASS",
+                item = dict(row)
+                findings = json.loads(item.pop("findings_json") or "{}")
+                binding = findings.get("input_binding") or {}
+                item["input_binding"] = binding
+                item["stored_script_binding_valid"] = bool(
+                    expected_script_sha256
+                    and binding.get("stored_script_bound") is True
+                    and binding.get("script_sha256")
+                        == expected_script_sha256
+                )
+                latest[row["audit_type"]] = item
+        accepted = {
+            "narrative_coherence": ("PASS",),
+            "relatability_script": ("PASS",),
+            "relatability_ai_qualitative": (
+                "PASS", NON_AI_PASS_DECISION,
+            ),
+            "relatability_transcript_cohort": ("PASS",),
+            "attention_script": ("PASS",),
+            "attention_video_preflight": ("PASS",),
         }
         return {
-            "ready_for_render": all(latest.get(kind, {}).get("decision") == decision for kind, decision in required.items()),
-            "required_decisions": required,
+            "ready_for_render": all(
+                latest.get(kind, {}).get("decision") in decisions
+                and latest.get(kind, {}).get("stored_script_binding_valid")
+                for kind, decisions in accepted.items()
+            ),
+            "required_decisions": {
+                kind: list(decisions) for kind, decisions in accepted.items()
+            },
             "latest_audits": latest,
         }
 
@@ -372,15 +901,17 @@ class QualityStore:
         score: float,
         findings: dict[str, Any],
     ) -> dict[str, Any]:
-        audit_id = stable_id("audit", audit_type, subject_id, decision, score, findings)
         created_at = utc_now()
+        # Every evaluation is an immutable attempt.  Reusing an ID derived
+        # from verdict content can resurrect an older timestamp and make a
+        # newer provider failure appear to leave an earlier PASS current.
+        audit_id = "audit_" + uuid.uuid4().hex
         with closing(self.connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO cq_audits
                     (audit_id, audit_type, subject_id, decision, score, findings_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(audit_id) DO NOTHING
                 """,
                 (audit_id, audit_type, subject_id, decision, score, json.dumps(findings, sort_keys=True), created_at),
             )
@@ -522,6 +1053,543 @@ class QualityStore:
             connection.commit()
         return row
 
+    def put_owned_outcome_event(
+        self, event: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        payload_json = json.dumps(event, sort_keys=True, separators=(",", ":"))
+        payload_sha256 = hashlib.sha256(payload_json.encode()).hexdigest()
+        event_id = stable_id("outcome", event["idempotency_key"])
+        created_at = utc_now()
+        with closing(self.connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO cq_owned_outcome_events(
+                    event_id, contract, idempotency_key, event_type,
+                    content_id, campaign_id, offer_id, source_platform,
+                    source_id, journey_id, occurred_at, provider_event_id,
+                    payload_sha256, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    event_id, OWNED_ATTRIBUTION_EVENT_CONTRACT,
+                    event["idempotency_key"], event["event_type"],
+                    event["content_id"], event["campaign_id"], event["offer_id"],
+                    event["source_platform"], event["source_id"],
+                    event["journey_id"], event["occurred_at"],
+                    event.get("provider_event_id"), payload_sha256, payload_json,
+                    created_at,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = connection.execute(
+                "SELECT * FROM cq_owned_outcome_events WHERE idempotency_key=?",
+                (event["idempotency_key"],),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.IntegrityError("owned outcome event insert was not readable")
+            if row["payload_sha256"] != payload_sha256:
+                raise IdempotencyConflict(
+                    "idempotency_key already identifies a different owned outcome event"
+                )
+            connection.commit()
+        return self._owned_event_row(row), created
+
+    def put_owned_retention_sample(
+        self, sample: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        payload_json = json.dumps(sample, sort_keys=True, separators=(",", ":"))
+        payload_sha256 = hashlib.sha256(payload_json.encode()).hexdigest()
+        sample_id = stable_id("retention", sample["idempotency_key"])
+        created_at = utc_now()
+        with closing(self.connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO cq_owned_retention_samples(
+                    sample_id, contract, idempotency_key, content_id,
+                    campaign_id, offer_id, source_platform, source_id,
+                    measurement_id, journey_id, observed_at, elapsed_ms,
+                    retained_percent, sample_size, payload_sha256,
+                    payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (
+                    sample_id, OWNED_RETENTION_SAMPLE_CONTRACT,
+                    sample["idempotency_key"], sample["content_id"],
+                    sample["campaign_id"], sample["offer_id"],
+                    sample["source_platform"], sample["source_id"],
+                    sample["measurement_id"], sample.get("journey_id"),
+                    sample["observed_at"], sample["elapsed_ms"],
+                    sample["retained_percent"], sample["sample_size"],
+                    payload_sha256, payload_json, created_at,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = connection.execute(
+                "SELECT * FROM cq_owned_retention_samples WHERE idempotency_key=?",
+                (sample["idempotency_key"],),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.IntegrityError("owned retention sample insert was not readable")
+            if row["payload_sha256"] != payload_sha256:
+                raise IdempotencyConflict(
+                    "idempotency_key already identifies a different owned retention sample"
+                )
+            connection.commit()
+        return self._owned_retention_row(row), created
+
+    @staticmethod
+    def _owned_event_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "event_id": row["event_id"],
+            "contract": row["contract"],
+            "idempotency_key": row["idempotency_key"],
+            "event_type": row["event_type"],
+            "attribution": {
+                "content_id": row["content_id"],
+                "campaign_id": row["campaign_id"],
+                "offer_id": row["offer_id"],
+                "source_platform": row["source_platform"],
+                "source_id": row["source_id"],
+            },
+            "journey_id": row["journey_id"],
+            "occurred_at": row["occurred_at"],
+            "provider_event_id": row["provider_event_id"],
+            "metadata": json.loads(row["payload_json"]).get("metadata", {}),
+            "payload_sha256": row["payload_sha256"],
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _owned_retention_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "sample_id": row["sample_id"],
+            "contract": row["contract"],
+            "idempotency_key": row["idempotency_key"],
+            "attribution": {
+                "content_id": row["content_id"],
+                "campaign_id": row["campaign_id"],
+                "offer_id": row["offer_id"],
+                "source_platform": row["source_platform"],
+                "source_id": row["source_id"],
+            },
+            "measurement_id": row["measurement_id"],
+            "journey_id": row["journey_id"],
+            "observed_at": row["observed_at"],
+            "elapsed_ms": int(row["elapsed_ms"]),
+            "retained_percent": round(float(row["retained_percent"]), 4),
+            "sample_size": int(row["sample_size"]),
+            "metadata": json.loads(row["payload_json"]).get("metadata", {}),
+            "payload_sha256": row["payload_sha256"],
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _owned_attribution_where(
+        filters: dict[str, str], *, alias: str = ""
+    ) -> tuple[str, list[Any]]:
+        prefix = f"{alias}." if alias else ""
+        clauses = [f"{prefix}content_id=?"]
+        parameters: list[Any] = [filters["content_id"]]
+        for field in ("campaign_id", "offer_id", "source_platform", "source_id"):
+            value = filters.get(field)
+            if value:
+                clauses.append(f"{prefix}{field}=?")
+                parameters.append(value)
+        return " AND ".join(clauses), parameters
+
+    def owned_outcome_events(
+        self, filters: dict[str, str], *, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        where, parameters = self._owned_attribution_where(filters)
+        parameters.append(max(1, min(int(limit), 500)))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM cq_owned_outcome_events
+                    WHERE {where}
+                    ORDER BY occurred_at, event_id LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [self._owned_event_row(row) for row in rows]
+
+    def owned_retention_samples(
+        self, filters: dict[str, str], *, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        where, parameters = self._owned_attribution_where(filters)
+        parameters.append(max(1, min(int(limit), 2000)))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM cq_owned_retention_samples
+                    WHERE {where}
+                    ORDER BY elapsed_ms, observed_at, sample_id LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [self._owned_retention_row(row) for row in rows]
+
+    def owned_outcome_rollup(self, filters: dict[str, str]) -> dict[str, Any]:
+        where, parameters = self._owned_attribution_where(filters)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT event_type, COUNT(*) AS event_count,
+                           COUNT(DISTINCT journey_id) AS unique_journeys,
+                           MIN(occurred_at) AS first_observed_at,
+                           MAX(occurred_at) AS last_observed_at
+                    FROM cq_owned_outcome_events
+                    WHERE {where}
+                    GROUP BY event_type""",
+                parameters,
+            ).fetchall()
+            linked: dict[str, int] = {}
+            for previous, current in zip(
+                OWNED_OUTCOME_EVENT_TYPES, OWNED_OUTCOME_EVENT_TYPES[1:]
+            ):
+                row = connection.execute(
+                    f"""WITH scoped AS (
+                            SELECT event_type, journey_id, occurred_at,
+                                   campaign_id, offer_id, source_platform, source_id
+                            FROM cq_owned_outcome_events WHERE {where}
+                        )
+                        SELECT COUNT(DISTINCT current.journey_id)
+                        FROM scoped current
+                        WHERE current.event_type=?
+                          AND EXISTS (
+                              SELECT 1 FROM scoped previous
+                              WHERE previous.journey_id=current.journey_id
+                                AND previous.event_type=?
+                                AND previous.occurred_at <= current.occurred_at
+                                AND previous.campaign_id=current.campaign_id
+                                AND previous.offer_id=current.offer_id
+                                AND previous.source_platform=current.source_platform
+                                AND previous.source_id=current.source_id
+                          )""",
+                    [*parameters, current, previous],
+                ).fetchone()
+                linked[f"{previous}_to_{current}"] = int(row[0])
+            chain_row = connection.execute(
+                f"""WITH scoped AS (
+                        SELECT event_type, journey_id, occurred_at,
+                               campaign_id, offer_id, source_platform, source_id
+                        FROM cq_owned_outcome_events WHERE {where}
+                    )
+                    SELECT COUNT(DISTINCT
+                        click.journey_id || char(31) || click.campaign_id ||
+                        char(31) || click.offer_id || char(31) ||
+                        click.source_platform || char(31) || click.source_id
+                    )
+                    FROM scoped click
+                    JOIN scoped install
+                      ON install.journey_id=click.journey_id
+                     AND install.campaign_id=click.campaign_id
+                     AND install.offer_id=click.offer_id
+                     AND install.source_platform=click.source_platform
+                     AND install.source_id=click.source_id
+                     AND install.event_type='install'
+                     AND click.occurred_at <= install.occurred_at
+                    JOIN scoped trial_event
+                      ON trial_event.journey_id=install.journey_id
+                     AND trial_event.campaign_id=install.campaign_id
+                     AND trial_event.offer_id=install.offer_id
+                     AND trial_event.source_platform=install.source_platform
+                     AND trial_event.source_id=install.source_id
+                     AND trial_event.event_type='trial'
+                     AND install.occurred_at <= trial_event.occurred_at
+                    JOIN scoped purchase
+                      ON purchase.journey_id=trial_event.journey_id
+                     AND purchase.campaign_id=trial_event.campaign_id
+                     AND purchase.offer_id=trial_event.offer_id
+                     AND purchase.source_platform=trial_event.source_platform
+                     AND purchase.source_id=trial_event.source_id
+                     AND purchase.event_type='purchase'
+                     AND trial_event.occurred_at <= purchase.occurred_at
+                    WHERE click.event_type='click'""",
+                parameters,
+            ).fetchone()
+            click_scope_row = connection.execute(
+                f"""SELECT COUNT(DISTINCT
+                           journey_id || char(31) || campaign_id || char(31) ||
+                           offer_id || char(31) || source_platform || char(31) ||
+                           source_id
+                       )
+                    FROM cq_owned_outcome_events
+                    WHERE {where} AND event_type='click'""",
+                parameters,
+            ).fetchone()
+        by_type = {
+            event_type: {
+                "event_count": 0,
+                "unique_journeys": 0,
+                "first_observed_at": None,
+                "last_observed_at": None,
+            }
+            for event_type in OWNED_OUTCOME_EVENT_TYPES
+        }
+        for row in rows:
+            by_type[row["event_type"]] = {
+                "event_count": int(row["event_count"]),
+                "unique_journeys": int(row["unique_journeys"]),
+                "first_observed_at": row["first_observed_at"],
+                "last_observed_at": row["last_observed_at"],
+            }
+        complete_chain_journeys = int(chain_row[0])
+        click_scope_journeys = int(click_scope_row[0])
+        return {
+            "by_type": by_type,
+            "linked_journeys": linked,
+            "complete_chain": {
+                "required_sequence": ["click", "install", "trial", "purchase"],
+                "complete_ordered_exact_scope_journeys": complete_chain_journeys,
+                "click_exact_scope_journeys": click_scope_journeys,
+                "observed_complete_chain_rate": (
+                    round(complete_chain_journeys / click_scope_journeys, 6)
+                    if click_scope_journeys else None
+                ),
+                "causal_effect": None,
+            },
+        }
+
+    def owned_retention_rollup(
+        self, filters: dict[str, str], *, point_limit: int = 2000
+    ) -> dict[str, Any]:
+        where, parameters = self._owned_attribution_where(filters)
+        bounded_limit = max(1, min(int(point_limit), 2000))
+        with closing(self.connect()) as connection:
+            total_row = connection.execute(
+                    f"""SELECT COUNT(*) AS fact_count,
+                           COUNT(DISTINCT
+                               content_id || char(31) || campaign_id || char(31) ||
+                               offer_id || char(31) || source_platform || char(31) ||
+                               source_id || char(31) || measurement_id || char(31) ||
+                               CASE
+                                   WHEN journey_id IS NULL THEN char(30)
+                                   ELSE char(29) || journey_id
+                               END
+                           ) AS measurement_count,
+                           COUNT(DISTINCT elapsed_ms) AS elapsed_point_count,
+                           COUNT(DISTINCT
+                               content_id || char(31) || campaign_id || char(31) ||
+                               offer_id || char(31) || source_platform || char(31) ||
+                               source_id || char(31) || measurement_id || char(31) ||
+                               CASE
+                                   WHEN journey_id IS NULL THEN char(30)
+                                   ELSE char(29) || journey_id
+                               END || char(31) ||
+                               elapsed_ms
+                           )
+                               AS measurement_point_count,
+                           MIN(observed_at) AS first_observed_at,
+                           MAX(observed_at) AS last_observed_at
+                    FROM cq_owned_retention_samples WHERE {where}""",
+                parameters,
+            ).fetchone()
+            rows = connection.execute(
+                f"""SELECT elapsed_ms,
+                           SUM(retained_percent * sample_size) /
+                               SUM(sample_size) AS retained_percent,
+                           SUM(sample_size) AS represented_sample_size,
+                           COUNT(*) AS fact_count,
+                           COUNT(DISTINCT
+                               content_id || char(31) || campaign_id || char(31) ||
+                               offer_id || char(31) || source_platform || char(31) ||
+                               source_id || char(31) || measurement_id || char(31) ||
+                               CASE
+                                   WHEN journey_id IS NULL THEN char(30)
+                                   ELSE char(29) || journey_id
+                               END
+                           ) AS measurement_count,
+                           MIN(observed_at) AS first_observed_at,
+                           MAX(observed_at) AS last_observed_at
+                    FROM cq_owned_retention_samples
+                    WHERE {where}
+                    GROUP BY elapsed_ms
+                    ORDER BY elapsed_ms LIMIT ?""",
+                [*parameters, bounded_limit],
+            ).fetchall()
+            measurement_rows = connection.execute(
+                f"""SELECT content_id, campaign_id, offer_id,
+                           source_platform, source_id, measurement_id, journey_id,
+                           elapsed_ms,
+                           SUM(retained_percent * sample_size) /
+                               SUM(sample_size) AS retained_percent,
+                           SUM(sample_size) AS represented_sample_size,
+                           COUNT(*) AS fact_count,
+                           MIN(observed_at) AS first_observed_at,
+                           MAX(observed_at) AS last_observed_at
+                    FROM cq_owned_retention_samples
+                    WHERE {where}
+                    GROUP BY content_id, campaign_id, offer_id,
+                             source_platform, source_id, measurement_id, journey_id,
+                             elapsed_ms
+                    ORDER BY content_id, campaign_id, offer_id,
+                             source_platform, source_id, measurement_id, journey_id,
+                             elapsed_ms LIMIT ?""",
+                [*parameters, bounded_limit],
+            ).fetchall()
+        measurement_curves: dict[
+            tuple[str, str, str, str, str, str, str | None],
+            list[dict[str, Any]],
+        ] = {}
+        for row in measurement_rows:
+            curve_key = tuple(str(row[field]) for field in (
+                "content_id", "campaign_id", "offer_id", "source_platform",
+                "source_id", "measurement_id",
+            )) + (row["journey_id"],)
+            measurement_curves.setdefault(curve_key, []).append({
+                "elapsed_ms": int(row["elapsed_ms"]),
+                "retained_percent": round(float(row["retained_percent"]), 4),
+                "represented_sample_size": int(row["represented_sample_size"]),
+                "fact_count": int(row["fact_count"]),
+                "first_observed_at": row["first_observed_at"],
+                "last_observed_at": row["last_observed_at"],
+            })
+        return {
+            "fact_count": int(total_row["fact_count"]),
+            "measurement_count": int(total_row["measurement_count"]),
+            "elapsed_point_count": int(total_row["elapsed_point_count"]),
+            "measurement_point_count": int(total_row["measurement_point_count"]),
+            "first_observed_at": total_row["first_observed_at"],
+            "last_observed_at": total_row["last_observed_at"],
+            "curve_truncated": int(total_row["measurement_point_count"]) > bounded_limit,
+            "curve_semantics": (
+                "points is a descriptive cross-measurement rollup; observed drops "
+                "are computed only within each measurement_curve"
+            ),
+            "points": [
+                {
+                    "elapsed_ms": int(row["elapsed_ms"]),
+                    "retained_percent": round(float(row["retained_percent"]), 4),
+                    "represented_sample_size": int(row["represented_sample_size"]),
+                    "fact_count": int(row["fact_count"]),
+                    "measurement_count": int(row["measurement_count"]),
+                    "first_observed_at": row["first_observed_at"],
+                    "last_observed_at": row["last_observed_at"],
+                }
+                for row in rows
+            ],
+            "measurement_curves": [
+                {
+                    "measurement_id": curve_key[5],
+                    "journey_id": curve_key[6],
+                    "attribution": dict(zip(
+                        (
+                            "content_id", "campaign_id", "offer_id",
+                            "source_platform", "source_id",
+                        ),
+                        curve_key[:5],
+                    )),
+                    "points": points,
+                }
+                for curve_key, points in measurement_curves.items()
+            ],
+        }
+
+    def owned_outcome_readiness(self) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            event_count = int(connection.execute(
+                "SELECT COUNT(*) FROM cq_owned_outcome_events"
+            ).fetchone()[0])
+            retention_sample_count = int(connection.execute(
+                "SELECT COUNT(*) FROM cq_owned_retention_samples"
+            ).fetchone()[0])
+            readiness_row = connection.execute(
+                """WITH ordered_chains AS (
+                       SELECT DISTINCT
+                              click.content_id, click.campaign_id, click.offer_id,
+                              click.source_platform, click.source_id,
+                              click.journey_id
+                       FROM cq_owned_outcome_events click
+                       JOIN cq_owned_outcome_events install
+                         ON install.content_id=click.content_id
+                        AND install.campaign_id=click.campaign_id
+                        AND install.offer_id=click.offer_id
+                        AND install.source_platform=click.source_platform
+                        AND install.source_id=click.source_id
+                        AND install.journey_id=click.journey_id
+                        AND install.event_type='install'
+                        AND click.occurred_at <= install.occurred_at
+                       JOIN cq_owned_outcome_events trial_event
+                         ON trial_event.content_id=install.content_id
+                        AND trial_event.campaign_id=install.campaign_id
+                        AND trial_event.offer_id=install.offer_id
+                        AND trial_event.source_platform=install.source_platform
+                        AND trial_event.source_id=install.source_id
+                        AND trial_event.journey_id=install.journey_id
+                        AND trial_event.event_type='trial'
+                        AND install.occurred_at <= trial_event.occurred_at
+                       JOIN cq_owned_outcome_events purchase
+                         ON purchase.content_id=trial_event.content_id
+                        AND purchase.campaign_id=trial_event.campaign_id
+                        AND purchase.offer_id=trial_event.offer_id
+                        AND purchase.source_platform=trial_event.source_platform
+                        AND purchase.source_id=trial_event.source_id
+                        AND purchase.journey_id=trial_event.journey_id
+                        AND purchase.event_type='purchase'
+                        AND trial_event.occurred_at <= purchase.occurred_at
+                       WHERE click.event_type='click'
+                   ), eligible_curves AS (
+                       SELECT content_id, campaign_id, offer_id,
+                              source_platform, source_id, measurement_id,
+                              journey_id
+                       FROM cq_owned_retention_samples
+                       GROUP BY content_id, campaign_id, offer_id,
+                                source_platform, source_id, measurement_id,
+                                journey_id
+                       HAVING COUNT(DISTINCT elapsed_ms) >= 2
+                   ), ready_scopes AS (
+                       SELECT DISTINCT
+                              chain.content_id, chain.campaign_id, chain.offer_id,
+                              chain.source_platform, chain.source_id
+                       FROM ordered_chains chain
+                       JOIN eligible_curves curve
+                         ON curve.content_id=chain.content_id
+                        AND curve.campaign_id=chain.campaign_id
+                        AND curve.offer_id=chain.offer_id
+                        AND curve.source_platform=chain.source_platform
+                        AND curve.source_id=chain.source_id
+                        AND (
+                            curve.journey_id IS NULL
+                            OR curve.journey_id=chain.journey_id
+                        )
+                   )
+                   SELECT
+                       (SELECT COUNT(*) FROM ordered_chains)
+                           AS complete_journey_count,
+                       (SELECT COUNT(*) FROM eligible_curves)
+                           AS same_measurement_curve_count,
+                       (SELECT COUNT(*) FROM ready_scopes)
+                           AS ready_scope_count"""
+            ).fetchone()
+        complete_journey_count = int(readiness_row["complete_journey_count"])
+        same_measurement_curve_count = int(
+            readiness_row["same_measurement_curve_count"]
+        )
+        ready_scope_count = int(readiness_row["ready_scope_count"])
+        if ready_scope_count:
+            status = "ready"
+        elif event_count or retention_sample_count:
+            status = "partial"
+        else:
+            status = "no_owned_outcomes"
+        return {
+            "status": status,
+            "outcome_event_count": event_count,
+            "retention_sample_count": retention_sample_count,
+            "complete_ordered_exact_scope_journey_count": complete_journey_count,
+            "same_measurement_retention_curve_count": same_measurement_curve_count,
+            "linked_complete_chain_retention_curve_scope_count": ready_scope_count,
+            # Compatibility alias for existing health consumers. Its value now
+            # follows the stricter complete-chain/same-measurement contract.
+            "linked_click_retention_curve_scope_count": ready_scope_count,
+            "readiness_requirement": (
+                "an ordered exact-scope click-to-install-to-trial-to-purchase "
+                "journey and at least two observed elapsed points within one "
+                "measurement_id in that same content/campaign/offer/source scope; "
+                "a journey-bound curve must match that journey, while a null "
+                "journey_id is explicitly aggregate-scope"
+            ),
+            "causal_drop_reasons_available": False,
+        }
+
     def counts(self) -> dict[str, int]:
         with closing(self.connect()) as connection:
             return {
@@ -529,6 +1597,7 @@ class QualityStore:
                 for table in (
                     "cq_receipts", "cq_scripts", "cq_audits", "cq_retention",
                     "cq_script_briefs", "cq_workflow_runs", "cq_agent_queries",
+                    "cq_owned_outcome_events", "cq_owned_retention_samples",
                 )
             }
 
@@ -1092,8 +2161,14 @@ class ViralTranscriptService:
                 continue
             pattern = self._pattern(document, row)
             transcript_keywords = sorted({
-                token.lower() for token in words(document.text)
-                if len(token) >= 4 and token.lower() not in STOP_WORDS
+                normalized_source_word(token) for token in words(document.text)
+                if (
+                    normalized_source_word(token) in HUMAN_EXPERIENCE_WORDS
+                    or (
+                        len(token) >= 4
+                        and normalized_source_word(token) not in STOP_WORDS
+                    )
+                )
             })[:300]
             payload = {
                 "topic": topic,
@@ -1186,12 +2261,10 @@ class AudienceIntelligenceService:
         candidates = self.tape.artifact_bound_candidates(
             [str(row["video_id"]) for row in candidates]
         )
-        cues = (
-            "anxious", "anxiety", "burned", "burnout", "burnt", "can't", "exhausted",
-            "feel", "feeling", "hopeless", "overwhelmed", "pressure", "struggle",
-            "struggling", "stuck", "tired", "worry",
+        audience_vocabulary, audience_off_context = (
+            audience_context_vocabulary(audience)
         )
-        moments: list[dict[str, Any]] = []
+        candidate_moments: list[dict[str, Any]] = []
         for row in candidates:
             artifact = self.tape.transcript_artifact(
                 str(row["video_id"]),
@@ -1211,25 +2284,243 @@ class AudienceIntelligenceService:
             if not source.strip():
                 continue
             sentences = SENTENCE_RE.split(source)
+            source_options: list[dict[str, Any]] = []
+            source_context_tokens = {
+                normalized_source_word(token)
+                for token in words(" ".join(
+                    str(row.get(field) or "")
+                    for field in ("title", "caption", "description")
+                ))
+            }
+            source_audience_terms = sorted(
+                source_context_tokens & audience_vocabulary
+            )
             for sentence in sentences:
-                clean = " ".join(words(sentence))
-                if 7 <= len(words(clean)) <= 40 and any(cue in clean.lower() for cue in cues):
-                    moment_id = stable_id("moment", row.get("video_id"), clean)
-                    moments.append(
+                extracted = source_exact_everyday_excerpt(
+                    sentence,
+                    audience_vocabulary=audience_vocabulary,
+                    audience_off_context=audience_off_context,
+                    source_audience_terms=source_audience_terms,
+                    source_off_context_terms=(
                         {
-                            "moment_id": moment_id,
-                            "situation": clean,
-                            "audience": audience,
-                            "source_video_id": row.get("video_id"),
-                            "source_transcript_id": artifact.get("transcript_id"),
-                            "source_observation_key": artifact.get("observation_key"),
-                            "source_url": row.get("url"),
-                            "basis": "performance_qualified_local_whisper_transcript",
+                            normalized_source_word(token)
+                            for token in words(sentence)
                         }
-                    )
-                    break
+                        & audience_off_context
+                    ),
+                )
+                if not extracted or extracted["word_count"] < 5:
+                    continue
+                if (
+                    extracted["audience_adjusted_selection_score"]
+                    < MIN_HUMAN_MOMENT_SOURCE_SCORE
+                ):
+                    continue
+                source_options.append(extracted)
+            if not source_options:
+                continue
+            extracted = max(source_options, key=lambda option: (
+                int(option["audience_adjusted_selection_score"]),
+                int(option["source_selection_score"]),
+                len(option["categories"]),
+                len(option["matched_terms"]),
+                -int(option["word_start"]),
+            ))
+            excerpt = str(extracted["text"])
+            moment_id = stable_id("moment", row.get("video_id"), excerpt)
+            candidate_moments.append(
+                {
+                    "moment_id": moment_id,
+                    "situation": excerpt,
+                    "audience": audience,
+                    "source_video_id": row.get("video_id"),
+                    "source_creator_id": row.get("creator_id"),
+                    "source_transcript_id": artifact.get("transcript_id"),
+                    "source_observation_key": artifact.get("observation_key"),
+                    "source_url": row.get("url"),
+                    "source_word_count": extracted["word_count"],
+                    "source_span_word_count": extracted[
+                        "source_span_word_count"
+                    ],
+                    "source_excerpt_truncated": extracted["truncated"],
+                    "source_excerpt_word_start": extracted["word_start"],
+                    "source_excerpt_word_end_exclusive": extracted[
+                        "word_end_exclusive"
+                    ],
+                    "moment_categories": extracted["categories"],
+                    "matched_source_terms": extracted["matched_terms"],
+                    "lived_context_terms": extracted[
+                        "lived_context_terms"
+                    ],
+                    "negation_terms": extracted["negation_terms"],
+                    "source_selection_score": extracted[
+                        "source_selection_score"
+                    ],
+                    "audience_adjusted_selection_score": extracted[
+                        "audience_adjusted_selection_score"
+                    ],
+                    "audience_match_terms": extracted[
+                        "audience_match_terms"
+                    ],
+                    "source_audience_match_terms": extracted[
+                        "source_audience_match_terms"
+                    ],
+                    "audience_off_context_terms": extracted[
+                        "audience_off_context_terms"
+                    ],
+                    "score_is_probability": False,
+                    "basis": "source_exact_performance_qualified_local_whisper_excerpt",
+                    "ai_relatability_verdict": "not_evaluated",
+                    "source_views": int(row.get("views") or 0),
+                }
+            )
+        ranked_moments = sorted(candidate_moments, key=lambda moment: (
+            -int(moment["audience_adjusted_selection_score"]),
+            -int(moment["source_selection_score"]),
+            -len(moment["moment_categories"]),
+            -int(moment["source_views"]),
+            str(moment.get("source_creator_id") or ""),
+            str(moment["moment_id"]),
+        ))
+        # Prefer one source per creator before admitting a second source from
+        # the same creator. Selection quality and creator diversity are both
+        # deterministic; the score is explicitly not a probability.
+        moments: list[dict[str, Any]] = []
+        seen_creators: set[str] = set()
+        for moment in ranked_moments:
+            creator_id = str(moment.get("source_creator_id") or "")
+            if creator_id and creator_id in seen_creators:
+                continue
+            moments.append(moment)
+            if creator_id:
+                seen_creators.add(creator_id)
             if len(moments) >= limit:
                 break
+        if len(moments) < limit:
+            selected_ids = {str(moment["moment_id"]) for moment in moments}
+            for moment in ranked_moments:
+                if str(moment["moment_id"]) in selected_ids:
+                    continue
+                moments.append(moment)
+                if len(moments) >= limit:
+                    break
+        # A second exact excerpt is useful only when it belongs to the same
+        # workflow context. Audience/topic words are too broad to establish
+        # that relationship: two excerpts are not related merely because both
+        # mention software, an app, or a founder. Prefer the same source video,
+        # otherwise require substantive non-audience overlap. Self-pairing is
+        # the honest fallback.
+        broad_context_terms = {
+            "agent", "agents", "automation", "business", "businesses",
+            "founder", "founders", "software", "app", "apps", "website",
+            "websites",
+        }
+        for moment in moments:
+            audience_terms = {
+                normalized_source_word(token)
+                for token in moment.get("audience_match_terms") or []
+            }
+            situation_terms = {
+                normalized_source_word(token)
+                for token in words(str(moment["situation"]))
+                if len(normalized_source_word(token)) >= 4
+                and normalized_source_word(token) not in STOP_WORDS
+                and normalized_source_word(token) not in HUMAN_EXPERIENCE_WORDS
+                and normalized_source_word(token) not in broad_context_terms
+                and normalized_source_word(token) not in audience_terms
+            }
+            related: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+            for option in ranked_moments:
+                if option["moment_id"] == moment["moment_id"]:
+                    continue
+                option_terms = {
+                    normalized_source_word(token)
+                    for token in words(str(option["situation"]))
+                    if len(normalized_source_word(token)) >= 4
+                    and normalized_source_word(token) not in STOP_WORDS
+                    and normalized_source_word(token)
+                    not in HUMAN_EXPERIENCE_WORDS
+                    and normalized_source_word(token)
+                    not in broad_context_terms
+                    and normalized_source_word(token)
+                    not in audience_terms
+                }
+                shared_content = situation_terms & option_terms
+                same_video = (
+                    str(option.get("source_video_id") or "")
+                    == str(moment.get("source_video_id") or "")
+                )
+                if not (same_video or shared_content):
+                    continue
+                related.append((
+                    (
+                        int(same_video),
+                        len(shared_content),
+                        int(option["audience_adjusted_selection_score"]),
+                        int(option["source_selection_score"]),
+                    ),
+                    option,
+                ))
+            stakes_source = (
+                max(related, key=lambda item: item[0])[1]
+                if related else moment
+            )
+            moment.update({
+                "stakes": stakes_source["situation"],
+                "stakes_pairing_contract": (
+                    "source_context_substantive_or_self_v2"
+                ),
+                "stakes_source_moment_id": stakes_source["moment_id"],
+                "stakes_source_video_id": stakes_source["source_video_id"],
+                "stakes_source_creator_id": stakes_source["source_creator_id"],
+                "stakes_source_transcript_id": stakes_source[
+                    "source_transcript_id"
+                ],
+                "stakes_source_word_count": stakes_source[
+                    "source_word_count"
+                ],
+                "stakes_source_span_word_count": stakes_source[
+                    "source_span_word_count"
+                ],
+                "stakes_source_excerpt_truncated": stakes_source[
+                    "source_excerpt_truncated"
+                ],
+                "stakes_source_excerpt_word_start": stakes_source[
+                    "source_excerpt_word_start"
+                ],
+                "stakes_source_excerpt_word_end_exclusive": stakes_source[
+                    "source_excerpt_word_end_exclusive"
+                ],
+                "stakes_source_observation_key": stakes_source[
+                    "source_observation_key"
+                ],
+            })
+        creator_ids = sorted({
+            str(moment["source_creator_id"])
+            for moment in moments
+            if moment.get("source_creator_id")
+        })
+        category_creators = {
+            category: sorted({
+                str(moment["source_creator_id"])
+                for moment in moments
+                if moment.get("source_creator_id")
+                and category in moment.get("moment_categories", [])
+            })
+            for category in EVERYDAY_HUMAN_LANGUAGE_BY_CATEGORY
+        }
+        evidence_summary = {
+            "contract": "source_exact_everyday_human_moment_v3",
+            "evidence_kind": "non_ai_source_language_extraction",
+            "audience_fit_contract": "audience_context_term_ranking_v1",
+            "max_source_excerpt_words": MAX_SOURCE_EXCERPT_WORDS,
+            "source_creator_count": len(creator_ids),
+            "source_creator_ids": creator_ids,
+            "category_creator_counts": {
+                category: len(ids) for category, ids in category_creators.items()
+            },
+            "ai_relatability_verdict": "not_evaluated",
+        }
         receipt = self.store.put_receipt(
             "audience_human_moments",
             "market_tape",
@@ -1240,6 +2531,7 @@ class AudienceIntelligenceService:
                 "audience": audience,
                 "candidate_count": len(candidates),
                 "moments": moments,
+                "evidence_summary": evidence_summary,
                 "note": "Moments are extracted from observed source language; none are invented when evidence is absent.",
             },
         )
@@ -1248,6 +2540,7 @@ class AudienceIntelligenceService:
             "topic": topic,
             "audience": audience,
             "moments": moments,
+            "evidence_summary": evidence_summary,
             "receipt": receipt,
         }
 
@@ -1322,62 +2615,240 @@ class ScriptService:
                 "creator_count": len(creators),
                 "observed_views_snapshot": observed_views,
             }
-        human_term_groups = {
-            "feel": "feeling stuck",
-            "feeling": "feeling stuck",
-            "hard": "the work getting harder",
-            "tired": "exhaustion",
-            "trying": "trying harder",
-            "worse": "things getting worse",
-        }
         human_term_sources: dict[str, set[str]] = {}
+        human_term_receipts: dict[str, set[str]] = {}
+        human_term_transcripts: dict[str, set[str]] = {}
         for item in verified_patterns:
             source_terms = {
-                str(token).lower()
+                normalized_source_word(str(token))
                 for token in item["payload"].get("transcript_keywords") or []
             }
             creator_identity = str(
-                item["payload"].get("creator_id")
-                or item["payload"].get("transcript_id")
-                or item["receipt_id"]
-            )
+                item["payload"].get("creator_id") or ""
+            ).strip()
+            if not creator_identity:
+                continue
             for term in HUMAN_EXPERIENCE_WORDS & source_terms:
-                display = human_term_groups.get(term, term)
-                human_term_sources.setdefault(display, set()).add(creator_identity)
+                human_term_sources.setdefault(term, set()).add(creator_identity)
+                human_term_receipts.setdefault(term, set()).add(item["receipt_id"])
+                transcript_id = str(
+                    item["payload"].get("transcript_id") or ""
+                ).strip()
+                if transcript_id:
+                    human_term_transcripts.setdefault(term, set()).add(
+                        transcript_id
+                    )
         recurring_human_terms = sorted(
             (term for term, sources in human_term_sources.items() if len(sources) >= 2),
             key=lambda term: (-len(human_term_sources[term]), term),
         )
+        recurring_human_language_evidence = [
+            {
+                "term": term,
+                "categories": sorted(
+                    category
+                    for category, terms in (
+                        EVERYDAY_HUMAN_LANGUAGE_BY_CATEGORY.items()
+                    )
+                    if term in terms
+                ),
+                "distinct_creator_count": len(human_term_sources[term]),
+                "creator_ids": sorted(human_term_sources[term]),
+                "source_receipt_ids": sorted(human_term_receipts[term]),
+                "source_transcript_ids": sorted(
+                    human_term_transcripts.get(term, set())
+                ),
+            }
+            for term in recurring_human_terms
+        ]
+        recurring_human_language_gate = {
+            "contract": "cross_creator_everyday_human_language_v1",
+            "evidence_kind": "non_ai_source_language_recurrence",
+            "minimum_distinct_creators_per_term": 2,
+            "pass": bool(recurring_human_terms),
+            "terms": recurring_human_language_evidence,
+            "ai_relatability_verdict": "not_evaluated",
+        }
         if not recurring_human_terms:
             return {
                 "status": "rejected",
                 "code": "REJECT_NO_RECURRING_HUMAN_LANGUAGE",
-                "reason": "At least one human-experience term must recur across two distinct creators.",
+                "reason": (
+                    "At least one source-derived problem, need, time, or work "
+                    "term must recur across two distinct creators."
+                ),
+                "recurring_human_language_gate": (
+                    recurring_human_language_gate
+                ),
             }
-        named_terms = recurring_human_terms[:4]
+        _audience_context, audience_off_context = (
+            audience_context_vocabulary(audience)
+        )
+        weak_display_terms = {
+            "can't", "cannot", "don't", "must", "trying",
+            *audience_off_context,
+        }
+        named_terms = [
+            term for term in recurring_human_terms
+            if term not in weak_display_terms
+        ][:4] or recurring_human_terms[:4]
         if len(named_terms) == 1:
             term_phrase = named_terms[0]
         else:
-            term_phrase = ", ".join(named_terms[:-1]) + f", and {named_terms[-1]}"
+            term_phrase = (
+                ", ".join(named_terms[:-1])
+                + f" and {named_terms[-1]}"
+            )
         proof_line = proof[0] if proof else (
-            f"Across these stories, the same signs keep showing up: {term_phrase}."
+            "In creator videos, I heard this same interruption: "
+            f"{term_phrase} kept coming up because the next step still waited "
+            "on a person."
         )
+        moment_categories = {
+            str(value) for value in human.get("moment_categories") or []
+        }
+        situation_terms = {
+            normalized_source_word(token) for token in words(situation)
+        }
+        claim_text = claim.rstrip(".") + "."
+        if {"quote", "form"} & situation_terms:
+            stakes_text = (
+                "That is a live buyer waiting. Without automation, the request "
+                "sits in an email while you copy the details into a meeting or invoice."
+            )
+            claim_text = (
+                "Build the first AI automation around that one handoff: quote "
+                "request in, then scheduled meeting or sent invoice out."
+            )
+            method_text = (
+                "On screen, the email request hits the app. The AI agent reads it, "
+                "creates the meeting or invoice, and shows the finished result."
+            )
+            payoff_text = (
+                "The buyer gets a next step while the request is still fresh, "
+                "without pulling you away from the product."
+            )
+            cta_text = "Which live request is still waiting in your inbox?"
+        elif "results" in situation_terms:
+            stakes_text = (
+                "The gap is the detour: the question starts inside the work, but "
+                "the answer lives somewhere else."
+            )
+            claim_text = (
+                "The first useful version has one job: one question in, one answer "
+                "back in the same software."
+            )
+            method_text = (
+                "Show the exact question as input. Show the answer returned in the "
+                "same software. Then compare it with leaving and coming back."
+            )
+            payoff_text = (
+                "The viewer sees one interruption disappear before hearing how "
+                "the automation works."
+            )
+            cta_text = "Which answer should your product keep inside the work?"
+        elif "software" in situation_terms or {"email", "emails"} & situation_terms:
+            first_person_hook = bool(
+                set(words(situation.lower())) & {"i", "i'm", "i've", "my", "me"}
+            )
+            if "software" in situation_terms:
+                stakes_text = (
+                    "Then customer emails land while I am building. Without "
+                    "automation, I stop, decide the next action, and move each "
+                    "request forward myself."
+                    if first_person_hook else
+                    "Then customer emails land while you are building. Without "
+                    "automation, you stop, decide the next action, and move each "
+                    "request forward yourself."
+                )
+            else:
+                stakes_text = (
+                    "Seeing the emails is not the job. Each message still waits "
+                    "for me to decide, reply, schedule a meeting, or send an invoice."
+                    if first_person_hook else
+                    "Seeing the emails is not the job. Each message still waits "
+                    "for you to decide, reply, schedule a meeting, or send an invoice."
+                )
+            claim_text = (
+                "Build the first AI app around that exact interruption: incoming "
+                "emails in, one useful next action out."
+            )
+            method_text = (
+                "On screen, an email arrives. The AI agent reads whether it is "
+                "a quote, meeting, or support request, then drafts the reply, "
+                "schedules the meeting, or prepares the invoice."
+            )
+            payoff_text = (
+                "The customer gets an answer before the request goes cold, "
+                "without taking the hour you set aside to finish the product."
+            )
+            cta_text = "Which email keeps stealing your focus every week?"
+        elif "time" in moment_categories or "work" in moment_categories:
+            stakes_text = (
+                "The gap is visible: the repeated job still waits for a person to "
+                "move it forward."
+            )
+            claim_text = (
+                f"For {audience}, show one request enter and one completed task leave."
+            )
+            method_text = (
+                "Show the request arrive. Show the finished task appear. Then "
+                "explain only the time the automation gives back."
+            )
+            payoff_text = (
+                "The viewer watches a recurring job shrink before hearing a feature list."
+            )
+            cta_text = "Which repeated job should your product finish this week?"
+        elif "problem" in moment_categories:
+            stakes_text = (
+                "The gap is concrete: the problem is named, but the next usable "
+                "result is still missing."
+            )
+            claim_text = (
+                f"For {audience}, show that problem move from one input to one "
+                "usable output."
+            )
+            method_text = (
+                "Use the viewer's exact problem language. Show the input, show the "
+                "usable output, then explain only what changed."
+            )
+            payoff_text = (
+                "The viewer sees their problem move before hearing a feature list."
+            )
+            cta_text = "What problem should your product solve on camera first?"
+        else:
+            stakes_text = (
+                "The gap is one unwanted step between the work and the answer."
+            )
+            method_text = (
+                "Show the unwanted step. Show the answer arrive where the work "
+                "already happens. Then explain only what changed."
+            )
+            payoff_text = (
+                "The viewer sees the detour disappear before hearing a feature list."
+            )
+            cta_text = "Which unwanted step should your product remove first?"
+        source_stakes_is_hook = stakes.strip() == situation.strip()
+        contextual_stakes_text = stakes_text
+        if not source_stakes_is_hook:
+            source_stakes_text = stakes.strip()
+            if source_stakes_text[-1] not in ".?!":
+                source_stakes_text += "."
+            stakes_text = f"{source_stakes_text} {contextual_stakes_text}"
         hook_text = situation.strip()
         if hook_text[-1] not in ".?!":
             hook_text += "."
         timeline = [
             {"start": 0.0, "end": 3.0, "beat": "human_hook", "text": hook_text},
-            {"start": 3.0, "end": 8.0, "beat": "stakes", "text": f"It matters because {stakes.rstrip('.')}."},
-            {"start": 8.0, "end": 15.0, "beat": "claim", "text": claim.rstrip(".") + "."},
-            {"start": 15.0, "end": 23.0, "beat": "proof", "text": proof_line.rstrip(".") + "."},
-            {"start": 23.0, "end": 31.0, "beat": "method", "text": "Choose the smallest pressure you can remove today, then make the next step easier to begin."},
-            {"start": 31.0, "end": 38.0, "beat": "payoff", "text": "The point is not to force momentum; it is to make the work feel possible again."},
-            {"start": 38.0, "end": 43.0, "beat": "cta", "text": "Which part feels heaviest right now?"},
+            {"start": 3.0, "end": 8.0, "beat": "stakes", "text": stakes_text},
+            {"start": 8.0, "end": 15.0, "beat": "proof", "text": proof_line.rstrip(".") + "."},
+            {"start": 15.0, "end": 23.0, "beat": "claim", "text": claim_text},
+            {"start": 23.0, "end": 31.0, "beat": "method", "text": method_text},
+            {"start": 31.0, "end": 38.0, "beat": "payoff", "text": payoff_text},
+            {"start": 38.0, "end": 43.0, "beat": "cta", "text": cta_text},
         ]
         full_text = " ".join(beat["text"] for beat in timeline)
-        script_id = stable_id("script", topic, objective, receipt_ids, full_text)
         result = {
-            "script_id": script_id,
             "status": "generated_pending_gates",
             "topic": topic,
             "audience": audience,
@@ -1385,12 +2856,38 @@ class ScriptService:
             "brief_id": payload.get("brief_id"),
             "trend_id": payload.get("trend_id"),
             "parent_script_id": payload.get("parent_script_id"),
+            "variant_index": payload.get("variant_index"),
+            "variant_selection_contract": payload.get(
+                "variant_selection_contract"
+            ),
             "source_receipt_ids": receipt_ids,
+            "human_moment": dict(human),
+            "source_language_binding": {
+                "contract": "source_moment_spoken_binding_v1",
+                "situation_exact_in_hook": situation in hook_text,
+                "stakes_exact_in_timeline": (
+                    stakes in hook_text if source_stakes_is_hook
+                    else stakes in stakes_text
+                ),
+                "stakes_exact_location": (
+                    "human_hook" if source_stakes_is_hook else "stakes"
+                ),
+                "contextual_stakes_classification": (
+                    "template_expansion_after_source_moment"
+                ),
+                "source_moment_receipt_id": human.get(
+                    "source_moment_receipt_id"
+                ),
+            },
             "evidence_summary": {
                 "viral_transcript_patterns": source_count,
                 "creator_count": len(creators),
                 "observed_views_snapshot": observed_views,
                 "recurring_human_terms": recurring_human_terms,
+                "recurring_human_language_gate": (
+                    recurring_human_language_gate
+                ),
+                "generation_contract": payload.get("generation_contract"),
                 "owned_proof_count": len(proof),
             },
             "timeline": timeline,
@@ -1400,6 +2897,7 @@ class ScriptService:
         # Owner directive 2026-08-22: the context behind the transcript must make
         # sense in timeline order as presented to the audience. Audit, auto-revise
         # deterministically, and fail closed if coherence cannot be reached.
+        coherence: dict[str, Any] | None = None
         if self.narrative is not None:
             result, coherence = self.narrative.enforce(result)
             if coherence["decision"] != "PASS":
@@ -1416,17 +2914,29 @@ class ScriptService:
                     "reason": "The script cannot be presented coherently in timeline order.",
                     "narrative_coherence": coherence,
                 }
-            result["script_id"] = stable_id("script", topic, objective, receipt_ids, result["text"])
             result["narrative_coherence"] = {
                 "decision": "PASS",
                 "attempts": len(coherence["attempts"]),
                 "revised": len(coherence["attempts"]) > 1,
             }
+        result["script_id"] = stable_id(
+            "script", script_identity_payload(result)
+        )
+        result = self.store.put_script(result)
+        if coherence is not None:
             self.store.put_audit(
                 "narrative_coherence", result["script_id"], "PASS", 100.0,
-                {"attempts": coherence["attempts"], "llm_judgment": coherence["llm_judgment"]},
+                {
+                    "attempts": coherence["attempts"],
+                    "llm_judgment": coherence["llm_judgment"],
+                    "input_binding": {
+                        "contract": "stored_script_audit_binding_v1",
+                        "stored_script_bound": True,
+                        "script_id": result["script_id"],
+                        "script_sha256": self.store.script_audit_sha256(result),
+                    },
+                },
             )
-        self.store.put_script(result)
         return result
 
 
@@ -1435,6 +2945,7 @@ class RelatabilityService:
         self.store = store
 
     def audit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload, input_binding = self.store.bind_script_audit_payload(payload)
         text = str(payload.get("text") or "").strip()
         timeline = payload.get("timeline") or []
         subject_id = str(payload.get("script_id") or stable_id("subject", text))
@@ -1557,6 +3068,7 @@ class RelatabilityService:
                 "supported_creator_count": len(supported_creators),
                 "opening_human_terms": opening_human_terms,
                 "pipeline_meta_phrases_in_script": pipeline_meta_matches,
+                "input_binding": input_binding,
             },
         )
 
@@ -1566,6 +3078,7 @@ class AttentionService:
         self.store = store
 
     def script_audit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload, input_binding = self.store.bind_script_audit_payload(payload)
         text = str(payload.get("text") or "").strip()
         timeline = payload.get("timeline") or []
         subject_id = str(payload.get("script_id") or stable_id("subject", text))
@@ -1593,10 +3106,18 @@ class AttentionService:
             subject_id,
             decision,
             score,
-            {"checks": checks, "failures": [name for name, passed in checks.items() if not passed], "threshold": 85},
+            {
+                "checks": checks,
+                "failures": [
+                    name for name, passed in checks.items() if not passed
+                ],
+                "threshold": 85,
+                "input_binding": input_binding,
+            },
         )
 
     def video_preflight(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload, input_binding = self.store.bind_script_audit_payload(payload)
         timeline = payload.get("timeline") or []
         subject_id = str(payload.get("script_id") or payload.get("video_id") or stable_id("timeline", timeline))
         if not timeline:
@@ -1622,7 +3143,13 @@ class AttentionService:
             subject_id,
             decision,
             score,
-            {"checks": checks, "failures": [name for name, passed in checks.items() if not passed]},
+            {
+                "checks": checks,
+                "failures": [
+                    name for name, passed in checks.items() if not passed
+                ],
+                "input_binding": input_binding,
+            },
         )
 
     def video_file_audit(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1725,6 +3252,265 @@ def sample_frame_changes(path: Path, duration: float) -> dict[str, Any]:
     }
 
 
+class OwnedOutcomeAttributionService:
+    """First-party, immutable attribution facts and descriptive rollups.
+
+    The service deliberately separates an observed retention change (a fact)
+    from a proposed explanation (an interpretation). A curve alone can locate
+    a drop; it cannot establish why a viewer left.
+    """
+
+    ATTRIBUTION_FIELDS = (
+        "content_id", "campaign_id", "offer_id", "source_platform", "source_id",
+    )
+
+    def __init__(self, store: QualityStore):
+        self.store = store
+
+    @staticmethod
+    def _required_text(
+        payload: dict[str, Any], field: str, *, maximum: int = 240
+    ) -> str:
+        raw = payload.get(field)
+        if raw is None:
+            raise ValueError(f"{field} is required")
+        if not isinstance(raw, str):
+            raise ValueError(f"{field} must be a string")
+        value = raw.strip()
+        if not value:
+            raise ValueError(f"{field} is required")
+        if len(value) > maximum:
+            raise ValueError(f"{field} must be at most {maximum} characters")
+        return value
+
+    @staticmethod
+    def _optional_text(
+        payload: dict[str, Any], field: str, *, maximum: int = 240
+    ) -> str | None:
+        raw = payload.get(field)
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError(f"{field} must be a string")
+        value = raw.strip()
+        if not value:
+            return None
+        if len(value) > maximum:
+            raise ValueError(f"{field} must be at most {maximum} characters")
+        return value
+
+    @staticmethod
+    def _timestamp(payload: dict[str, Any], field: str) -> str:
+        value = str(payload.get(field) or "").strip()
+        if not value:
+            raise ValueError(f"{field} is required")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{field} must be an ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"{field} must include a timezone")
+        return parsed.astimezone(UTC).isoformat()
+
+    @classmethod
+    def _attribution(
+        cls, payload: dict[str, Any], *, require_all: bool = True
+    ) -> dict[str, str]:
+        source = payload.get("attribution")
+        if source is None:
+            source = payload
+        if not isinstance(source, dict):
+            raise ValueError("attribution must be an object")
+        result: dict[str, str] = {}
+        fields = cls.ATTRIBUTION_FIELDS if require_all else ("content_id",)
+        for field in fields:
+            result[field] = cls._required_text(source, field)
+        if not require_all:
+            for field in cls.ATTRIBUTION_FIELDS[1:]:
+                value = cls._optional_text(source, field)
+                if value:
+                    result[field] = value.lower() if field == "source_platform" else value
+        if "source_platform" in result:
+            result["source_platform"] = result["source_platform"].lower()
+        return result
+
+    @staticmethod
+    def _metadata(payload: dict[str, Any]) -> dict[str, Any]:
+        metadata = payload.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata must be an object")
+        encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode()) > 32_768:
+            raise ValueError("metadata must be at most 32768 encoded bytes")
+        return metadata
+
+    @staticmethod
+    def _whole_number(
+        payload: dict[str, Any], field: str, *, minimum: int
+    ) -> int:
+        value = payload.get(field)
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be a whole number")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a whole number") from exc
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError(f"{field} must be a whole number")
+        result = int(numeric)
+        if result < minimum:
+            raise ValueError(f"{field} must be at least {minimum}")
+        return result
+
+    def ingest_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        event_type = str(payload.get("event_type") or "").strip().lower()
+        if event_type not in OWNED_OUTCOME_EVENT_TYPES:
+            raise ValueError(
+                "event_type must be one of: " + ", ".join(OWNED_OUTCOME_EVENT_TYPES)
+            )
+        event = {
+            "contract": OWNED_ATTRIBUTION_EVENT_CONTRACT,
+            "idempotency_key": self._required_text(
+                payload, "idempotency_key", maximum=300
+            ),
+            "event_type": event_type,
+            **self._attribution(payload),
+            "journey_id": self._required_text(payload, "journey_id", maximum=300),
+            "occurred_at": self._timestamp(payload, "occurred_at"),
+            "provider_event_id": self._optional_text(
+                payload, "provider_event_id", maximum=300
+            ),
+            "metadata": self._metadata(payload),
+        }
+        stored, created = self.store.put_owned_outcome_event(event)
+        return {
+            "status": "created" if created else "idempotent_replay",
+            "created": created,
+            "event": stored,
+        }
+
+    def ingest_retention_sample(self, payload: dict[str, Any]) -> dict[str, Any]:
+        retained = payload.get("retained_percent")
+        if isinstance(retained, bool):
+            raise ValueError("retained_percent must be a number from 0 to 100")
+        try:
+            retained_percent = float(retained)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("retained_percent must be a number from 0 to 100") from exc
+        if not math.isfinite(retained_percent) or not 0 <= retained_percent <= 100:
+            raise ValueError("retained_percent must be a number from 0 to 100")
+        sample = {
+            "contract": OWNED_RETENTION_SAMPLE_CONTRACT,
+            "idempotency_key": self._required_text(
+                payload, "idempotency_key", maximum=300
+            ),
+            **self._attribution(payload),
+            "measurement_id": self._required_text(
+                payload, "measurement_id", maximum=300
+            ),
+            "journey_id": self._optional_text(payload, "journey_id", maximum=300),
+            "observed_at": self._timestamp(payload, "observed_at"),
+            "elapsed_ms": self._whole_number(payload, "elapsed_ms", minimum=0),
+            "retained_percent": round(retained_percent, 6),
+            "sample_size": self._whole_number(payload, "sample_size", minimum=1),
+            "metadata": self._metadata(payload),
+        }
+        stored, created = self.store.put_owned_retention_sample(sample)
+        return {
+            "status": "created" if created else "idempotent_replay",
+            "created": created,
+            "sample": stored,
+        }
+
+    def summary(self, payload: dict[str, Any]) -> dict[str, Any]:
+        filters = self._attribution(payload, require_all=False)
+        event_rollup = self.store.owned_outcome_rollup(filters)
+        retention = self.store.owned_retention_rollup(filters)
+        transitions: dict[str, dict[str, Any]] = {}
+        for previous, current in zip(
+            OWNED_OUTCOME_EVENT_TYPES, OWNED_OUTCOME_EVENT_TYPES[1:]
+        ):
+            previous_count = event_rollup["by_type"][previous]["unique_journeys"]
+            linked_count = event_rollup["linked_journeys"][f"{previous}_to_{current}"]
+            transitions[f"{previous}_to_{current}"] = {
+                "linked_journeys": linked_count,
+                "prior_stage_journeys": previous_count,
+                "observed_link_rate": (
+                    round(linked_count / previous_count, 6)
+                    if previous_count else None
+                ),
+                "causal_effect": None,
+            }
+
+        observed_drops: list[dict[str, Any]] = []
+        for curve in retention["measurement_curves"]:
+            points = curve["points"]
+            for before, after in zip(points, points[1:]):
+                drop = before["retained_percent"] - after["retained_percent"]
+                if drop > 0:
+                    observed_drops.append({
+                        "measurement_id": curve["measurement_id"],
+                        "journey_id": curve["journey_id"],
+                        "attribution": curve["attribution"],
+                        "from_elapsed_ms": before["elapsed_ms"],
+                        "to_elapsed_ms": after["elapsed_ms"],
+                        "drop_percentage_points": round(drop, 4),
+                        "fact_type": "descriptive_observed_drop",
+                        "causal_reason": None,
+                    })
+
+        has_retention = retention["fact_count"] > 0
+        causal_code = (
+            "DESCRIPTIVE_RETENTION_IS_NOT_CAUSAL_EVIDENCE"
+            if has_retention else "NO_RETENTION_SAMPLES"
+        )
+        exact_dimensions = all(filters.get(field) for field in self.ATTRIBUTION_FIELDS)
+        return {
+            "status": "ok",
+            "contract": OWNED_OUTCOME_SUMMARY_CONTRACT,
+            "attribution_scope": {
+                field: filters.get(field) or "all"
+                for field in self.ATTRIBUTION_FIELDS
+            },
+            "scope_precision": "exact" if exact_dimensions else "aggregated",
+            "funnel": {
+                "stages": event_rollup["by_type"],
+                "transitions": transitions,
+                "complete_chain": event_rollup["complete_chain"],
+                "measurement": "observed_first_party_events",
+                "causal_claim": False,
+            },
+            "retention_curve": {
+                "status": "observed" if has_retention else "no_owned_samples",
+                **retention,
+                "time_unit": "milliseconds",
+            },
+            "observed_drop_facts": observed_drops,
+            "causal_drop_reasons": {
+                "status": "refused",
+                "code": causal_code,
+                "reasons": [],
+                "note": (
+                    "The stored retention facts locate observed changes but do not "
+                    "prove why a viewer left. A causal reason requires additional "
+                    "experimental or directly observed evidence."
+                    if has_retention else
+                    "No owned retention samples exist in this attribution scope, so "
+                    "no millisecond drop location or reason can be claimed."
+                ),
+            },
+            "ai_interpretation": {
+                "status": "not_generated",
+                "epistemic_status": "interpretation_not_fact",
+                "causal_claim": False,
+                "note": (
+                    "Any future AI explanation must cite these event/sample facts and "
+                    "remain explicitly labelled as a hypothesis, not an observed cause."
+                ),
+            },
+        }
+
+
 class RetentionService:
     def __init__(self, store: QualityStore):
         self.store = store
@@ -1779,10 +3565,24 @@ class RetentionService:
                     {
                         "elapsed_seconds": elapsed,
                         "drop_percent": round(drop, 2),
-                        "classification": "opening_mismatch" if elapsed <= 5 else "attention_drop",
+                        "classification": (
+                            "observed_early_retention_drop"
+                            if elapsed <= 5 else "observed_retention_drop"
+                        ),
+                        "fact_type": "descriptive_observed_drop",
+                        "causal_reason": None,
                     }
                 )
-        return {"status": "classified", "events": events, "event_count": len(events)}
+        return {
+            "status": "classified",
+            "events": events,
+            "event_count": len(events),
+            "causal_drop_reasons": {
+                "status": "refused",
+                "code": "DESCRIPTIVE_RETENTION_IS_NOT_CAUSAL_EVIDENCE",
+                "reasons": [],
+            },
+        }
 
 
 class ContentQualityEngine:
@@ -1791,6 +3591,7 @@ class ContentQualityEngine:
         market_tape_path: str | Path,
         quality_db_path: str | Path,
         narrative_llm_runner: Any = None,
+        relatability_llm_runner: Any = None,
         transcript_storage_root: str | Path | None = None,
         script_language_demand_enqueuer: Any = None,
     ):
@@ -1801,8 +3602,12 @@ class ContentQualityEngine:
         self.audience = AudienceIntelligenceService(self.tape, self.store)
         self.scripts = ScriptService(self.store, self.narrative)
         self.relatability = RelatabilityService(self.store)
+        self.ai_relatability = AIRelatabilityAdjudicator(
+            self.store, relatability_llm_runner
+        )
         self.attention = AttentionService(self.store)
         self.retention = RetentionService(self.store)
+        self.owned_outcomes = OwnedOutcomeAttributionService(self.store)
         self.script_intelligence = ScriptIntelligenceService(
             tape=self.tape,
             store=self.store,
@@ -1810,12 +3615,17 @@ class ContentQualityEngine:
             audience=self.audience,
             scripts=self.scripts,
             relatability=self.relatability,
+            ai_relatability=self.ai_relatability,
             attention=self.attention,
             transcript_storage_root=(
                 transcript_storage_root
                 or os.getenv(
                     "TRANSCRIPT_BANK_ROOT",
-                    "/Volumes/My Passport/MarketTape/transcript-bank",
+                    str(
+                        Path.home()
+                        / "Library/Application Support/ContentQuality/data/"
+                        "transcript-bank"
+                    ),
                 )
             ),
             demand_enqueuer=script_language_demand_enqueuer,
@@ -1824,19 +3634,29 @@ class ContentQualityEngine:
     def health(self) -> dict[str, Any]:
         tape = self.tape.health()
         script_intelligence = self.script_intelligence.readiness()
-        ai_configured = bool(
+        store_counts = self.store.counts()
+        owned_outcome_readiness = self.store.owned_outcome_readiness()
+        openai_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+        usable_openai_key = bool(
+            openai_key and not openai_key.startswith("__")
+        )
+        narrative_ai_configured = bool(
             self.narrative.llm_runner is not None
-            and str(os.getenv("OPENAI_API_KEY") or "").strip()
+            and usable_openai_key
+        )
+        relatability_ai_configured = bool(
+            self.ai_relatability.llm_runner is not None
+            and usable_openai_key
         )
         return {
             "status": "healthy" if tape["status"] == "up" else "degraded",
             "service": "content-quality",
             "market_tape": tape,
-            "learning_store": {"status": "up", "path": str(self.store.path), "counts": self.store.counts()},
+            "learning_store": {"status": "up", "path": str(self.store.path), "counts": store_counts},
             "capabilities": [
                 "audience-intelligence", "viral-transcripts", "evidence-first-scripts",
                 "narrative-coherence", "relatability", "attention", "retention", "learning-memory",
-                "script-intelligence",
+                "script-intelligence", "owned-outcome-attribution",
             ],
             "data_readiness": {
                 "script_intelligence": script_intelligence,
@@ -1850,20 +3670,20 @@ class ContentQualityEngine:
                     "direct_cross_database_writes": False,
                 },
                 "owned_retention": {
-                    "status": (
-                        "ready"
-                        if self.store.counts()["cq_retention"] > 0
-                        else "no_owned_outcomes"
-                    ),
+                    **owned_outcome_readiness,
                 },
             },
             "ai_readiness": {
-                "narrative_judge_configured": ai_configured,
+                "narrative_judge_configured": narrative_ai_configured,
+                "relatability_judge_configured": relatability_ai_configured,
                 "deterministic_services_available": True,
                 "note": (
-                    "AI judgment is configured."
-                    if ai_configured
-                    else "Deterministic services remain available; the production AI judge is not configured."
+                    "Narrative and relatability AI judgments are configured."
+                    if narrative_ai_configured and relatability_ai_configured
+                    else (
+                        "Deterministic services remain available; one or more "
+                        "production AI judges are not configured."
+                    )
                 ),
             },
             "checked_at": utc_now(),

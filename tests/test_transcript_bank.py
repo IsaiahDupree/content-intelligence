@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import wave
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,7 @@ from services.content_quality.transcript_bank import (
     TranscriptBank,
     canonical_sha256,
     file_sha256,
+    file_sha256_bounded,
     transcribe_cohort,
 )
 from services.market_tape.config import MarketTapeConfig
@@ -170,6 +173,144 @@ def test_youtube_backfill_accepts_twelve_minutes_but_not_longer(tmp_path):
     )
 
     assert [candidate.external_id for candidate in candidates] == ["accepted-603"]
+
+
+def test_explicit_legacy_payload_snapshot_backfill_is_bounded_and_audited(tmp_path):
+    _config, bank, candidate, observed_at = _single_video_bank(tmp_path)
+    artifact, transcript_text = _real_transcript_artifact(
+        tmp_path, bank, candidate, observed_at
+    )
+    with bank.connect() as connection:
+        connection.execute(
+            """INSERT INTO mt_transcript_artifacts(
+                   transcript_id, video_id, platform, external_id, source_url,
+                   observation_key, source_metrics_json, audio_path, audio_sha256,
+                   transcript_path, transcript_sha256, whisper_model,
+                   whisper_language, duration_seconds, word_count, segment_count,
+                   acquisition_json, audit_json, created_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                artifact["transcript_id"], artifact["video_id"],
+                artifact["platform"], artifact["external_id"],
+                artifact["source_url"], artifact["observation_key"],
+                json.dumps(artifact["source_metrics"], sort_keys=True),
+                artifact["audio_path"], artifact["audio_sha256"],
+                artifact["transcript_path"], artifact["transcript_sha256"],
+                artifact["whisper_model"], artifact["whisper_language"],
+                artifact["duration_seconds"], artifact["word_count"],
+                artifact["segment_count"],
+                json.dumps(artifact["acquisition"], sort_keys=True),
+                json.dumps(artifact["audit"], sort_keys=True),
+                artifact["created_at"],
+            ),
+        )
+        connection.execute(
+            """UPDATE mt_content_genomes
+               SET transcript=?, transcript_embedding_ref=?,
+                   extraction_status='whisper_transcribed'
+               WHERE video_id=?""",
+            (
+                transcript_text, f"sha256:{artifact['transcript_sha256']}",
+                artifact["video_id"],
+            ),
+        )
+
+    result = bank.backfill_transcript_payload_snapshots(
+        transcript_ids=[artifact["transcript_id"]], limit=1
+    )
+
+    assert result["status"] == "completed"
+    assert result["created_count"] == 1
+    assert result["already_present_count"] == 0
+    assert result["failure_count"] == 0
+    assert result["automatic_script_path_reads"] is False
+    assert result["passport_read_scope"] == (
+        "selected_legacy_transcript_payloads_only"
+    )
+    with bank.connect() as connection:
+        snapshot = connection.execute(
+            """SELECT transcript_sha256, payload_json
+               FROM mt_transcript_payload_snapshots WHERE transcript_id=?""",
+            (artifact["transcript_id"],),
+        ).fetchone()
+        run_count = connection.execute(
+            "SELECT COUNT(*) FROM mt_transcript_payload_snapshot_backfill_runs"
+        ).fetchone()[0]
+    assert snapshot["transcript_sha256"] == artifact["transcript_sha256"]
+    assert canonical_sha256(json.loads(snapshot["payload_json"])) == artifact[
+        "transcript_sha256"
+    ]
+    assert run_count == 1
+
+    Path(artifact["transcript_path"]).unlink()
+    replay = bank.backfill_transcript_payload_snapshots(
+        transcript_ids=[artifact["transcript_id"]], limit=1
+    )
+    assert replay["status"] == "completed"
+    assert replay["created_count"] == 0
+    assert replay["already_present_count"] == 1
+
+
+def test_legacy_payload_snapshot_backfill_times_out_and_records_receipt(tmp_path):
+    _config, bank, candidate, observed_at = _single_video_bank(tmp_path)
+    artifact, _transcript_text = _real_transcript_artifact(
+        tmp_path, bank, candidate, observed_at
+    )
+    transcript_path = Path(artifact["transcript_path"])
+    transcript_path.unlink()
+    os.mkfifo(transcript_path)
+    with bank.connect() as connection:
+        connection.execute(
+            """INSERT INTO mt_transcript_artifacts(
+                   transcript_id, video_id, platform, external_id, source_url,
+                   observation_key, source_metrics_json, audio_path, audio_sha256,
+                   transcript_path, transcript_sha256, whisper_model,
+                   whisper_language, duration_seconds, word_count, segment_count,
+                   acquisition_json, audit_json, created_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                artifact["transcript_id"], artifact["video_id"],
+                artifact["platform"], artifact["external_id"],
+                artifact["source_url"], artifact["observation_key"],
+                json.dumps(artifact["source_metrics"], sort_keys=True),
+                artifact["audio_path"], artifact["audio_sha256"],
+                artifact["transcript_path"], artifact["transcript_sha256"],
+                artifact["whisper_model"], artifact["whisper_language"],
+                artifact["duration_seconds"], artifact["word_count"],
+                artifact["segment_count"],
+                json.dumps(artifact["acquisition"], sort_keys=True),
+                json.dumps(artifact["audit"], sort_keys=True),
+                artifact["created_at"],
+            ),
+        )
+
+    result = bank.backfill_transcript_payload_snapshots(
+        transcript_ids=[artifact["transcript_id"]],
+        limit=1,
+        read_timeout_seconds=0.1,
+    )
+
+    assert result["status"] == "failed"
+    assert result["failure_count"] == 1
+    assert result["items"][0]["code"] == "TRANSCRIPT_PAYLOAD_READ_TIMEOUT"
+    assert result["read_timeout_seconds"] == 0.1
+    with bank.connect() as connection:
+        run = connection.execute(
+            """SELECT result_json
+               FROM mt_transcript_payload_snapshot_backfill_runs
+               ORDER BY started_at DESC LIMIT 1"""
+        ).fetchone()
+    assert json.loads(run["result_json"])["items"][0]["code"] == (
+        "TRANSCRIPT_PAYLOAD_READ_TIMEOUT"
+    )
+
+
+def test_bounded_legacy_artifact_hash_times_out_on_blocked_data_read(tmp_path):
+    artifact_path = tmp_path / "blocked-source.audio"
+    os.mkfifo(artifact_path)
+
+    with pytest.raises(TimeoutError, match="artifact hash read timed out"):
+        file_sha256_bounded(artifact_path, timeout_seconds=0.1)
 
 
 def test_topic_backfill_prefilters_before_global_performance_ranking(tmp_path):
@@ -343,6 +484,14 @@ def test_real_files_are_hash_bound_and_bad_script_claim_fails_closed(tmp_path):
     assert cohort["decision"] == "PASS"
     assert cohort["aggregate_metrics"]["member_count"] == 5
     assert cohort["aggregate_metrics"]["total_views"] == 150_000
+    cohort_manifest_payload = json.loads(
+        Path(cohort["manifest_path"]).read_text(encoding="utf-8")
+    )
+    cohort_manifest_sha256 = canonical_sha256(cohort_manifest_payload)
+
+    for item in artifacts:
+        Path(item["transcript_path"]).unlink()
+        Path(item["audio_path"]).unlink()
 
     rejected = bank.audit_script_against_cohort(
         script_id="bad-script",
@@ -351,9 +500,12 @@ def test_real_files_are_hash_bound_and_bad_script_claim_fails_closed(tmp_path):
             "transcript patterns with 297 observed views. Reveal the mechanism."
         ),
         cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
     )
     assert rejected["decision"] == "REJECT_NOT_RELATABLE"
     assert rejected["score"] <= 69
+    assert rejected["findings"]["minimum_source_tfidf_cosine"] == 0.05
     assert rejected["findings"]["checks"]["stated_source_claim_matches_cohort"] is False
     assert rejected["findings"]["checks"]["audience_facing_not_pipeline_meta"] is False
 
@@ -365,10 +517,65 @@ def test_real_files_are_hash_bound_and_bad_script_claim_fails_closed(tmp_path):
             "real break and make the next step feel possible again."
         ),
         cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
     )
     assert accepted["decision"] == "PASS_PREDICTED_RELATABILITY"
     assert accepted["score"] <= 85
     assert accepted["findings"]["actual_audience_relatability_measured"] is False
+    assert accepted["findings"][
+        "fresh_removable_volume_rehash_performed"
+    ] is False
+    assert accepted["findings"]["artifact_integrity_failures"] == []
+
+    tampered_text = transcript_text.replace("Creator", "Viewer", 1)
+    assert len(tampered_text.split()) == len(transcript_text.split())
+    tampered_transcript_id = artifacts[0]["transcript_id"]
+    with bank.connect() as connection:
+        connection.execute(
+            "UPDATE mt_content_genomes SET transcript=? WHERE video_id=?",
+            (tampered_text, artifacts[0]["video_id"]),
+        )
+
+    tampered = bank.audit_script_against_cohort(
+        script_id="same-word-count-tampering",
+        script_text=(
+            "Do you feel tired and stuck when the audience asks for more content? Creator "
+            "burnout can make creative work feel harder even when you keep trying. Take a "
+            "real break and make the next step feel possible again."
+        ),
+        cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
+    )
+
+    assert tampered["decision"] == "REJECT_NOT_RELATABLE"
+    assert tampered["findings"]["fresh_removable_volume_rehash_performed"] is False
+    assert tampered["findings"]["checks"]["all_artifact_hashes_verified"] is False
+    assert tampered["findings"]["artifact_integrity_failures"] == [{
+        "transcript_id": tampered_transcript_id,
+        "error": "acquisition or atomic tape integrity attestation failed",
+    }]
+    attestation = next(
+        item
+        for item in tampered["findings"]["artifact_integrity_attestations"]
+        if item["transcript_id"] == tampered_transcript_id
+    )
+    assert attestation["checks"]["atomic_tape_word_count_matches"] is True
+    assert attestation["checks"][
+        "acquisition_transcript_payload_sha256_matches"
+    ] is True
+    assert attestation["checks"][
+        "atomic_tape_transcript_payload_sha256_matches"
+    ] is False
+    assert (
+        attestation["acquisition_transcript_payload_sha256"]
+        == artifacts[0]["transcript_sha256"]
+    )
+    assert (
+        attestation["atomic_tape_transcript_payload_sha256"]
+        != artifacts[0]["transcript_sha256"]
+    )
 
 
 def test_just_in_time_claim_and_success_ledger_are_atomic_and_append_only(tmp_path):

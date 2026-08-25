@@ -16,6 +16,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import uuid
 from contextlib import closing
 from dataclasses import asdict, dataclass
@@ -28,10 +29,15 @@ from typing import Any, Iterable, Sequence
 
 from services.market_tape.source_urls import is_usable_source_url
 
+from .ai_relatability import HUMAN_EXPERIENCE_WORDS
 from .contracts import (
     CURRENT_TRANSCRIPT_AUDIT_CONTRACT,
     is_supported_transcript_audit_contract,
 )
+
+
+MIN_SOURCE_TFIDF_COSINE = 0.05
+LEGACY_PAYLOAD_READ_TIMEOUT_SECONDS = 5.0
 
 
 UTC = timezone.utc
@@ -69,6 +75,78 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def file_sha256_bounded(
+    path: Path,
+    *,
+    timeout_seconds: float = LEGACY_PAYLOAD_READ_TIMEOUT_SECONDS,
+) -> str:
+    """Hash one legacy artifact without trusting its volume to return.
+
+    A removable-volume driver can satisfy ``stat`` while blocking forever on
+    the first data read. Keep that potentially wedged descriptor in a child
+    process so the parent can terminate it at a hard deadline and fail closed.
+    """
+
+    reader = (
+        "from pathlib import Path\n"
+        "import hashlib\n"
+        "import sys\n"
+        "digest = hashlib.sha256()\n"
+        "with Path(sys.argv[1]).open('rb') as handle:\n"
+        "    for chunk in iter(lambda: handle.read(1024 * 1024), b''):\n"
+        "        digest.update(chunk)\n"
+        "sys.stdout.write(digest.hexdigest())\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", reader, str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(0.05, float(timeout_seconds)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("legacy artifact hash read timed out") from exc
+    if completed.returncode != 0:
+        error = " ".join(completed.stderr.split())[-500:]
+        raise OSError(error or "legacy artifact hash reader failed")
+    digest = completed.stdout.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("legacy artifact hash reader returned an invalid digest")
+    return digest
+
+
+def read_legacy_json_payload_bounded(
+    path: Path,
+    *,
+    timeout_seconds: float = LEGACY_PAYLOAD_READ_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Read one selected legacy payload without an unbounded volume wait."""
+
+    reader = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.stdout.write(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", reader, str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(0.05, float(timeout_seconds)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("legacy transcript payload read timed out") from exc
+    if completed.returncode != 0:
+        error = " ".join(completed.stderr.split())[-500:]
+        raise OSError(error or "legacy transcript payload reader failed")
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("legacy transcript payload must be a JSON object")
+    return payload
 
 
 def words(text: str) -> list[str]:
@@ -260,7 +338,7 @@ FAILURE_RETRY_BASE_HOURS = {
 }
 MAX_FAILURE_RETRY_HOURS = 24 * 7
 ACQUISITION_CLAIM_HOURS = 6
-TRANSCRIPT_LEDGER_SCHEMA_VERSION = 9
+TRANSCRIPT_LEDGER_SCHEMA_VERSION = 11
 PASSPORT_VOLUME_ROOT = Path("/Volumes/My Passport")
 
 
@@ -422,6 +500,44 @@ class TranscriptBank:
                     ON mt_transcript_artifacts(video_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS mt_transcript_artifacts_platform_idx
                     ON mt_transcript_artifacts(platform, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_payload_snapshots (
+                    transcript_id TEXT PRIMARY KEY,
+                    transcript_sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS mt_transcript_payload_snapshots_no_update
+                BEFORE UPDATE ON mt_transcript_payload_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshots are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS mt_transcript_payload_snapshots_no_delete
+                BEFORE DELETE ON mt_transcript_payload_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshots are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_transcript_payload_snapshot_backfill_runs (
+                    run_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    requested_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_transcript_payload_snapshot_backfill_runs_no_update
+                BEFORE UPDATE ON mt_transcript_payload_snapshot_backfill_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshot backfills are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_transcript_payload_snapshot_backfill_runs_no_delete
+                BEFORE DELETE ON mt_transcript_payload_snapshot_backfill_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'transcript payload snapshot backfills are append-only');
+                END;
 
                 CREATE TABLE IF NOT EXISTS mt_transcript_cohorts (
                     cohort_id TEXT PRIMARY KEY,
@@ -2001,6 +2117,201 @@ class TranscriptBank:
             row = connection.execute(query, parameters).fetchone()
         return self._artifact_row(row) if row else None
 
+    def backfill_transcript_payload_snapshots(
+        self,
+        *,
+        transcript_ids: Sequence[str],
+        limit: int = 5,
+        read_timeout_seconds: float = LEGACY_PAYLOAD_READ_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Explicitly snapshot a bounded set of legacy acquisition payloads.
+
+        This is the only legacy path that reads transcript artifact files. It is
+        deliberately caller-invoked and is never called by brief generation or
+        script auditing. Each payload must still match both its acquisition hash
+        and the current SQLite transcript before an immutable snapshot is added.
+        """
+
+        bounded_limit = max(1, min(int(limit), 100))
+        requested_ids = list(dict.fromkeys(
+            " ".join(str(value or "").split())
+            for value in transcript_ids
+            if " ".join(str(value or "").split())
+        ))
+        if not requested_ids:
+            raise ValueError("at least one transcript_id is required")
+        selected_ids = requested_ids[:bounded_limit]
+        started_at = utc_now()
+        run_id = f"payload_snapshot_backfill_{uuid.uuid4().hex}"
+        placeholders = ",".join("?" for _ in selected_ids)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT artifact.transcript_id, artifact.transcript_path,
+                           artifact.transcript_sha256, genome.transcript,
+                           snapshot.transcript_sha256 AS snapshot_sha256,
+                           snapshot.payload_json AS snapshot_payload_json
+                    FROM mt_transcript_artifacts artifact
+                    LEFT JOIN mt_content_genomes genome
+                      ON genome.video_id=artifact.video_id
+                    LEFT JOIN mt_transcript_payload_snapshots snapshot
+                      ON snapshot.transcript_id=artifact.transcript_id
+                    WHERE artifact.transcript_id IN ({placeholders})""",
+                selected_ids,
+            ).fetchall()
+            by_id = {str(row["transcript_id"]): row for row in rows}
+            items: list[dict[str, Any]] = []
+            for transcript_id in selected_ids:
+                row = by_id.get(transcript_id)
+                if row is None:
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": "failed",
+                        "code": "TRANSCRIPT_ARTIFACT_NOT_FOUND",
+                    })
+                    continue
+                transcript_sha256 = str(row["transcript_sha256"] or "")
+                snapshot_exists = row["snapshot_sha256"] is not None
+                existing_payload_json = str(row["snapshot_payload_json"] or "")
+                if snapshot_exists:
+                    try:
+                        existing_payload = json.loads(existing_payload_json)
+                    except (TypeError, json.JSONDecodeError):
+                        existing_payload = None
+                    existing_valid = bool(
+                        isinstance(existing_payload, dict)
+                        and str(row["snapshot_sha256"] or "")
+                            == transcript_sha256
+                        and canonical_sha256(existing_payload)
+                            == transcript_sha256
+                    )
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": (
+                            "already_present" if existing_valid else "failed"
+                        ),
+                        "code": (
+                            "" if existing_valid
+                            else "EXISTING_PAYLOAD_SNAPSHOT_INVALID"
+                        ),
+                    })
+                    continue
+                try:
+                    transcript_path = Path(
+                        str(row["transcript_path"] or "")
+                    ).expanduser().resolve()
+                    payload = read_legacy_json_payload_bounded(
+                        transcript_path,
+                        timeout_seconds=read_timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": "failed",
+                        "code": "TRANSCRIPT_PAYLOAD_READ_TIMEOUT",
+                        "error_type": type(exc).__name__,
+                    })
+                    continue
+                except (
+                    OSError, UnicodeError, json.JSONDecodeError, ValueError,
+                ) as exc:
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": "failed",
+                        "code": "TRANSCRIPT_PAYLOAD_UNREADABLE",
+                        "error_type": type(exc).__name__,
+                    })
+                    continue
+                if not isinstance(payload, dict):
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": "failed",
+                        "code": "TRANSCRIPT_PAYLOAD_NOT_OBJECT",
+                    })
+                    continue
+                payload_sha256 = canonical_sha256(payload)
+                if payload_sha256 != transcript_sha256:
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": "failed",
+                        "code": "ACQUISITION_TRANSCRIPT_SHA256_MISMATCH",
+                    })
+                    continue
+                sqlite_transcript = str(row["transcript"] or "")
+                if not sqlite_transcript or str(payload.get("text") or "") != sqlite_transcript:
+                    items.append({
+                        "transcript_id": transcript_id,
+                        "status": "failed",
+                        "code": "SQLITE_TRANSCRIPT_DOES_NOT_MATCH_ACQUISITION",
+                    })
+                    continue
+                payload_json = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+                self._put_transcript_payload_snapshot(
+                    connection,
+                    transcript_id=transcript_id,
+                    transcript_sha256=transcript_sha256,
+                    payload_json=payload_json,
+                    created_at=utc_now(),
+                )
+                items.append({
+                    "transcript_id": transcript_id,
+                    "status": "created",
+                    "code": "",
+                    "transcript_sha256": transcript_sha256,
+                })
+            finished_at = utc_now()
+            failure_count = sum(item["status"] == "failed" for item in items)
+            success_count = len(items) - failure_count
+            result = {
+                "contract": "transcript_payload_snapshot_backfill_v1",
+                "run_id": run_id,
+                "status": (
+                    "completed" if not failure_count and not (
+                        len(requested_ids) > len(selected_ids)
+                    )
+                    else "partial" if success_count else "failed"
+                ),
+                "bounded_limit": bounded_limit,
+                "requested_count": len(requested_ids),
+                "selected_count": len(selected_ids),
+                "request_truncated": len(requested_ids) > len(selected_ids),
+                "created_count": sum(
+                    item["status"] == "created" for item in items
+                ),
+                "already_present_count": sum(
+                    item["status"] == "already_present" for item in items
+                ),
+                "failure_count": failure_count,
+                "items": items,
+                "passport_read_scope": "selected_legacy_transcript_payloads_only",
+                "automatic_script_path_reads": False,
+                "read_timeout_seconds": max(
+                    0.05, float(read_timeout_seconds)
+                ),
+                "started_at": started_at,
+                "finished_at": finished_at,
+            }
+            connection.execute(
+                """INSERT INTO mt_transcript_payload_snapshot_backfill_runs(
+                       run_id, contract, requested_json, result_json,
+                       started_at, finished_at
+                   ) VALUES(?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, result["contract"],
+                    json.dumps({
+                        "transcript_ids": selected_ids,
+                        "bounded_limit": bounded_limit,
+                    }, sort_keys=True),
+                    json.dumps(result, sort_keys=True), started_at, finished_at,
+                ),
+            )
+            connection.commit()
+        return result
+
     @staticmethod
     def _artifact_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -2025,6 +2336,39 @@ class TranscriptBank:
             "created_at": row["created_at"],
         }
 
+    @staticmethod
+    def _put_transcript_payload_snapshot(
+        connection: sqlite3.Connection,
+        *,
+        transcript_id: str,
+        transcript_sha256: str,
+        payload_json: str,
+        created_at: str,
+    ) -> bool:
+        cursor = connection.execute(
+            """
+            INSERT INTO mt_transcript_payload_snapshots(
+                transcript_id, transcript_sha256, payload_json, created_at
+            ) VALUES(?, ?, ?, ?)
+            ON CONFLICT(transcript_id) DO NOTHING
+            """,
+            (transcript_id, transcript_sha256, payload_json, created_at),
+        )
+        payload_snapshot = connection.execute(
+            """SELECT transcript_sha256, payload_json
+               FROM mt_transcript_payload_snapshots WHERE transcript_id=?""",
+            (transcript_id,),
+        ).fetchone()
+        if (
+            payload_snapshot is None
+            or payload_snapshot["transcript_sha256"] != transcript_sha256
+            or payload_snapshot["payload_json"] != payload_json
+        ):
+            raise ValueError(
+                "transcript_id already identifies a different acquisition payload"
+            )
+        return cursor.rowcount == 1
+
     def _persist_artifact(self, artifact: dict[str, Any], transcript_text: str) -> None:
         with closing(self.connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2037,6 +2381,32 @@ class TranscriptBank:
         artifact: dict[str, Any],
         transcript_text: str,
     ) -> None:
+        transcript_path = Path(str(artifact["transcript_path"])).expanduser().resolve()
+        try:
+            transcript_payload = json.loads(
+                transcript_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "transcript payload must be readable while persisting acquisition"
+            ) from exc
+        if not isinstance(transcript_payload, dict):
+            raise ValueError("transcript payload must be a JSON object")
+        if str(transcript_payload.get("text") or "") != transcript_text:
+            raise ValueError(
+                "transcript payload text does not match the SQLite transcript text"
+            )
+        transcript_payload_sha256 = canonical_sha256(transcript_payload)
+        if transcript_payload_sha256 != str(artifact["transcript_sha256"]):
+            raise ValueError(
+                "transcript payload does not match acquisition transcript_sha256"
+            )
+        transcript_payload_json = json.dumps(
+            transcript_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
         connection.execute(
             """
             INSERT OR REPLACE INTO mt_transcript_artifacts(
@@ -2058,6 +2428,13 @@ class TranscriptBank:
                 json.dumps(artifact["acquisition"], sort_keys=True),
                 json.dumps(artifact["audit"], sort_keys=True), artifact["created_at"],
             ),
+        )
+        TranscriptBank._put_transcript_payload_snapshot(
+            connection,
+            transcript_id=str(artifact["transcript_id"]),
+            transcript_sha256=str(artifact["transcript_sha256"]),
+            payload_json=transcript_payload_json,
+            created_at=str(artifact["created_at"]),
         )
         connection.execute(
             """
@@ -2254,6 +2631,8 @@ class TranscriptBank:
         script_id: str,
         script_text: str,
         cohort_manifest_path: str | Path,
+        expected_cohort_id: str,
+        expected_cohort_manifest_sha256: str,
     ) -> dict[str, Any]:
         """Predict script relatability from verified high-performing transcripts.
 
@@ -2264,48 +2643,180 @@ class TranscriptBank:
         if not script_id.strip() or not script_text.strip():
             raise ValueError("script_id and script_text are required")
         manifest_path = Path(cohort_manifest_path).expanduser().resolve()
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_load_error: str | None = None
+        try:
+            loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            loaded_manifest = None
+            manifest_load_error = f"{type(exc).__name__}: {exc}"
+        manifest_payload_is_object = isinstance(loaded_manifest, dict)
+        actual_manifest = loaded_manifest if manifest_payload_is_object else {}
+        actual_cohort_id = str(actual_manifest.get("cohort_id") or "")
+        actual_manifest_hash = (
+            canonical_sha256(loaded_manifest) if loaded_manifest is not None else ""
+        )
+        expected_cohort_id = str(expected_cohort_id or "").strip()
+        expected_manifest_hash = str(
+            expected_cohort_manifest_sha256 or ""
+        ).strip().lower()
+        expected_cohort_id_valid = bool(expected_cohort_id)
+        expected_manifest_hash_valid = bool(
+            re.fullmatch(r"[0-9a-f]{64}", expected_manifest_hash)
+        )
+        cohort_id_matches = (
+            expected_cohort_id_valid and actual_cohort_id == expected_cohort_id
+        )
+        manifest_hash_matches = (
+            expected_manifest_hash_valid
+            and actual_manifest_hash == expected_manifest_hash
+        )
+        manifest_binding_valid = (
+            manifest_payload_is_object
+            and cohort_id_matches
+            and manifest_hash_matches
+        )
+        # Never use an unbound manifest to select source material.  We still write
+        # a rejection receipt below with the expected and observed identifiers.
+        manifest = actual_manifest if manifest_binding_valid else {}
         members = list(manifest.get("members") or [])
         aggregate = dict(manifest.get("aggregate_metrics") or {})
         cohort_audit = dict(manifest.get("audit") or {})
 
         integrity_failures: list[dict[str, str]] = []
         transcript_documents: list[dict[str, Any]] = []
+        member_video_ids = [
+            str(member.get("video_id") or "") for member in members
+            if str(member.get("video_id") or "")
+        ]
+        member_transcript_ids = [
+            str(member.get("transcript_id") or "") for member in members
+            if str(member.get("transcript_id") or "")
+        ]
+        with closing(self.connect()) as connection:
+            genome_rows = connection.execute(
+                f"""SELECT video_id, transcript, transcript_embedding_ref,
+                           extraction_status
+                    FROM mt_content_genomes
+                    WHERE video_id IN ({','.join('?' for _ in member_video_ids)})""",
+                member_video_ids,
+            ).fetchall() if member_video_ids else []
+            artifact_payload_rows = connection.execute(
+                f"""SELECT transcript_id, payload_json
+                    FROM mt_transcript_payload_snapshots
+                    WHERE transcript_id IN (
+                        {','.join('?' for _ in member_transcript_ids)}
+                    )""",
+                member_transcript_ids,
+            ).fetchall() if member_transcript_ids else []
+        genome_by_video = {
+            str(row["video_id"]): dict(row) for row in genome_rows
+        }
+        payload_json_by_transcript = {
+            str(row["transcript_id"]): str(row["payload_json"] or "")
+            for row in artifact_payload_rows
+        }
+        integrity_attestations: list[dict[str, Any]] = []
         for member in members:
-            transcript_path = Path(str(member.get("transcript_path") or ""))
-            audio_path = Path(str(member.get("audio_path") or ""))
-            if not transcript_path.is_file() or not audio_path.is_file():
+            transcript_id = str(member.get("transcript_id") or "")
+            transcript_hash = str(member.get("transcript_sha256") or "")
+            audio_hash = str(member.get("audio_sha256") or "")
+            acquisition_audit = member.get("audit") or {}
+            acquisition_checks = acquisition_audit.get("checks") or {}
+            genome = genome_by_video.get(str(member.get("video_id") or ""))
+            transcript_text = str((genome or {}).get("transcript") or "")
+            transcript_payload: dict[str, Any] | None = None
+            transcript_payload_error: str | None = None
+            raw_transcript_payload = payload_json_by_transcript.get(
+                transcript_id, ""
+            )
+            if raw_transcript_payload:
+                try:
+                    loaded_transcript_payload = json.loads(raw_transcript_payload)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    transcript_payload_error = type(exc).__name__
+                else:
+                    if isinstance(loaded_transcript_payload, dict):
+                        transcript_payload = loaded_transcript_payload
+                    else:
+                        transcript_payload_error = "payload_not_object"
+            else:
+                transcript_payload_error = "payload_snapshot_missing"
+            acquisition_payload_sha256 = (
+                canonical_sha256(transcript_payload)
+                if transcript_payload is not None else ""
+            )
+            rebound_payload = (
+                {**transcript_payload, "text": transcript_text}
+                if transcript_payload is not None else None
+            )
+            atomic_tape_payload_sha256 = (
+                canonical_sha256(rebound_payload)
+                if rebound_payload is not None else ""
+            )
+            attestation_checks = {
+                "acquisition_audit_passed": (
+                    acquisition_audit.get("decision") == "PASS"
+                ),
+                "transcript_hash_matches_acquisition_audit": (
+                    len(transcript_hash) == 64
+                    and acquisition_audit.get("transcript_payload_sha256")
+                    == transcript_hash
+                ),
+                "audio_hash_was_bound_at_acquisition": (
+                    len(audio_hash) == 64
+                    and acquisition_checks.get("audio_file_exists") is True
+                    and acquisition_checks.get("audio_sha256_bound") is True
+                ),
+                "acquisition_transcript_payload_snapshot_present": (
+                    transcript_payload is not None
+                ),
+                "acquisition_transcript_payload_sha256_matches": (
+                    bool(transcript_hash)
+                    and acquisition_payload_sha256 == transcript_hash
+                ),
+                "atomic_tape_transcript_present": bool(transcript_text),
+                "atomic_tape_transcript_payload_sha256_matches": (
+                    bool(transcript_text)
+                    and atomic_tape_payload_sha256 == transcript_hash
+                ),
+                "atomic_tape_hash_reference_matches": (
+                    (genome or {}).get("transcript_embedding_ref")
+                    == f"sha256:{transcript_hash}"
+                ),
+                "atomic_tape_word_count_matches": (
+                    len(words(transcript_text))
+                    == int(member.get("word_count") or 0)
+                ),
+                "atomic_tape_extraction_status_matches": (
+                    (genome or {}).get("extraction_status")
+                    == "whisper_transcribed"
+                ),
+            }
+            integrity_attestations.append({
+                "transcript_id": transcript_id,
+                "verification_mode": (
+                    "acquisition_payload_hash_plus_atomic_tape_reconstruction"
+                ),
+                "fresh_removable_volume_rehash": False,
+                "acquisition_transcript_payload_sha256": (
+                    acquisition_payload_sha256 or None
+                ),
+                "atomic_tape_transcript_payload_sha256": (
+                    atomic_tape_payload_sha256 or None
+                ),
+                "transcript_payload_snapshot_error": transcript_payload_error,
+                "checks": attestation_checks,
+            })
+            if not all(attestation_checks.values()):
                 integrity_failures.append({
-                    "transcript_id": str(member.get("transcript_id") or ""),
-                    "error": "bound artifact file missing",
-                })
-                continue
-            try:
-                payload = json.loads(transcript_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                integrity_failures.append({
-                    "transcript_id": str(member.get("transcript_id") or ""),
-                    "error": f"invalid transcript payload: {type(exc).__name__}",
-                })
-                continue
-            transcript_hash = canonical_sha256(payload)
-            audio_hash = file_sha256(audio_path)
-            if transcript_hash != member.get("transcript_sha256"):
-                integrity_failures.append({
-                    "transcript_id": str(member.get("transcript_id") or ""),
-                    "error": "transcript hash mismatch",
-                })
-                continue
-            if audio_hash != member.get("audio_sha256"):
-                integrity_failures.append({
-                    "transcript_id": str(member.get("transcript_id") or ""),
-                    "error": "audio hash mismatch",
+                    "transcript_id": transcript_id,
+                    "error": "acquisition or atomic tape integrity attestation failed",
                 })
                 continue
             transcript_documents.append({
-                "transcript_id": member["transcript_id"],
+                "transcript_id": transcript_id,
                 "video_id": member["video_id"],
-                "text": str(payload.get("text") or ""),
+                "text": transcript_text,
                 "views": int(member.get("source_metrics", {}).get("views") or 0),
                 "engagement_rate": float(
                     member.get("source_metrics", {}).get("engagement_rate") or 0.0
@@ -2323,7 +2834,9 @@ class TranscriptBank:
             _tfidf_cosine(script_tokens, source_tokens, document_tokens)
             for source_tokens in document_tokens
         ]
-        supported_sources = sum(score >= 0.07 for score in cosine_scores)
+        supported_sources = sum(
+            score >= MIN_SOURCE_TFIDF_COSINE for score in cosine_scores
+        )
 
         recurrence: dict[str, int] = {}
         for source_tokens in document_tokens:
@@ -2333,15 +2846,9 @@ class TranscriptBank:
         recurring_opening_terms = sorted(
             token for token in opening_tokens if recurrence.get(token, 0) >= 2
         )
-        human_experience_terms = {
-            "alone", "anxious", "anxiety", "burned", "burnout", "burnt", "care",
-            "exhausted", "fear", "feel", "feeling", "frustrated", "hard", "hate",
-            "overwhelmed", "pressure", "quit", "struggle", "stuck", "tired",
-            "trying", "worry", "worse",
-        }
         recurring_human_opening_terms = sorted(
             token for token in opening_tokens
-            if token in human_experience_terms and recurrence.get(token, 0) >= 2
+            if token in HUMAN_EXPERIENCE_WORDS and recurrence.get(token, 0) >= 2
         )
         lowered_script = script_text.lower()
         pipeline_meta_phrases = (
@@ -2362,6 +2869,7 @@ class TranscriptBank:
             )
 
         checks = {
+            "cohort_manifest_binding_valid": manifest_binding_valid,
             "cohort_decision_pass": (
                 manifest.get("decision") == "PASS"
                 and cohort_audit.get("decision") == "PASS"
@@ -2380,6 +2888,9 @@ class TranscriptBank:
             "audience_facing_not_pipeline_meta": not pipeline_meta_matches,
         }
         weights = {
+            # Binding is a hard requirement below.  It carries no additive score
+            # so the existing, calibrated transcript-evidence score is unchanged.
+            "cohort_manifest_binding_valid": 0,
             "cohort_decision_pass": 10,
             "cohort_minimum_members": 5,
             "cohort_minimum_creators": 5,
@@ -2397,6 +2908,7 @@ class TranscriptBank:
         # reserved for audited retention/comment evidence from this exact script.
         score = min(85.0, float(raw_score))
         hard_requirements = (
+            "cohort_manifest_binding_valid",
             "cohort_decision_pass",
             "all_artifact_hashes_verified",
             "stated_source_claim_matches_cohort",
@@ -2412,17 +2924,30 @@ class TranscriptBank:
         decision = "PASS_PREDICTED_RELATABILITY" if passed else "REJECT_NOT_RELATABLE"
         created_at = utc_now()
         script_hash = canonical_sha256({"script_id": script_id, "text": script_text})
-        manifest_hash = canonical_sha256(manifest)
+        manifest_hash = actual_manifest_hash
+        manifest_binding = {
+            "contract": "immutable_brief_cohort_manifest_binding_v1",
+            "expected_cohort_id": expected_cohort_id,
+            "actual_cohort_id": actual_cohort_id,
+            "cohort_id_matches": cohort_id_matches,
+            "expected_cohort_manifest_sha256": expected_manifest_hash,
+            "actual_cohort_manifest_sha256": actual_manifest_hash,
+            "cohort_manifest_sha256_matches": manifest_hash_matches,
+            "manifest_payload_is_object": manifest_payload_is_object,
+            "manifest_load_error": manifest_load_error,
+            "binding_valid": manifest_binding_valid,
+        }
         findings = {
-            "contract": "performance_transcript_script_audit_v1",
+            "contract": "performance_transcript_script_audit_v3",
             "measurement_kind": "prediction_from_source_transcripts",
             "actual_audience_relatability_measured": False,
             "score_cap_without_post_publication_outcomes": 85,
             "checks": checks,
             "failures": [name for name, passed in checks.items() if not passed],
             "hard_requirements": list(hard_requirements),
+            "cohort_manifest_binding": manifest_binding,
             "cohort": {
-                "cohort_id": manifest.get("cohort_id"),
+                "cohort_id": actual_cohort_id,
                 "member_count": aggregate.get("member_count"),
                 "creator_count": aggregate.get("creator_count"),
                 "total_views": aggregate.get("total_views"),
@@ -2431,17 +2956,31 @@ class TranscriptBank:
             "script_vocabulary_overlap": round(script_overlap, 6),
             "per_source_tfidf_cosine": [round(value, 6) for value in cosine_scores],
             "supported_source_count": supported_sources,
+            "minimum_source_tfidf_cosine": MIN_SOURCE_TFIDF_COSINE,
             "recurring_opening_terms": recurring_opening_terms,
             "recurring_human_experience_opening_terms": recurring_human_opening_terms,
             "pipeline_meta_phrases_in_script": pipeline_meta_matches,
             "artifact_integrity_failures": integrity_failures,
+            "artifact_integrity_basis": (
+                "acquisition-time audio/transcript hashes plus a canonical "
+                "acquisition payload snapshot; the SQLite transcript is inserted "
+                "into that exact serialization and rehashed without reading the "
+                "removable volume"
+            ),
+            "fresh_removable_volume_rehash_performed": False,
+            "artifact_integrity_attestations": integrity_attestations,
             "audited_at": created_at,
         }
         audit_input = {
             "script_id": script_id,
             "script_sha256": script_hash,
-            "cohort_id": manifest.get("cohort_id"),
+            "cohort_id": expected_cohort_id,
+            "expected_cohort_id": expected_cohort_id,
+            "actual_cohort_id": actual_cohort_id,
             "cohort_manifest_sha256": manifest_hash,
+            "expected_cohort_manifest_sha256": expected_manifest_hash,
+            "actual_cohort_manifest_sha256": actual_manifest_hash,
+            "cohort_manifest_binding_valid": manifest_binding_valid,
             "decision": decision,
             "score": score,
             "findings": findings,
@@ -2463,7 +3002,7 @@ class TranscriptBank:
                 ON CONFLICT(audit_id) DO NOTHING
                 """,
                 (
-                    audit_id, script_id, str(manifest.get("cohort_id") or ""), decision,
+                    audit_id, script_id, expected_cohort_id, decision,
                     score, script_hash, manifest_hash, json.dumps(findings, sort_keys=True),
                     str(receipt_path), created_at,
                 ),

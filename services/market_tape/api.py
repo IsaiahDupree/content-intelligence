@@ -6,6 +6,7 @@ import hmac
 import os
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, request
@@ -17,13 +18,15 @@ from .full_pipeline import run_full_pipeline
 from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
 from .script_demand import ScriptLanguageDemandWorker
-from .store import MarketTapeStore
+from .store import MarketTapeStore, ScriptLanguageDemandClaimConflict
 from .sinks import SupabaseSink
 
 
 def register_market_tape_routes(
     app: Flask,
     config: MarketTapeConfig | None = None,
+    *,
+    transcript_storage_root: str | Path | None = None,
 ) -> MarketTapeStore:
     resolved = config or MarketTapeConfig.from_environment()
     store = MarketTapeStore(resolved)
@@ -202,6 +205,8 @@ def register_market_tape_routes(
                     "method": "POST",
                     "path": "/api/market-tape/script-language-demands/run-next",
                     "effect": "one_claim_one_bounded_cycle_no_same_call_retry",
+                    "optional": ["expected_demand_id", "lease_seconds"],
+                    "atomic_expected_demand_binding": True,
                 },
             },
         })
@@ -258,11 +263,22 @@ def register_market_tape_routes(
         lease_seconds = _limit(
             body.get("lease_seconds"), 7200, maximum=86400
         )
-        return run_exclusive(
-            lambda: ScriptLanguageDemandWorker(resolved, store).run_next(
-                lease_seconds=lease_seconds
-            )
+        expected_demand_id = " ".join(
+            str(body.get("expected_demand_id") or "").split()
         )
+        try:
+            return run_exclusive(
+                lambda: ScriptLanguageDemandWorker(
+                    resolved,
+                    store,
+                    transcript_storage_root=transcript_storage_root,
+                ).run_next(
+                    lease_seconds=lease_seconds,
+                    expected_demand_id=expected_demand_id or None,
+                )
+            )
+        except ScriptLanguageDemandClaimConflict as exc:
+            return jsonify(exc.payload()), 409
 
     @app.post("/api/market-tape/cycles")
     def market_tape_cycle():
@@ -321,6 +337,7 @@ def register_market_tape_routes(
             topic=topic,
             transcript_trend_ids=trend_ids,
             performance_discovery=performance_discovery,
+            transcript_storage_root=transcript_storage_root,
         ))
 
     @app.post("/api/market-tape/bootstrap-local")

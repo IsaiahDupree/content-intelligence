@@ -372,7 +372,7 @@ CIOS orchestrates these 6 external systems:
 
 Loopback-only Flask app (`services/content_quality/`), launchd
 `com.isaiah.content-quality.api`. Evidence-first script generation and the
-four render gates. Full agent-facing reference, including the
+six render gates. Full agent-facing reference, including the
 narrative-coherence gate (owner directive 2026-08-22) and the complete
 receipt → generate → gates → handoff pathway with reject codes:
 **[docs/NARRATIVE-COHERENCE.md](docs/NARRATIVE-COHERENCE.md)**
@@ -385,7 +385,7 @@ receipt → generate → gates → handoff pathway with reject codes:
 | `/api/narrative-coherence/audit` | ✅ NarrativeCoherenceService | `services/content_quality/narrative_coherence.py` |
 | `/api/relatability/script-audit` | ✅ RelatabilityService | `services/content_quality/engine.py` |
 | `/api/attention/script-audit`, `/video-preflight` | ✅ AttentionService | `services/content_quality/engine.py` |
-| `/api/scripts/{id}` | ✅ gates summary (`ready_for_render` needs 4 PASSes) | `services/content_quality/engine.py` |
+| `/api/scripts/{id}` | ✅ gates summary (`ready_for_render` needs six current hash-bound decisions) | `services/content_quality/engine.py` |
 | `/api/script-intelligence/briefs` | ✅ Immutable Market Tape → verified-language brief | `services/content_quality/script_intelligence.py` |
 | `/api/script-intelligence/generate-and-audit` | ✅ Brief-bound script + all pre-render gates | `services/content_quality/script_intelligence.py` |
 | `/api/script-intelligence/run` | ✅ One-call brief → script → audit, or evidence demand | `services/content_quality/api.py` |
@@ -406,7 +406,15 @@ the Passport volume; runtime state is never read from Markdown.
 | `POST /api/market-tape/script-language-demands` | Idempotently enqueue a missing-language cohort request |
 | `GET /api/market-tape/script-language-demands` | Bounded demand status/lineage list |
 | `GET /api/market-tape/script-language-demands/{id}` | One demand and its append-only event history |
-| `POST /api/market-tape/script-language-demands/run-next` | Claim and execute one bounded acquisition cycle; never loops |
+| `POST /api/market-tape/script-language-demands/run-next` | Claim and execute one bounded acquisition cycle; optional `expected_demand_id` is checked atomically and returns 409 without mutation on mismatch; never loops |
+
+Demand execution is frontier-bounded across every generation of the same
+semantic request. A refreshed snapshot can create a new generation, but its
+worker inherits the terminal query history and will not spend another provider
+attempt on a query already tried by that semantic lineage for the same exact
+platform scope. A deliberately broader platform scope may retry the query.
+Only the newest generation is claimable, one call performs at most one
+acquisition attempt, and no same-call retry or background loop is permitted.
 
 The script brief keeps evidence roles separate: current trend evidence says
 what is timely; verified transcripts show how successful creators phrase it;
@@ -414,6 +422,31 @@ source-bound human moments identify who/what feels relatable; observed hook and
 proof structure informs pacing. Forecast scores are not treated as calibrated
 probabilities, and no script is generated when the language cohort is below its
 minimum evidence gates.
+
+Trend selection uses exact normalized topic-token matches before strength so an
+unrelated high-volume label cannot outrank a directly matching trend. Human
+moments are contiguous, source-exact excerpts of at most 10 words. Their
+deterministic selection score is explicitly not a probability: first/second-
+person lived context, problem/time/work specificity, and complete phrasing rank
+above clipped fragments, promotional CTAs, generic desire language, and numeric
+claims. A separate audience-fit score favors exact customer, software, lead,
+form, meeting, and invoice context for software founders and penalizes job-seeker
+context even when a clipped window omits the off-audience term. The separately
+named AI relatability adjudicator remains a later, independent render gate.
+
+Transcript-cohort similarity requires at least three source transcripts at a
+TF-IDF cosine of `0.05` plus at least 18% supported script vocabulary, recurring
+human language in the opening, verified artifact hashes, creator/view minimums,
+and all other hard gates. The per-source cosine is calibrated for a short script
+against much longer transcripts and is persisted in every audit; it is not an
+audience-outcome probability.
+
+Script briefs support an optional zero-based `variant_index` from 0 through 7,
+defaulting to 0. Sibling variants keep the same cohort ID and evidence hash but
+select different text-distinct human moments already stored from Whisper
+sources. The selector and moment lineage are immutable brief identity inputs.
+Unavailable variants are refused without generated filler or another evidence
+acquisition demand, and every sibling still needs all six render gates.
 
 ### Runtime data and AI boundary
 
@@ -424,9 +457,9 @@ minimum evidence gates.
 | Script brief selection | Immutable trend snapshot, accepted transcript cohort, creator diversity, views, human moments, hooks, and pacing | Yes | None required; insufficient evidence creates a typed acquisition demand instead of a script |
 | Script drafting | Brief-bound recurring vocabulary and abstract structures | Yes | Optional qualitative refinement must remain inside the immutable evidence and originality constraints |
 | Narrative coherence | Script plus evidence receipts and deterministic findings | Yes, with deterministic checks | `gpt-5-nano` supplies the production qualitative judgment when configured; failures are classified and audited |
-| Human relatability | Source-bound moments, cross-creator human terms, and transcript-cohort comparison | Yes | Benefits from qualitative review; today the shared narrative AI gate complements, but does not replace, the deterministic relatability gates |
+| Human relatability | Source-bound moments, cross-creator human terms, and transcript-cohort comparison | Yes, through an explicitly labelled deterministic fallback | A standalone qualitative verdict checks the audience moment, human explanation, and exact source-language overlap; configured AI failures fail closed |
 | Attention and preflight | Hook/proof deadlines, semantic beats, payoff/CTA ordering, and media checks | Yes | AI is optional; observed owned outcomes must outrank model opinion |
-| Retention learning | Owned post/content attribution and measured retention outcomes | No inference is fabricated when absent | AI may interpret measured curves later, but cannot manufacture millisecond drop reasons without provider evidence |
+| Retention learning | Exact content, campaign, offer, platform, and source lineage plus measurement-specific retention curves | Yes for ingestion and descriptive measurement; no causal inference is fabricated | AI may interpret measured curves later, but interpretations remain hypotheses and cannot manufacture millisecond drop reasons without causal evidence |
 
 Agent access is through the two authenticated catalogs and typed bounded
 operations above. Agents never receive arbitrary SQL execution, and databases—not

@@ -25,6 +25,15 @@ AGENT_ENDPOINTS = (
         "/api/script-intelligence/run",
         {"topic": "AI automation", "audience": "software founders"},
     ),
+    (
+        "POST",
+        "/api/relatability/qualitative-audit",
+        {
+            "text": "You feel stuck after another launch.",
+            "audience": "software founders",
+            "source_receipt_ids": [],
+        },
+    ),
 )
 
 
@@ -105,3 +114,23 @@ def test_successful_agent_reads_append_hash_only_query_audits(tmp_path):
     assert {row[4] for row in rows} == {"success"}
     assert all(len(row[2]) == 64 and len(row[3]) == 64 for row in rows)
     assert all(CONTROL_TOKEN not in str(row) for row in rows)
+
+
+def test_invalid_qualitative_audit_gets_an_agent_receipt(tmp_path):
+    app = _production_app(tmp_path)
+    client = app.test_client()
+    response = client.post(
+        "/api/relatability/qualitative-audit",
+        json={"audience": "software founders", "source_receipt_ids": []},
+        headers={"Authorization": f"Bearer {CONTROL_TOKEN}"},
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["code"] == "INVALID_REQUEST"
+    assert len(body["agent_query"]["response_sha256"]) == 64
+    database_path = app.extensions["content_quality_engine"].store.path
+    assert database_path.exists()
+    assert app.extensions["content_quality_engine"].store.counts()[
+        "cq_agent_queries"
+    ] == 1

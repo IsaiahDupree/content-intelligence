@@ -45,6 +45,8 @@ def main() -> int:
     )
     parser.add_argument("--script-id", required=True)
     parser.add_argument("--cohort-manifest", type=Path, required=True)
+    parser.add_argument("--expected-cohort-id", required=True)
+    parser.add_argument("--expected-cohort-manifest-sha256", required=True)
     parser.add_argument("--quality-db", type=Path, default=DEFAULT_QUALITY)
     parser.add_argument("--tape", type=Path, default=DEFAULT_TAPE)
     parser.add_argument("--storage-root", type=Path, default=DEFAULT_STORAGE)
@@ -61,6 +63,10 @@ def main() -> int:
         script_id=args.script_id,
         script_text=str(script.get("text") or ""),
         cohort_manifest_path=args.cohort_manifest,
+        expected_cohort_id=args.expected_cohort_id,
+        expected_cohort_manifest_sha256=(
+            args.expected_cohort_manifest_sha256
+        ),
     )
     gate_decision = (
         "PASS" if evidence_audit["decision"] == "PASS_PREDICTED_RELATABILITY"

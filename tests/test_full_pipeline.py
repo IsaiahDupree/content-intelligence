@@ -207,13 +207,19 @@ class TestFullPipeline:
         assert result["fully_vetted_transcript_ids"] == []
         assert result["state"] == "failed"
 
-    def test_api_route_chains_both_stages_and_is_auth_gated(self, market_config, monkeypatch):
+    def test_api_route_chains_both_stages_and_is_auth_gated(
+        self, market_config, monkeypatch, tmp_path
+    ):
         """The Flask route wires the real orchestrator, honors the loopback/
         token auth gate every other market-tape write route uses, and does
         not accept an invalid discovery_mode."""
         config = replace(market_config, platforms=[])
         app = Flask(__name__)
-        register_market_tape_routes(app, config)
+        register_market_tape_routes(
+            app,
+            config,
+            transcript_storage_root=tmp_path / "transcript-bank",
+        )
         client = app.test_client()
 
         bad_mode = client.post(

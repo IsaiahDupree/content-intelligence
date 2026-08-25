@@ -36,10 +36,10 @@ launchctl enable "gui/$(id -u)/$LABEL"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 ready=false
-# A first integrity sweep over the multi-GB Market Tape has measured 50-60s.
-# Keep this bounded, but do not declare a healthy process failed at 30s while
-# its single background sweep is still producing the first honest snapshot.
-for _attempt in {1..90}; do
+# A cold first integrity sweep over the multi-GB Market Tape has measured up to
+# 110s. Keep installation bounded while avoiding a false failure just before
+# the first honest health snapshot becomes available.
+for _attempt in {1..120}; do
   if /usr/bin/curl --fail --silent --max-time 2 \
     http://127.0.0.1:6010/health >/dev/null; then
     ready=true

@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from .ai_relatability import NON_AI_PASS_DECISION
 from .contracts import (
     ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
     SCRIPT_INTELLIGENCE_BRIEF_CONTRACT,
@@ -38,20 +39,35 @@ UTC = timezone.utc
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
 STOP_WORDS = {
     "about", "after", "again", "also", "because", "been", "before", "being",
-    "could", "does", "doing", "from", "have", "here", "into", "just", "more",
-    "most", "only", "other", "over", "should", "some", "than", "that", "their",
+    "can", "could", "did", "does", "doing", "ever", "from", "have", "here",
+    "into", "just", "know", "look", "more", "most", "one", "only", "other",
+    "over", "should", "some", "than", "that", "their",
     "them", "then", "there", "these", "they", "this", "those", "through", "very",
     "want", "what", "when", "where", "which", "while", "with", "would", "your",
 }
 HUMAN_TERMS = {
     "alone", "anxious", "anxiety", "burned", "burnout", "burnt", "care",
-    "exhausted", "fear", "feel", "feeling", "frustrated", "hard", "hate",
-    "hopeless", "overwhelmed", "pressure", "quit", "struggle", "struggling",
-    "stuck", "tired", "trying", "worry", "worse",
+    "challenge", "challenges", "client", "clients", "customer", "customers",
+    "daily", "deadline", "deadlines", "difficult", "email", "emails",
+    "exhausted", "fail", "failed", "failing", "fear", "feel", "feeling",
+    "frustrated", "hard", "hate", "hopeless", "hour", "hours", "issue",
+    "form", "forms", "invoice", "invoices", "issues", "job", "jobs",
+    "late", "lead", "leads",
+    "meeting", "meetings", "minute", "minutes", "morning", "mornings",
+    "must", "need", "needed", "needs",
+    "night", "nights", "overwhelmed", "pressure", "problem", "problems",
+    "quit", "scattered", "solution", "solutions", "struggle", "struggling",
+    "quote", "quotes", "sales", "stuck", "support", "task", "tasks", "team",
+    "teams", "time", "tired", "trying", "week",
+    "weeks", "wish", "work", "working",
+    "worry", "worse",
 }
 ACTIONABLE_STATES = {"discovering", "emerging", "breakout", "recurring"}
-TREND_SELECTION_CONTRACT = "script_intelligence_trend_selection_v2"
+TREND_SELECTION_CONTRACT = "script_intelligence_trend_selection_v3"
 CANDIDATE_ASSESSMENT_CONTRACT = "script_intelligence_trend_candidate_assessment_v1"
+SCRIPT_VARIANT_SELECTION_CONTRACT = "source_bound_human_moment_variant_v1"
+SCRIPT_GENERATION_CONTRACT = "evidence_bound_category_script_v9"
+MAX_SCRIPT_VARIANTS = 8
 
 
 def utc_now() -> str:
@@ -105,6 +121,7 @@ class ScriptIntelligenceService:
         audience: Any,
         scripts: Any,
         relatability: Any,
+        ai_relatability: Any,
         attention: Any,
         transcript_storage_root: str | Path,
         demand_enqueuer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -115,9 +132,43 @@ class ScriptIntelligenceService:
         self.audience = audience
         self.scripts = scripts
         self.relatability = relatability
+        self.ai_relatability = ai_relatability
         self.attention = attention
         self.transcript_storage_root = Path(transcript_storage_root).expanduser()
         self.demand_enqueuer = demand_enqueuer
+
+    @staticmethod
+    def _variant_index(payload: dict[str, Any]) -> int:
+        """Return a strict, bounded zero-based source-moment selector."""
+
+        if "variant_index" not in payload:
+            return 0
+        value = payload.get("variant_index")
+        if type(value) is not int:
+            raise ValueError("variant_index must be a JSON integer")
+        if value < 0 or value >= MAX_SCRIPT_VARIANTS:
+            raise ValueError(
+                f"variant_index must be between 0 and {MAX_SCRIPT_VARIANTS - 1}"
+            )
+        return value
+
+    @staticmethod
+    def _distinct_source_moments(
+        moments: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep only moments that can produce text-distinct source-bound scripts."""
+
+        distinct: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for moment in moments:
+            situation = " ".join(_words(str(moment.get("situation") or ""))).casefold()
+            stakes = " ".join(_words(str(moment.get("stakes") or ""))).casefold()
+            key = (situation, stakes)
+            if not all(key) or key in seen:
+                continue
+            seen.add(key)
+            distinct.append(dict(moment))
+        return distinct
 
     def readiness(self) -> dict[str, Any]:
         if not self.tape.path.is_file():
@@ -203,16 +254,50 @@ class ScriptIntelligenceService:
         with closing(self.tape.connect()) as connection:
             rows = connection.execute(
                 """
-                WITH latest_signal AS (
+                WITH latest_signal_time AS (
+                    SELECT observation.trend_id,
+                           MAX(observation.observed_at) AS observed_at
+                    FROM mt_trend_observations observation
+                    WHERE observation.observation_quality_contract=?
+                    GROUP BY observation.trend_id
+                ),
+                latest_signal AS (
+                    SELECT observation.*
+                    FROM mt_trend_observations observation
+                    JOIN latest_signal_time latest
+                      ON latest.trend_id=observation.trend_id
+                     AND latest.observed_at=observation.observed_at
+                    WHERE observation.trend_observation_id=(
+                        SELECT MAX(tied.trend_observation_id)
+                        FROM mt_trend_observations tied
+                        WHERE tied.trend_id=observation.trend_id
+                          AND tied.observed_at=observation.observed_at
+                          AND tied.observation_quality_contract=
+                              observation.observation_quality_contract
+                    )
+                ),
+                accepted_evidence AS MATERIALIZED (
+                    SELECT evidence.*
+                    FROM mt_accepted_observation_evidence evidence
+                    LEFT JOIN mt_observation_quality_flags quality
+                      ON quality.observation_id=evidence.observation_id
+                    WHERE evidence.contract=?
+                      AND evidence.evidence_scope='full'
+                      AND quality.observation_id IS NULL
+                ),
+                latest_accepted_lineage AS (
                     SELECT ranked.* FROM (
-                        SELECT observation.*,
+                        SELECT lineage.trend_id, lineage.video_id,
+                               lineage.observation_id, lineage.linked_at,
                                ROW_NUMBER() OVER (
-                                   PARTITION BY observation.trend_id
-                                   ORDER BY observation.observed_at DESC,
-                                            observation.trend_observation_id DESC
+                                   PARTITION BY lineage.trend_id, lineage.video_id
+                                   ORDER BY lineage.linked_at DESC,
+                                            lineage.observation_id DESC
                                ) AS row_number
-                        FROM mt_trend_observations observation
-                        WHERE observation.observation_quality_contract=?
+                        FROM mt_trend_membership_lineage lineage
+                        JOIN accepted_evidence accepted
+                          ON accepted.observation_id=lineage.observation_id
+                        WHERE lineage.contract=?
                     ) ranked WHERE ranked.row_number=1
                 )
                 SELECT trend.trend_id, trend.trend_type, trend.canonical_key,
@@ -238,26 +323,16 @@ class ScriptIntelligenceService:
                         WHERE counted.video_id=video.video_id) AS observation_count
                 FROM mt_trends trend
                 JOIN latest_signal signal ON signal.trend_id=trend.trend_id
-                JOIN mt_accepted_trend_memberships_v1 membership
+                JOIN mt_trend_memberships membership
                   ON membership.trend_id=trend.trend_id
-                JOIN mt_trend_membership_lineage lineage
+                JOIN latest_accepted_lineage lineage
                   ON lineage.trend_id=membership.trend_id
                  AND lineage.video_id=membership.video_id
-                 AND lineage.observation_id=(
-                     SELECT current.observation_id
-                     FROM mt_trend_membership_lineage current
-                     JOIN mt_accepted_full_evidence_v1 current_evidence
-                       ON current_evidence.observation_id=current.observation_id
-                     WHERE current.trend_id=membership.trend_id
-                       AND current.video_id=membership.video_id
-                       AND current.contract=?
-                     ORDER BY current.linked_at DESC, current.observation_id DESC
-                     LIMIT 1
-                 )
-                JOIN mt_accepted_full_evidence_v1 evidence
+                JOIN accepted_evidence evidence
                   ON evidence.observation_id=lineage.observation_id
-                JOIN mt_accepted_metric_observations_v1 metric
+                JOIN mt_market_observations metric
                   ON metric.observation_id=evidence.observation_id
+                 AND metric.source_confidence > 0
                 JOIN mt_videos video ON video.video_id=membership.video_id
                 WHERE lower(signal.state) IN ('discovering','emerging','breakout','recurring')
                 ORDER BY signal.trend_strength DESC, signal.videos_total DESC,
@@ -266,6 +341,7 @@ class ScriptIntelligenceService:
                 """,
                 (
                     TREND_OBSERVATION_QUALITY_CONTRACT,
+                    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
                     ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
                 ),
             ).fetchall()
@@ -313,19 +389,38 @@ class ScriptIntelligenceService:
         requested = set(_terms(topic))
         candidates: list[dict[str, Any]] = []
         for group in grouped.values():
-            corpus = " ".join([
+            label_corpus = " ".join([
                 str(group["display_name"] or ""),
                 str(group["canonical_key"] or ""),
+            ])
+            member_corpus = " ".join([
                 *[
                     " ".join(str(member.get(field) or "") for field in (
                         "title", "caption", "description",
                     ))
                     for member in group["members"]
                 ],
-            ]).lower()
-            group["topic_matches"] = sorted(term for term in requested if term in corpus)
+            ])
+            label_words = {term.casefold() for term in _words(label_corpus)}
+            corpus_words = label_words | {
+                term.casefold() for term in _words(member_corpus)
+            }
+            group["label_topic_matches"] = sorted(
+                term for term in requested if term in label_words
+            )
+            group["topic_matches"] = sorted(
+                term for term in requested if term in corpus_words
+            )
             if requested and not group["topic_matches"]:
                 continue
+            # A trend whose own immutable label names the requested topic is a
+            # stronger topical relationship than an unrelated label that merely
+            # shares one member video.  Keep both visible, but evaluate the direct
+            # trend first so a globally strong co-occurrence such as "ice cream"
+            # cannot outrank "automation can" for an automation script.
+            group["topic_label_match_priority"] = (
+                0 if not requested or group["label_topic_matches"] else 1
+            )
             trend_type = str(group.get("trend_type") or "").casefold()
             if not requested:
                 topic_affinity_priority = 0
@@ -346,6 +441,7 @@ class ScriptIntelligenceService:
             ).items()))
             candidates.append(group)
         candidates.sort(key=lambda item: (
+            int(item["topic_label_match_priority"]),
             int(item["topic_affinity_priority"]),
             -len(item["topic_matches"]),
             -float(item["signals"]["trend_strength"]),
@@ -372,11 +468,24 @@ class ScriptIntelligenceService:
                 "hashtags_json": member.get("hashtags_json") or "[]",
                 "discovery_queries_json": member.get("discovery_queries_json") or "[]",
             })
+        evidence_times: list[datetime] = []
+        for row in rows:
+            value = str(row.get("observed_at") or "").strip()
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            evidence_times.append(
+                parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+            )
         return rank_keywords(
             rows,
             window_hours=24 * 30,
             min_videos=1,
             limit=20,
+            now=max(evidence_times) if evidence_times else None,
             candidate_mode="all",
         )
 
@@ -395,6 +504,7 @@ class ScriptIntelligenceService:
                 "topic": payload.get("topic"),
                 "audience": payload.get("audience"),
                 "objective": payload.get("objective"),
+                "variant_index": payload.get("variant_index", 0),
             },
             "detail": detail,
             "created_at": utc_now(),
@@ -480,7 +590,7 @@ class ScriptIntelligenceService:
             },
             "acquisition_policy": {
                 "cycles": 1,
-                "platforms": ["youtube"],
+                "platforms": ["youtube", "tiktok", "instagram", "facebook"],
                 "discovery_limit": 50,
                 "transcript_limit": min(
                     10, max(1, 2 * max(transcript_deficit, creator_deficit))
@@ -830,10 +940,21 @@ class ScriptIntelligenceService:
             term for term in recurring_terms if term in HUMAN_TERMS
         ]
         assessment["gates"]["cross_creator_human_language"] = {
+            "contract": "cross_creator_everyday_human_language_v1",
+            "evidence_kind": "non_ai_source_language_recurrence",
             "status": "evaluated",
             "actual": len(recurring_human_terms),
             "minimum": 1,
             "pass": bool(recurring_human_terms),
+            "terms": [
+                {
+                    "term": term,
+                    "distinct_creator_count": len(term_creators[term]),
+                    "creator_ids": sorted(term_creators[term]),
+                }
+                for term in recurring_human_terms
+            ],
+            "ai_relatability_verdict": "not_evaluated",
         }
         if not recurring_human_terms:
             assessment.update({
@@ -872,6 +993,7 @@ class ScriptIntelligenceService:
         audience_name = str(payload.get("audience") or "").strip()
         requested_topic = str(payload.get("topic") or "").strip()
         objective = str(payload.get("objective") or "qualified_attention").strip()
+        variant_index = self._variant_index(payload)
         minimum_transcripts = max(5, min(20, int(payload.get("minimum_transcripts") or 5)))
         if not audience_name:
             raise ValueError("audience is required")
@@ -958,16 +1080,32 @@ class ScriptIntelligenceService:
         structures = selected["structures"]
         proof_seconds = selected["proof_seconds"]
         words_per_second = selected["words_per_second"]
-        selected_moment = dict(moments["moments"][0])
-        second_moment = (
-            moments["moments"][1]["situation"]
-            if len(moments["moments"]) > 1 else selected_moment["situation"]
+        cohort_manifest_path = Path(cohort["manifest_path"]).expanduser().resolve()
+        cohort_manifest_payload = json.loads(
+            cohort_manifest_path.read_text(encoding="utf-8")
         )
-        stakes = _lower_first(str(second_moment).rstrip(".!?"))
-        human_term = recurring_human_terms[0]
+        cohort_manifest_sha256 = canonical_sha256(cohort_manifest_payload)
+        variant_moments = self._distinct_source_moments(moments["moments"])
+        if variant_index >= len(variant_moments):
+            return self._record_failed_attempt(
+                code="SCRIPT_VARIANT_INDEX_NOT_AVAILABLE",
+                payload=payload,
+                detail={
+                    "selection_contract": SCRIPT_VARIANT_SELECTION_CONTRACT,
+                    "requested_variant_index": variant_index,
+                    "available_variant_count": len(variant_moments),
+                    "available_variant_indexes": list(range(len(variant_moments))),
+                    "reason": (
+                        "Only text-distinct, source-bound human moments may become "
+                        "script variants. No generated wording is used to fill a gap."
+                    ),
+                },
+            )
+        selected_moment = variant_moments[variant_index]
+        stakes = str(selected_moment["stakes"])
         claim = (
-            f"When {topic} leaves people {human_term}, reduce the pressure "
-            "before adding another step"
+            f"For {audience_name}, useful {topic} completes one task where the "
+            "work already happens instead of adding another app"
         )
         receipt_ids = [receipt["receipt_id"] for receipt in receipts]
         source_material = {
@@ -983,18 +1121,27 @@ class ScriptIntelligenceService:
             ),
             "keyword_signals": keyword_signals,
             "cohort_id": cohort["cohort_id"],
+            "cohort_manifest_sha256": cohort_manifest_sha256,
         }
         evidence_sha256 = canonical_sha256(source_material)
         created_at = utc_now()
         brief_id = "brief_" + canonical_sha256({
             "contract": SCRIPT_INTELLIGENCE_BRIEF_CONTRACT,
+            "generation_contract": SCRIPT_GENERATION_CONTRACT,
             "audience": audience_name,
             "objective": objective,
             "evidence_sha256": evidence_sha256,
+            "variant_selection_contract": SCRIPT_VARIANT_SELECTION_CONTRACT,
+            "variant_index": variant_index,
+            "source_moment_id": selected_moment["moment_id"],
+            "stakes_source_moment_id": selected_moment[
+                "stakes_source_moment_id"
+            ],
         })[:24]
         brief = {
             "brief_id": brief_id,
             "contract": SCRIPT_INTELLIGENCE_BRIEF_CONTRACT,
+            "generation_contract": SCRIPT_GENERATION_CONTRACT,
             "status": "ready",
             "topic": topic,
             "audience": audience_name,
@@ -1021,8 +1168,9 @@ class ScriptIntelligenceService:
                     "trend_id", "trend_type", "canonical_key", "display_name",
                     "state", "observed_at", "rank", "ranking_contract",
                     "score_is_probability", "prediction", "signals", "evidence",
-                    "platform_distribution", "topic_matches", "topic_affinity",
-                    "topic_affinity_priority",
+                    "platform_distribution", "topic_matches",
+                    "label_topic_matches", "topic_label_match_priority",
+                    "topic_affinity", "topic_affinity_priority",
                 )
             },
             "keywords": keyword_signals,
@@ -1030,8 +1178,8 @@ class ScriptIntelligenceService:
                 "query": language_query,
                 "cohort_id": cohort["cohort_id"],
                 "cohort_contract": cohort["audit"]["contract"],
-                "cohort_manifest_path": cohort["manifest_path"],
-                "cohort_manifest_sha256": canonical_sha256(cohort),
+                "cohort_manifest_path": str(cohort_manifest_path),
+                "cohort_manifest_sha256": cohort_manifest_sha256,
                 "aggregate_metrics": cohort["aggregate_metrics"],
                 "recurring_terms": recurring_terms[:30],
                 "recurring_human_terms": recurring_human_terms[:10],
@@ -1054,6 +1202,13 @@ class ScriptIntelligenceService:
                 "selected_moment": selected_moment,
                 "moment_receipt_id": moments["receipt"]["receipt_id"],
                 "source_bound": True,
+                "variant_selection": {
+                    "contract": SCRIPT_VARIANT_SELECTION_CONTRACT,
+                    "variant_index": variant_index,
+                    "available_variant_count": len(variant_moments),
+                    "selection_basis": "distinct_stored_source_moment_text",
+                    "generated_fillers_allowed": False,
+                },
             },
             "pacing": {
                 "hook_deadline_seconds": 3.5,
@@ -1068,13 +1223,13 @@ class ScriptIntelligenceService:
                 "topic": topic,
                 "audience": audience_name,
                 "objective": objective,
+                "variant_index": variant_index,
+                "variant_selection_contract": SCRIPT_VARIANT_SELECTION_CONTRACT,
+                "generation_contract": SCRIPT_GENERATION_CONTRACT,
                 "claim": claim,
                 "human_moment": {
-                    "moment_id": selected_moment["moment_id"],
-                    "situation": selected_moment["situation"],
-                    "stakes": stakes,
-                    "source_transcript_id": selected_moment["source_transcript_id"],
-                    "source_observation_key": selected_moment["source_observation_key"],
+                    **selected_moment,
+                    "source_moment_receipt_id": moments["receipt"]["receipt_id"],
                 },
                 "receipt_ids": receipt_ids,
             },
@@ -1153,6 +1308,7 @@ class ScriptIntelligenceService:
             return {**generated, "workflow_id": workflow_id, "brief_id": brief_id}
 
         relatability = self.relatability.audit(generated)
+        qualitative_relatability = self.ai_relatability.audit(generated)
         attention = self.attention.script_audit(generated)
         preflight = self.attention.video_preflight(generated)
 
@@ -1163,6 +1319,10 @@ class ScriptIntelligenceService:
             script_id=generated["script_id"],
             script_text=generated["text"],
             cohort_manifest_path=brief["language"]["cohort_manifest_path"],
+            expected_cohort_id=brief["language"]["cohort_id"],
+            expected_cohort_manifest_sha256=brief["language"][
+                "cohort_manifest_sha256"
+            ],
         )
         cohort_pass = cohort_audit.get("decision") == "PASS_PREDICTED_RELATABILITY"
         cohort_quality_audit = self.store.put_audit(
@@ -1172,15 +1332,36 @@ class ScriptIntelligenceService:
             float(cohort_audit.get("score") or 0.0),
             {
                 "cohort_id": brief["language"]["cohort_id"],
+                "expected_cohort_id": cohort_audit.get("expected_cohort_id"),
+                "actual_cohort_id": cohort_audit.get("actual_cohort_id"),
                 "market_tape_audit_id": cohort_audit.get("audit_id"),
                 "script_sha256": cohort_audit.get("script_sha256"),
                 "cohort_manifest_sha256": cohort_audit.get("cohort_manifest_sha256"),
+                "expected_cohort_manifest_sha256": cohort_audit.get(
+                    "expected_cohort_manifest_sha256"
+                ),
+                "actual_cohort_manifest_sha256": cohort_audit.get(
+                    "actual_cohort_manifest_sha256"
+                ),
+                "cohort_manifest_binding_valid": cohort_audit.get(
+                    "cohort_manifest_binding_valid"
+                ),
                 "findings": cohort_audit.get("findings") or {},
+                "input_binding": {
+                    "contract": "stored_script_audit_binding_v1",
+                    "stored_script_bound": True,
+                    "script_id": generated["script_id"],
+                    "script_sha256": self.store.script_audit_sha256(generated),
+                },
             },
         )
         decisions = {
             "narrative": generated.get("narrative_coherence", {}).get("decision") == "PASS",
             "relatability": relatability["decision"] == "PASS",
+            "qualitative_relatability": (
+                qualitative_relatability["decision"]
+                in {"PASS", NON_AI_PASS_DECISION}
+            ),
             "cohort_integrity": cohort_pass,
             "attention": attention["decision"] == "PASS",
             "video_preflight": preflight["decision"] == "PASS",
@@ -1191,7 +1372,8 @@ class ScriptIntelligenceService:
             "script_id": generated["script_id"],
             "request_sha256": request_sha256,
             "audit_ids": [
-                relatability["audit_id"], attention["audit_id"], preflight["audit_id"],
+                relatability["audit_id"], qualitative_relatability["audit_id"],
+                attention["audit_id"], preflight["audit_id"],
                 cohort_quality_audit["audit_id"],
             ],
         })[:24]
@@ -1201,6 +1383,9 @@ class ScriptIntelligenceService:
                 generated["script_id"]
             )["latest_audits"].get("narrative_coherence", {}).get("audit_id"),
             "relatability_audit_id": relatability["audit_id"],
+            "qualitative_relatability_audit_id": qualitative_relatability[
+                "audit_id"
+            ],
             "cohort_relatability_audit_id": cohort_quality_audit["audit_id"],
             "attention_audit_id": attention["audit_id"],
             "video_preflight_audit_id": preflight["audit_id"],
@@ -1213,6 +1398,7 @@ class ScriptIntelligenceService:
             "decisions": decisions,
             "audits": {
                 "relatability": relatability,
+                "qualitative_relatability": qualitative_relatability,
                 "transcript_cohort_relatability": cohort_quality_audit,
                 "attention": attention,
                 "video_preflight": preflight,

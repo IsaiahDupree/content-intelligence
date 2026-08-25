@@ -15,6 +15,27 @@ if [[ -f "$RUNTIME_ROOT/.env.content-quality" ]]; then
 fi
 print -u2 "content-quality-start: runtime-config"
 
+if [[ -n "${CONTENT_QUALITY_CREDENTIAL_ENV_FILE:-}" && -f "$CONTENT_QUALITY_CREDENTIAL_ENV_FILE" ]]; then
+  OPENAI_API_KEY="$(/opt/homebrew/bin/python3 - "$CONTENT_QUALITY_CREDENTIAL_ENV_FILE" <<'PY'
+from pathlib import Path
+from dotenv import dotenv_values
+import sys
+
+value = str(
+    dotenv_values(Path(sys.argv[1]).expanduser()).get("OPENAI_API_KEY") or ""
+).strip()
+if value and not value.startswith("__"):
+    print(value, end="")
+PY
+)"
+  if [[ -n "$OPENAI_API_KEY" ]]; then
+    export OPENAI_API_KEY
+  else
+    unset OPENAI_API_KEY
+  fi
+fi
+print -u2 "content-quality-start: credential-config"
+
 if [[ -f "$CONTENT_INTELLIGENCE_RUNTIME/.env.market-tape" ]]; then
   set -a
   source "$CONTENT_INTELLIGENCE_RUNTIME/.env.market-tape"

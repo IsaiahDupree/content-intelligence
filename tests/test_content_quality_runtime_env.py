@@ -56,6 +56,8 @@ def test_runtime_env_references_external_credential_without_copying_it(tmp_path)
     )
     assert parsed["NARRATIVE_COHERENCE_LLM"] == "openai"
     assert parsed["NARRATIVE_JUDGE_MODEL"] == "gpt-5-nano"
+    assert parsed["RELATABILITY_JUDGE"] == "openai"
+    assert parsed["RELATABILITY_JUDGE_MODEL"] == "gpt-5-nano"
     assert "OPENAI_API_KEY" not in rendered
     assert secret not in rendered
     assert secret not in combined_process_output
@@ -90,3 +92,31 @@ def test_runtime_env_preserves_generated_control_token_on_rebuild(tmp_path):
     assert first_token not in first.stdout + first.stderr
     assert first_token not in second.stdout + second.stderr
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+def test_runtime_env_rejects_scrubbed_openai_credential(tmp_path):
+    credential_path = tmp_path / "provider.env"
+    credential_path.write_text(
+        "OPENAI_API_KEY=__managed_by_external_secret__\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / ".env.content-quality"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(BUILDER),
+            "--output",
+            str(output),
+            "--credential-env",
+            str(credential_path),
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "usable OPENAI_API_KEY" in completed.stderr
+    assert not output.exists()

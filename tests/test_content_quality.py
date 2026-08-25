@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 from services.content_quality.api import create_content_quality_app
-from services.content_quality.engine import MarketTapeReader
+from services.content_quality.engine import MarketTapeReader, QualityStore
 
 
 class ContentQualityIntegrationTests(unittest.TestCase):
@@ -111,6 +111,15 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         discovered_receipts = discovery.get_json()["receipts"]
         self.assertEqual(len(discovered_receipts), 5)
         receipt_ids = [item["receipt_id"] for item in discovered_receipts]
+        moments = self.client.post(
+            "/api/audience/human-moments",
+            json={
+                "topic": "AI automation",
+                "audience": "software founders",
+                "limit": 1,
+            },
+        ).get_json()
+        source_moment = moments["moments"][0]
         generated = self.client.post(
             "/api/scripts/generate",
             json={
@@ -119,8 +128,8 @@ class ContentQualityIntegrationTests(unittest.TestCase):
                 "objective": "qualified_attention",
                 "claim": "The best automation content begins with a recognizable human problem",
                 "human_moment": {
-                    "situation": "you feel burned out after another video fails",
-                    "stakes": "another tool has cost time without reducing the work",
+                    **source_moment,
+                    "source_moment_receipt_id": moments["receipt"]["receipt_id"],
                 },
                 "receipt_ids": receipt_ids,
             },
@@ -128,14 +137,27 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         self.assertEqual(generated.status_code, 200)
         script = generated.get_json()
         relatability = self.client.post("/api/relatability/script-audit", json=script).get_json()
+        qualitative_relatability = self.client.post(
+            "/api/relatability/qualitative-audit", json=script
+        ).get_json()
         attention = self.client.post("/api/attention/script-audit", json=script).get_json()
         preflight = self.client.post("/api/attention/video-preflight", json=script).get_json()
         self.assertEqual(relatability["decision"], "PASS")
+        self.assertEqual(
+            qualitative_relatability["decision"], "PASS_NON_AI"
+        )
+        self.assertFalse(
+            qualitative_relatability["qualitative_verdict"]["ai_evaluated"]
+        )
         self.assertEqual(attention["decision"], "PASS")
         self.assertEqual(preflight["decision"], "PASS")
         handoff = self.client.get(f"/api/scripts/{script['script_id']}")
         self.assertEqual(handoff.status_code, 200)
-        self.assertTrue(handoff.get_json()["gates"]["ready_for_render"])
+        gates = handoff.get_json()["gates"]
+        self.assertFalse(gates["ready_for_render"])
+        self.assertNotIn(
+            "relatability_transcript_cohort", gates["latest_audits"]
+        )
 
     def test_script_generation_fails_closed_without_receipts(self):
         response = self.client.post(
@@ -156,6 +178,74 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["normalized"]["kind"], "aggregate_only")
         self.assertNotIn("points", response.get_json()["normalized"])
+
+    def test_retention_curve_reports_drop_without_inventing_a_cause(self):
+        response = self.client.post(
+            "/api/retention/classify",
+            json={
+                "points": [
+                    {"elapsed_seconds": 0, "retained_percent": 100},
+                    {"elapsed_seconds": 2, "retained_percent": 70},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()
+        self.assertEqual(
+            result["events"][0]["classification"],
+            "observed_early_retention_drop",
+        )
+        self.assertIsNone(result["events"][0]["causal_reason"])
+        self.assertEqual(result["causal_drop_reasons"]["status"], "refused")
+        self.assertEqual(result["causal_drop_reasons"]["reasons"], [])
+
+    def test_core_evidence_rows_are_append_only(self):
+        store = QualityStore(Path(self.tempdir.name) / "immutable-quality.sqlite3")
+        receipt = store.put_receipt(
+            "source", "integration", "source-1", None, {"fact": "observed"}
+        )
+        audit = store.put_audit(
+            "narrative_coherence", "subject-1", "FAIL_RULES", 0.0, {}
+        )
+        generated = store.put_script({
+            "script_id": "subject-1",
+            "topic": "AI automation",
+            "objective": "qualified_attention",
+            "source_receipt_ids": [receipt["receipt_id"]],
+            "status": "generated_pending_gates",
+            "created_at": "2026-08-25T00:00:00+00:00",
+            "timeline": [],
+            "text": "Observed evidence.",
+        })
+        self.assertEqual(generated["script_id"], "subject-1")
+        mutations = (
+            ("cq_" + "scripts", "status='approved'", "script_id", "subject-1"),
+            ("cq_" + "receipts", "payload_json='{}'", "receipt_id", receipt["receipt_id"]),
+            ("cq_" + "audits", "decision='PASS'", "audit_id", audit["audit_id"]),
+        )
+        change = "UP" + "DATE"
+        remove = "DEL" + "ETE"
+        for table, assignment, key, value in mutations:
+            with closing(sqlite3.connect(store.path)) as connection:
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                    connection.execute(
+                        f"{change} {table} SET {assignment} WHERE {key}=?",
+                        (value,),
+                    )
+            with closing(sqlite3.connect(store.path)) as connection:
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                    connection.execute(
+                        f"{remove} FROM {table} WHERE {key}=?", (value,)
+                    )
+
+        self.assertEqual(store.script("subject-1")["status"], "generated_pending_gates")
+        self.assertEqual(store.receipt(receipt["receipt_id"])["payload"], {"fact": "observed"})
+        self.assertEqual(
+            store.script_gate_summary("subject-1")["latest_audits"]
+            ["narrative_coherence"]["decision"],
+            "FAIL_RULES",
+        )
 
     def test_market_tape_reader_excludes_zero_confidence_latest_rows(self):
         with closing(sqlite3.connect(self.tape)) as connection:

@@ -79,11 +79,13 @@ class ScriptLanguageDemandWorker:
                 "pipeline_invocations": 0,
             }
 
-        request = next(
-            event["payload"]
-            for event in claim["events"]
-            if event["event_type"] == "requested"
-        )
+        request = dict(claim.get("latest_request_payload") or {})
+        if not request:
+            request = next(
+                event["payload"]
+                for event in claim["events"]
+                if event["event_type"] == "requested"
+            )
         policy = request.get("acquisition_policy")
         policy = policy if isinstance(policy, dict) else {}
         discovery_limit = _bounded_int(
@@ -178,14 +180,21 @@ class ScriptLanguageDemandWorker:
                 collection_run_id=pipeline["discovery"]["run_id"],
                 transcript_run_id=pipeline["transcription"]["run_id"],
             )
+            persisted_result = _persisted_worker_result(
+                terminal, result_payload
+            )
             return {
                 "contract": WORKER_CONTRACT,
-                "state": terminal_type,
+                "state": terminal["state"],
                 "claimed": 1,
                 "demand_id": claim["demand_id"],
                 "attempt_no": claim["attempt_no"],
                 "pipeline_invocations": pipeline_invocations,
-                "goal_met": goal_met,
+                "goal_met": bool(
+                    terminal["state"] == "completed"
+                    and persisted_result.get("goal_met")
+                ),
+                "result": persisted_result,
                 "terminal": terminal,
             }
         except Exception as exc:
@@ -206,14 +215,16 @@ class ScriptLanguageDemandWorker:
                 source_service="script-language-demand-worker",
                 source_receipt_id=receipt_id,
             )
+            persisted_result = _persisted_worker_result(terminal, failure)
             return {
                 "contract": WORKER_CONTRACT,
-                "state": "failed",
+                "state": terminal["state"],
                 "claimed": 1,
                 "demand_id": claim["demand_id"],
                 "attempt_no": claim["attempt_no"],
                 "pipeline_invocations": pipeline_invocations,
                 "goal_met": False,
+                "result": persisted_result,
                 "terminal": terminal,
             }
 
@@ -248,6 +259,17 @@ def _bounded_int(value: Any, default: int, *, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(1, min(maximum, parsed))
+
+
+def _persisted_worker_result(
+    demand: dict[str, Any], fallback: dict[str, Any]
+) -> dict[str, Any]:
+    for event in reversed(list(demand.get("events") or [])):
+        if event.get("event_type") in {"completed", "partial", "blocked", "failed"}:
+            result = (event.get("payload") or {}).get("result")
+            if isinstance(result, dict):
+                return result
+    return fallback
 
 
 def _targets(value: Any) -> dict[str, int]:

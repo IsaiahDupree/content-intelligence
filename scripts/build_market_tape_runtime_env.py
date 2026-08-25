@@ -91,6 +91,16 @@ def main() -> int:
             data_dir / "market-tape-local-research-state.json"
         ),
         "MARKET_TAPE_PREDICTION_MODEL_DIR": str(data_dir / "market-tape-models"),
+        # New transcript acquisition is latency-sensitive and must not block
+        # the loopback API on an unhealthy removable-volume data path. Passport
+        # remains an export/archive target, never the active artifact store.
+        "MARKET_TAPE_TRANSCRIPT_STORAGE_ROOT": str(
+            Path.home()
+            / "Library/Application Support/ContentQuality/data/transcript-bank"
+        ),
+        # Five-thousand-row REST upserts exceeded the production statement
+        # timeout. Keep every supervised flush intentionally small.
+        "MARKET_TAPE_SUPABASE_SYNC_BATCH_SIZE": "250",
         "MARKET_TAPE_LOCAL_RESEARCH_DIR": str(
             Path.home() / "Library" / "Application Support" / "SafariAutomation" / "market-research-data"
         ),

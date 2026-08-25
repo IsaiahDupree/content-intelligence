@@ -249,10 +249,21 @@ class EnforceLoopTests(unittest.TestCase):
 
     def test_one_shot_audit_persists_receipt(self):
         service = NarrativeCoherenceService(self.store, llm_runner=None)
-        record = service.audit({"timeline": template_timeline(), "evidence_summary": EVIDENCE,
-                                "script_id": "script-x"})
+        self.store.put_script({
+            "script_id": "script-x",
+            "topic": "AI automation",
+            "objective": "qualified_attention",
+            "source_receipt_ids": [],
+            "status": "generated_pending_gates",
+            "created_at": "2026-08-24T00:00:00+00:00",
+            "timeline": template_timeline(),
+            "evidence_summary": EVIDENCE,
+            "text": " ".join(item["text"] for item in template_timeline()),
+        })
+        record = service.audit({"script_id": "script-x"})
         self.assertEqual(record["decision"], "FAIL_RULES")
         self.assertEqual(record["subject_id"], "script-x")
+        self.assertTrue(record["findings"]["input_binding"]["stored_script_bound"])
         latest = self.store.script_gate_summary("script-x")["latest_audits"]
         self.assertIn("narrative_coherence", latest)
 

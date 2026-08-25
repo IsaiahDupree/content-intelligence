@@ -27,8 +27,13 @@ def main() -> int:
         if not credential_path.is_file():
             raise SystemExit(f"credential env does not exist: {credential_path}")
         credential_values = dotenv_values(credential_path)
-        if not str(credential_values.get("OPENAI_API_KEY") or "").strip():
-            raise SystemExit("credential env does not contain OPENAI_API_KEY")
+        openai_key = str(
+            credential_values.get("OPENAI_API_KEY") or ""
+        ).strip()
+        if not openai_key or openai_key.startswith("__"):
+            raise SystemExit(
+                "credential env does not contain a usable OPENAI_API_KEY"
+            )
 
     values = {
         "CONTENT_QUALITY_CONTROL_TOKEN": (
@@ -37,7 +42,17 @@ def main() -> int:
         ),
         "NARRATIVE_COHERENCE_LLM": "openai",
         "NARRATIVE_JUDGE_MODEL": "gpt-5-nano",
-        "TRANSCRIPT_BANK_ROOT": "/Volumes/My Passport/MarketTape/transcript-bank",
+        "RELATABILITY_JUDGE": "openai",
+        "RELATABILITY_JUDGE_MODEL": "gpt-5-nano",
+        "CQ_HEALTH_CACHE_SECONDS": "300",
+        # Content Quality writes small, latency-sensitive cohort manifests here.
+        # Source audio/transcripts keep their immutable absolute Passport paths
+        # in Market Tape; generating a script must not block on removable-volume
+        # metadata writes.
+        "TRANSCRIPT_BANK_ROOT": str(
+            Path.home()
+            / "Library/Application Support/ContentQuality/data/transcript-bank"
+        ),
     }
     if credential_path is not None:
         values["CONTENT_QUALITY_CREDENTIAL_ENV_FILE"] = str(credential_path)

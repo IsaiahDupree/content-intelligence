@@ -60,6 +60,11 @@ def test_market_tape_runtime_env_is_self_contained_and_preserves_credentials(tmp
     assert sibling_secret not in completed.stdout + completed.stderr
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
     assert parsed["MARKET_TAPE_DB_PATH"].endswith("data/market-tape.sqlite3")
+    assert parsed["MARKET_TAPE_TRANSCRIPT_STORAGE_ROOT"] == str(
+        Path.home()
+        / "Library/Application Support/ContentQuality/data/transcript-bank"
+    )
+    assert parsed["MARKET_TAPE_SUPABASE_SYNC_BATCH_SIZE"] == "250"
     control_token = str(parsed["MARKET_TAPE_CONTROL_TOKEN"])
     assert len(control_token) >= 48
     assert control_token not in completed.stdout + completed.stderr

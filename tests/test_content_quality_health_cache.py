@@ -45,7 +45,8 @@ def test_eight_capability_probes_cause_one_sweep(tmp_path):
     calls = _count_sweeps(app)
     client = app.test_client()
     routes = ["/api/audience-intelligence/health", "/api/viral-transcripts/health",
-              "/api/scripts/health", "/api/relatability/health", "/api/attention/health",
+              "/api/scripts/health", "/api/relatability/health",
+              "/api/relatability/qualitative-health", "/api/attention/health",
               "/api/retention/health", "/api/learning/health",
               "/api/narrative-coherence/health"]
     for route in routes:

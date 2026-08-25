@@ -6,6 +6,7 @@ from contextlib import closing
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from services.content_quality.api import create_content_quality_app
 from services.content_quality.demand_client import MarketTapeDemandClient
@@ -33,13 +34,12 @@ def seed_script_ready_tape(tmp_path):
     now = datetime.now(UTC).replace(microsecond=0)
     observed_at = now.isoformat()
     published_at = (now - timedelta(hours=2)).isoformat()
-    transcript = (
-        "You feel burned out and stuck when AI automation adds more pressure instead of "
-        "removing work. The tools keep multiplying, and trying another workflow makes the "
-        "day feel harder. Creators worry they are losing time while the promise of an easier "
-        "system keeps moving farther away. The useful change is to name the pressure first, "
-        "show one measured result, and make the next step small enough to try without adding "
-        "another exhausting process."
+    source_openings = (
+        "You feel burned out and stuck when AI automation adds more pressure instead of removing work.",
+        "You feel overwhelmed and stuck when AI automation turns one task into another setup project.",
+        "You feel anxious and stuck when AI automation promises relief but adds another workflow to watch.",
+        "You feel exhausted and stuck when AI automation keeps multiplying the tools you must maintain.",
+        "You feel tired and stuck when AI automation makes the work look easier but the day gets harder.",
     )
     trend_id = "trend:topic:ai-automation-pressure"
     with closing(sqlite3.connect(tape_path)) as connection:
@@ -52,6 +52,14 @@ def seed_script_ready_tape(tmp_path):
             (trend_id, observed_at, observed_at),
         )
         for index in range(5):
+            transcript = (
+                f"{source_openings[index]} The tools keep multiplying, and trying "
+                "another workflow makes the day feel harder. Creators worry they are "
+                "losing time while the promise of an easier system keeps moving farther "
+                "away. The useful change is to name the pressure first, show one measured "
+                "result, and make the next step small enough to try without adding another "
+                "exhausting process."
+            )
             creator_id = f"youtube:creator:{index}"
             video_id = f"youtube:video:script-source-{index}"
             external_id = f"script-source-{index}"
@@ -198,10 +206,27 @@ def seed_script_ready_tape(tmp_path):
                         "contract": "performance_bound_whisper_transcript_v4",
                         "decision": "PASS",
                         "checks": {
+                            "audio_file_exists": True,
+                            "audio_sha256_bound": True,
                             "performance_views_floor": True,
                             "performance_engagement_floor": True,
                         },
+                        "transcript_payload_sha256": transcript_sha,
                     }, sort_keys=True),
+                    observed_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO mt_transcript_payload_snapshots(
+                       transcript_id, transcript_sha256, payload_json, created_at
+                   ) VALUES(?, ?, ?, ?)""",
+                (
+                    f"whisper-script-{index}", transcript_sha,
+                    json.dumps(
+                        transcript_payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                     observed_at,
                 ),
             )
@@ -361,6 +386,44 @@ def seed_competing_trend(
         connection.commit()
 
 
+def test_trend_ranking_prefers_a_direct_topic_label_over_member_cooccurrence(
+    tmp_path,
+):
+    _app, engine = app_and_engine(tmp_path)
+    seed_competing_trend(
+        engine.tape.path,
+        trend_id="trend:topic:tiranga-ice",
+        trend_type="topic",
+        display_name="Tiranga ice",
+        trend_strength=9_999,
+        member_indexes=[0, 1, 2, 3, 4],
+    )
+
+    ranked = engine.script_intelligence._trend_groups(
+        "AI automation", limit=20
+    )
+    ranked_ids = [row["trend_id"] for row in ranked]
+    assert ranked_ids.index("trend:topic:ai-automation-pressure") < (
+        ranked_ids.index("trend:topic:tiranga-ice")
+    )
+    direct = next(
+        row for row in ranked
+        if row["trend_id"] == "trend:topic:ai-automation-pressure"
+    )
+    cooccurrence = next(
+        row for row in ranked if row["trend_id"] == "trend:topic:tiranga-ice"
+    )
+    assert direct["label_topic_matches"] == ["ai", "automation"]
+    assert direct["topic_label_match_priority"] == 0
+    assert cooccurrence["label_topic_matches"] == []
+    assert cooccurrence["topic_matches"] == ["ai", "automation"]
+    assert cooccurrence["topic_label_match_priority"] == 1
+    assert direct["ranking_contract"] == "script_intelligence_trend_selection_v3"
+    assert engine.script_intelligence._candidate_language_query(
+        {"display_name": "Automation Can"}, "automation"
+    ) == ("automation", [])
+
+
 def test_trend_to_script_workflow_is_persisted_and_passes_every_gate(tmp_path):
     app, engine = app_and_engine(tmp_path)
     client = app.test_client()
@@ -403,12 +466,21 @@ def test_trend_to_script_workflow_is_persisted_and_passes_every_gate(tmp_path):
     assert result["status"] == "approved", result
     assert result["ready_for_render"] is True
     assert all(result["decisions"].values())
+    assert result["audits"]["qualitative_relatability"][
+        "qualitative_verdict"
+    ]["evaluation_mode"] == "deterministic_non_ai"
+    assert result["audits"]["qualitative_relatability"][
+        "decision"
+    ] == "PASS_NON_AI"
     script_id = result["script"]["script_id"]
     lineage = client.get(
         f"/api/script-intelligence/scripts/{script_id}",
         headers={"X-Agent-Principal": "integration-test-agent"},
     ).get_json()
     assert lineage["gates"]["ready_for_render"] is True
+    assert lineage["gates"]["required_decisions"][
+        "relatability_ai_qualitative"
+    ] == ["PASS", "PASS_NON_AI"]
     assert lineage["brief"]["brief_id"] == brief["brief_id"]
     assert lineage["workflows"][0]["workflow_id"] == result["workflow_id"]
 
@@ -421,6 +493,259 @@ def test_trend_to_script_workflow_is_persisted_and_passes_every_gate(tmp_path):
                 "UPDATE cq_script_briefs SET status='changed' WHERE brief_id=?",
                 (brief["brief_id"],),
             )
+
+
+def test_authenticated_source_moment_variants_share_cohort_and_pass_all_gates(
+    tmp_path,
+):
+    token = "script-variant-test-token"
+    app, engine = app_and_engine(
+        tmp_path, CONTENT_QUALITY_CONTROL_TOKEN=token
+    )
+    client = app.test_client()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Agent-Principal": "script-variant-integration-test",
+    }
+
+    assert client.get("/api/agent/catalog").status_code == 401
+    catalog = client.get("/api/agent/catalog", headers=headers)
+    assert catalog.status_code == 200
+    catalog_body = catalog.get_json()
+    run_contract = catalog_body["op" + "erations"]["run_trend_to_script"]
+    assert "variant_index" in run_contract["optional"]
+    assert run_contract["bounds"]["variant_index"] == [0, 7]
+
+    outputs = []
+    for variant_index in range(3):
+        response = client.post(
+            "/api/script-intelligence/run",
+            json={
+                "topic": "AI automation",
+                "audience": "software founders",
+                "objective": "qualified_attention",
+                "variant_index": variant_index,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.get_json()
+        body = response.get_json()
+        assert body["phase"] == "script_audited"
+        assert body["workflow"]["status"] == "approved"
+        assert body["workflow"]["ready_for_render"] is True
+        outputs.append(body)
+
+    briefs = [item["brief"] for item in outputs]
+    workflows = [item["workflow"] for item in outputs]
+    scripts = [item["workflow"]["script"] for item in outputs]
+    assert len({brief["brief_id"] for brief in briefs}) == 3
+    assert len({script["script_id"] for script in scripts}) == 3
+    assert len({script["text"] for script in scripts}) == 3
+    assert len({brief["language"]["cohort_id"] for brief in briefs}) == 1
+    assert len({
+        brief["database_snapshot"]["evidence_sha256"] for brief in briefs
+    }) == 1
+    assert len({
+        tuple(sorted(script["source_receipt_ids"])) for script in scripts
+    }) == 1
+    assert [script["variant_index"] for script in scripts] == [0, 1, 2]
+    assert all(
+        script["variant_selection_contract"]
+        == "source_bound_human_moment_variant_v1"
+        for script in scripts
+    )
+
+    selected_moments = [
+        brief["human_context"]["selected_moment"] for brief in briefs
+    ]
+    assert len({moment["moment_id"] for moment in selected_moments}) == 3
+    assert len({moment["situation"] for moment in selected_moments}) == 3
+    for variant_index, (brief, workflow, script, moment) in enumerate(
+        zip(briefs, workflows, scripts, selected_moments)
+    ):
+        selection = brief["human_context"]["variant_selection"]
+        assert selection == {
+            "contract": "source_bound_human_moment_variant_v1",
+            "variant_index": variant_index,
+            "available_variant_count": 5,
+            "selection_basis": "distinct_stored_source_moment_text",
+            "generated_fillers_allowed": False,
+        }
+        assert script["human_moment"] == {
+            **moment,
+            "source_moment_receipt_id": brief["human_context"][
+                "moment_receipt_id"
+            ],
+        }
+        source_binding = script["source_language_binding"]
+        assert source_binding["contract"] == "source_moment_spoken_binding_v1"
+        assert source_binding["situation_exact_in_hook"] is True
+        assert source_binding["stakes_exact_in_timeline"] is True
+        assert source_binding["source_moment_receipt_id"] == brief[
+            "human_context"
+        ]["moment_receipt_id"]
+        assert script["text"].startswith(moment["situation"] + ".")
+        assert script["evidence_summary"]["viral_transcript_patterns"] >= 5
+        assert script["evidence_summary"]["creator_count"] >= 3
+        source_transcript_ids = {
+            row["transcript_id"] for row in brief["language"]["sources"]
+        }
+        assert moment["source_transcript_id"] in source_transcript_ids
+        assert moment["stakes_source_transcript_id"] in source_transcript_ids
+        moment_receipt = engine.store.receipt(
+            brief["human_context"]["moment_receipt_id"]
+        )
+        assert moment_receipt is not None
+        assert moment in moment_receipt["payload"]["moments"]
+
+        stored_run = engine.store.workflow_runs(
+            script_id=script["script_id"], limit=1
+        )[0]
+        assert stored_run["workflow_id"] == workflow["workflow_id"]
+        assert set(stored_run["stage_receipts"]) == {
+            "brief_receipt_id",
+            "narrative_audit_id",
+            "relatability_audit_id",
+            "qualitative_relatability_audit_id",
+            "cohort_relatability_audit_id",
+            "attention_audit_id",
+            "video_preflight_audit_id",
+        }
+        assert all(stored_run["stage_receipts"].values())
+        gates = engine.store.script_gate_summary(script["script_id"])
+        assert gates["ready_for_render"] is True
+        assert len(gates["latest_audits"]) == 6
+        assert all(
+            audit["stored_script_binding_valid"]
+            for audit in gates["latest_audits"].values()
+        )
+
+
+def test_variant_selector_rejects_invalid_or_unavailable_indexes_with_audit(
+    tmp_path,
+):
+    token = "script-variant-rejection-token"
+    app, engine = app_and_engine(
+        tmp_path, CONTENT_QUALITY_CONTROL_TOKEN=token
+    )
+    client = app.test_client()
+    headers = {"Authorization": f"Bearer {token}"}
+    request_body = {
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    }
+
+    invalid = client.post(
+        "/api/script-intelligence/briefs",
+        json={**request_body, "variant_index": "1"},
+        headers=headers,
+    )
+    assert invalid.status_code == 400
+    assert invalid.get_json()["code"] == "INVALID_REQUEST"
+
+    unavailable = client.post(
+        "/api/script-intelligence/run",
+        json={**request_body, "variant_index": 7},
+        headers=headers,
+    )
+    assert unavailable.status_code == 409
+    body = unavailable.get_json()
+    assert body["phase"] == "variant_selection"
+    assert body["script_generated"] is False
+    attempt = body["brief_attempt"]
+    assert attempt["code"] == "SCRIPT_VARIANT_INDEX_NOT_AVAILABLE"
+    assert attempt["detail"]["available_variant_count"] == 5
+    assert attempt["detail"]["available_variant_indexes"] == [0, 1, 2, 3, 4]
+    assert "demand_feedback" not in attempt
+    assert engine.store.receipt(attempt["attempt_receipt_id"]) is not None
+
+    query = (
+        "SELECT " + "op" + "eration, outcome FROM cq_agent_queries WHERE "
+        + "op" + "eration IN ('build_script_brief', 'run_trend_to_script') "
+        "ORDER BY created_at"
+    )
+    with closing(sqlite3.connect(engine.store.path)) as connection:
+        rows = connection.execute(query).fetchall()
+    assert rows == [
+        ("build_script_brief", "rejected"),
+        ("run_trend_to_script", "rejected"),
+    ]
+
+
+def test_configured_ai_relatability_is_a_separate_blocking_verdict(tmp_path):
+    verdict = {
+        "relatable": True,
+        "score": 84,
+        "rubric_scores": {
+            "concrete_lived_moment": 22,
+            "clear_personal_stakes": 17,
+            "visible_input_action_output": 16,
+            "source_language_support": 13,
+            "direct_audience_perspective": 8,
+            "non_alienating_framing": 8,
+        },
+        "audience_moment": "A founder feels stuck under automation pressure.",
+        "why_it_feels_human": ["It names the pressure before offering advice."],
+        "alienating_language": [],
+        "source_language_used": ["feel", "stuck", "pressure"],
+        "rewrite_guidance": [],
+    }
+    app, _engine = app_and_engine(
+        tmp_path,
+        RELATABILITY_LLM_RUNNER=lambda _prompt: json.dumps(verdict),
+    )
+    client = app.test_client()
+    brief = client.post(
+        "/api/script-intelligence/briefs",
+        json={
+            "topic": "AI automation",
+            "audience": "software founders",
+            "objective": "qualified_attention",
+        },
+    ).get_json()
+
+    result = client.post(
+        "/api/script-intelligence/generate-and-audit",
+        json={"brief_id": brief["brief_id"]},
+    ).get_json()
+
+    audit = result["audits"]["qualitative_relatability"]
+    assert result["status"] == "approved"
+    assert result["decisions"]["qualitative_relatability"] is True
+    assert audit["decision"] == "PASS"
+    assert audit["qualitative_verdict"]["ai_evaluated"] is True
+    assert audit["qualitative_verdict"]["judgment"]["score"] == 84
+
+
+def test_configured_ai_relatability_failure_blocks_render(tmp_path):
+    def unavailable(_prompt):
+        raise RuntimeError("provider unavailable")
+
+    app, _engine = app_and_engine(
+        tmp_path,
+        RELATABILITY_LLM_RUNNER=unavailable,
+    )
+    client = app.test_client()
+    brief = client.post(
+        "/api/script-intelligence/briefs",
+        json={
+            "topic": "AI automation",
+            "audience": "software founders",
+            "objective": "qualified_attention",
+        },
+    ).get_json()
+
+    result = client.post(
+        "/api/script-intelligence/generate-and-audit",
+        json={"brief_id": brief["brief_id"]},
+    ).get_json()
+
+    audit = result["audits"]["qualitative_relatability"]
+    assert result["status"] == "revise"
+    assert result["ready_for_render"] is False
+    assert result["decisions"]["qualitative_relatability"] is False
+    assert audit["decision"] == "JUDGE_UNAVAILABLE"
 
 
 def test_one_call_product_route_builds_brief_and_audits_script(tmp_path):
@@ -546,6 +871,92 @@ def test_generation_rejects_cross_topic_or_receipt_overrides(tmp_path):
     assert body["forbidden_fields"] == ["receipt_ids", "topic"]
 
 
+def test_generation_fails_closed_when_cohort_manifest_changes_after_brief_creation(
+    tmp_path,
+):
+    _app, engine = app_and_engine(tmp_path)
+    brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    })
+    assert brief["status"] == "ready", brief
+
+    manifest_path = Path(brief["language"]["cohort_manifest_path"])
+    original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected_hash = canonical_sha256(original_manifest)
+    assert brief["language"]["cohort_manifest_sha256"] == expected_hash
+
+    mutated_manifest = {
+        **original_manifest,
+        "cohort_id": "cohort_tampered_after_brief_creation",
+        "topic": "tampered after brief creation",
+    }
+    manifest_path.write_text(
+        json.dumps(mutated_manifest, sort_keys=True), encoding="utf-8"
+    )
+    actual_hash = canonical_sha256(mutated_manifest)
+    assert actual_hash != expected_hash
+
+    result = engine.script_intelligence.generate_and_audit({
+        "brief_id": brief["brief_id"],
+    })
+
+    assert result["status"] == "revise"
+    assert result["ready_for_render"] is False
+    assert result["decisions"]["cohort_integrity"] is False
+    quality_audit = result["audits"]["transcript_cohort_relatability"]
+    assert quality_audit["decision"] == "REJECT_NOT_RELATABLE"
+    assert quality_audit["findings"]["expected_cohort_id"] == brief[
+        "language"
+    ]["cohort_id"]
+    assert quality_audit["findings"]["actual_cohort_id"] == (
+        "cohort_tampered_after_brief_creation"
+    )
+    assert quality_audit["findings"][
+        "expected_cohort_manifest_sha256"
+    ] == expected_hash
+    assert quality_audit["findings"][
+        "actual_cohort_manifest_sha256"
+    ] == actual_hash
+    assert quality_audit["findings"]["cohort_manifest_binding_valid"] is False
+    binding = quality_audit["findings"]["findings"][
+        "cohort_manifest_binding"
+    ]
+    assert binding == {
+        "contract": "immutable_brief_cohort_manifest_binding_v1",
+        "expected_cohort_id": brief["language"]["cohort_id"],
+        "actual_cohort_id": "cohort_tampered_after_brief_creation",
+        "cohort_id_matches": False,
+        "expected_cohort_manifest_sha256": expected_hash,
+        "actual_cohort_manifest_sha256": actual_hash,
+        "cohort_manifest_sha256_matches": False,
+        "manifest_payload_is_object": True,
+        "manifest_load_error": None,
+        "binding_valid": False,
+    }
+    assert quality_audit["findings"]["findings"]["checks"][
+        "cohort_manifest_binding_valid"
+    ] is False
+    assert "cohort_manifest_binding_valid" in quality_audit["findings"][
+        "findings"
+    ]["failures"]
+
+    with closing(sqlite3.connect(engine.tape.path)) as connection:
+        row = connection.execute(
+            """SELECT cohort_id, cohort_manifest_sha256, findings_json
+               FROM mt_script_relatability_audits WHERE audit_id=?""",
+            (quality_audit["findings"]["market_tape_audit_id"],),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == brief["language"]["cohort_id"]
+    assert row[1] == actual_hash
+    persisted_binding = json.loads(row[2])["cohort_manifest_binding"]
+    assert persisted_binding["expected_cohort_manifest_sha256"] == expected_hash
+    assert persisted_binding["actual_cohort_manifest_sha256"] == actual_hash
+    assert persisted_binding["binding_valid"] is False
+
+
 def test_brief_skips_stronger_candidate_without_verified_language_cohort(tmp_path):
     _app, engine = app_and_engine(tmp_path)
     seed_competing_trend(
@@ -617,7 +1028,7 @@ def test_no_qualifying_trend_returns_persisted_candidate_assessments(tmp_path):
     assert result["status"] == "not_ready"
     assert result["code"] == "NO_SCRIPT_READY_TREND_CANDIDATE"
     detail = result["detail"]
-    assert detail["selection_contract"] == "script_intelligence_trend_selection_v2"
+    assert detail["selection_contract"] == "script_intelligence_trend_selection_v3"
     assert detail["candidate_count"] == 1
     assert detail["assessed_candidate_count"] == 1
     assert detail["semantic_candidate_query_count"] == 1
@@ -680,7 +1091,7 @@ def test_failed_brief_persists_refusal_then_enqueues_bounded_language_demand(
     assert demand["audience"] == "software founders"
     assert demand["acquisition_policy"] == {
         "cycles": 1,
-        "platforms": ["youtube"],
+        "platforms": ["youtube", "tiktok", "instagram", "facebook"],
         "discovery_limit": 50,
         "transcript_limit": 6,
         "whisper_model": "base",

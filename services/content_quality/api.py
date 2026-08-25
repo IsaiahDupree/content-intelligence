@@ -14,9 +14,10 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 
+from .ai_relatability import NON_AI_PASS_DECISION, openai_relatability_runner
 from .contracts import SCRIPT_INTELLIGENCE_BRIEF_CONTRACT
 from .demand_client import MarketTapeDemandClient
-from .engine import ContentQualityEngine
+from .engine import ContentQualityEngine, IdempotencyConflict
 from .marketing_scripts import MarketingScriptCompiler
 from .narrative_coherence import default_llm_runner, openai_llm_runner
 from .reference_corpus import (
@@ -46,6 +47,15 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             llm_runner = openai_llm_runner
         elif mode == "claude":
             llm_runner = default_llm_runner
+    relatability_llm_runner = app.config.get("RELATABILITY_LLM_RUNNER")
+    if relatability_llm_runner is None:
+        relatability_mode = app.config.get("RELATABILITY_JUDGE") or (
+            "off"
+            if app.config.get("TESTING")
+            else os.getenv("RELATABILITY_JUDGE", "openai")
+        )
+        if relatability_mode == "openai":
+            relatability_llm_runner = openai_relatability_runner
     demand_client = app.config.get("MARKET_TAPE_DEMAND_CLIENT")
     if demand_client is None:
         demand_client = MarketTapeDemandClient.from_environment()
@@ -53,6 +63,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         app.config.get("MARKET_TAPE_DB") or os.getenv("MARKET_TAPE_DB") or DEFAULT_MARKET_TAPE,
         app.config.get("CONTENT_QUALITY_DB") or os.getenv("CONTENT_QUALITY_DB") or DEFAULT_QUALITY_DB,
         narrative_llm_runner=llm_runner,
+        relatability_llm_runner=relatability_llm_runner,
         transcript_storage_root=(
             app.config.get("TRANSCRIPT_BANK_ROOT")
             or os.getenv("TRANSCRIPT_BANK_ROOT")
@@ -94,7 +105,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     # not fall through to the default the way a falsy 0 would.
     _ttl = app.config.get("HEALTH_CACHE_SECONDS")
     if _ttl is None:
-        _ttl = os.getenv("CQ_HEALTH_CACHE_SECONDS", "20")
+        _ttl = os.getenv("CQ_HEALTH_CACHE_SECONDS", "300")
     health_ttl = float(_ttl)
     health_lock = threading.Lock()        # guards the cache dict only, never held over a sweep
     sweep_lock = threading.Lock()         # at most one tape sweep in flight, ever
@@ -110,6 +121,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         },
         "ai_readiness": {
             "narrative_judge_configured": False,
+            "relatability_judge_configured": False,
             "deterministic_services_available": True,
             "note": "Health sweep pending.",
         },
@@ -151,9 +163,9 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     def health_report() -> dict[str, Any]:
         """Never block a caller on the tape sweep after the first one.
 
-        The Ops Console probes with a 5s timeout while a cold sweep takes ~12s on a
-        multi-GB tape, so a synchronous refresh would report this service DOWN roughly
-        once per TTL window even while it is perfectly healthy. Serve the last snapshot
+        The Ops Console probes with a 5s timeout while a cold sweep over the multi-GB
+        tape may take more than one minute. A five-minute TTL prevents continuous
+        competition between frequent probes and the sweep. Serve the last snapshot
         immediately and refresh behind it; `checked_at` in the payload always says how
         fresh the answer really is.
         """
@@ -186,6 +198,11 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 "ready" if report["ai_readiness"]["narrative_judge_configured"]
                 else "not_configured"
             )
+        elif dependency == "relatability_ai_judge":
+            dependency_status = (
+                "ready" if report["ai_readiness"]["relatability_judge_configured"]
+                else "not_configured"
+            )
         else:
             dependency_status = "up"
         status = "healthy" if dependency_status in {"up", "ready"} else "degraded"
@@ -205,6 +222,9 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         "/api/scripts/health": ("evidence-first-scripts", "script_intelligence"),
         "/api/script-intelligence/health": ("script-intelligence", "script_intelligence"),
         "/api/relatability/health": ("relatability", "script_intelligence"),
+        "/api/relatability/qualitative-health": (
+            "relatability-ai-qualitative", "relatability_ai_judge"
+        ),
         "/api/attention/health": ("attention", None),
         "/api/retention/health": ("post-publish-retention", "owned_retention"),
         "/api/learning/health": ("learning-memory", None),
@@ -245,7 +265,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
 
     def audited_agent_response(
         operation: str,
-        parameters: dict[str, Any],
+        parameters: Any,
         result: dict[str, Any],
         status_code: int = 200,
         started_at: float | None = None,
@@ -265,8 +285,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             f"{principal}|{operation}|{created_at}|".encode() + encoded_parameters
         ).hexdigest()[:24]
         row_count = 1
-        if isinstance(result.get("briefs"), list):
-            row_count = len(result["briefs"])
+        for collection_key in ("briefs", "events", "samples"):
+            if isinstance(result.get(collection_key), list):
+                row_count = len(result[collection_key])
+                break
         engine.store.put_agent_query({
             "query_id": query_id,
             "principal": principal,
@@ -284,6 +306,24 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             "response_sha256": hashlib.sha256(encoded_response).hexdigest(),
         }
         return jsonify(response), status_code
+
+    def audited_invalid_request(
+        operation: str,
+        parameters: Any,
+        error: ValueError,
+        started_at: float,
+    ) -> tuple[Any, int]:
+        return audited_agent_response(
+            operation,
+            parameters,
+            {
+                "status": "error",
+                "code": "INVALID_REQUEST",
+                "error": str(error),
+            },
+            400,
+            started_at,
+        )
 
     def reference_invalid_request(
         action: str,
@@ -622,7 +662,13 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 },
                 "build_script_brief": {
                     "method": "POST", "path": "/api/script-intelligence/briefs",
-                    "required": ["audience"], "optional": ["topic", "objective"],
+                    "required": ["audience"],
+                    "optional": ["topic", "objective", "variant_index"],
+                    "bounds": {"variant_index": [0, 7]},
+                    "variant_selection": (
+                        "zero-based selection over text-distinct stored human "
+                        "moments; the selection is immutable in the brief"
+                    ),
                 },
                 "list_script_briefs": {
                     "method": "GET", "path": "/api/script-intelligence/briefs",
@@ -640,15 +686,73 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "method": "POST",
                     "path": "/api/script-intelligence/run",
                     "required": ["audience"],
-                    "optional": ["topic", "objective"],
+                    "optional": ["topic", "objective", "variant_index"],
+                    "bounds": {"variant_index": [0, 7]},
                     "effect": (
                         "build immutable brief then generate and audit, or "
-                        "enqueue one bounded evidence demand"
+                        "enqueue one bounded evidence demand; each variant uses "
+                        "a distinct stored source moment from the same cohort"
                     ),
                 },
                 "get_script_lineage": {
                     "method": "GET",
                     "path": "/api/script-intelligence/scripts/{script_id}",
+                },
+                "audit_qualitative_relatability": {
+                    "method": "POST",
+                    "path": "/api/relatability/qualitative-audit",
+                    "required_one_of": [
+                        ["script_id"],
+                        ["text", "audience", "source_receipt_ids"],
+                    ],
+                    "effect": (
+                        "persist a separately named, evidence-bound AI verdict; "
+                        "use an explicit deterministic fallback when AI is off"
+                    ),
+                },
+                "ingest_owned_outcome_event": {
+                    "method": "POST",
+                    "path": "/api/owned-outcomes/events",
+                    "contract": "owned_attribution_event_v1",
+                    "required": [
+                        "idempotency_key", "event_type", "attribution",
+                        "journey_id", "occurred_at",
+                    ],
+                    "event_types": ["click", "install", "trial", "purchase"],
+                },
+                "list_owned_outcome_events": {
+                    "method": "GET",
+                    "path": "/api/owned-outcomes/events",
+                    "required": ["content_id"],
+                    "bounds": {"limit": [1, 500]},
+                },
+                "ingest_owned_retention_sample": {
+                    "method": "POST",
+                    "path": "/api/owned-outcomes/retention-samples",
+                    "contract": "owned_retention_sample_v1",
+                    "required": [
+                        "idempotency_key", "attribution", "measurement_id",
+                        "observed_at", "elapsed_ms", "retained_percent",
+                        "sample_size",
+                    ],
+                },
+                "list_owned_retention_samples": {
+                    "method": "GET",
+                    "path": "/api/owned-outcomes/retention-samples",
+                    "required": ["content_id"],
+                    "bounds": {"limit": [1, 2000]},
+                },
+                "summarize_owned_outcomes": {
+                    "method": "GET",
+                    "path": "/api/owned-outcomes/summary",
+                    "required": ["content_id"],
+                    "optional": [
+                        "campaign_id", "offer_id", "source_platform", "source_id",
+                    ],
+                    "causal_policy": (
+                        "observed drops are facts; reasons are refused without causal evidence; "
+                        "AI explanations are labelled interpretation_not_fact"
+                    ),
                 },
                 "reference_corpus_status": {
                     "method": "GET",
@@ -724,6 +828,173 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         }
         return audited_agent_response("catalog", {}, result, started_at=started)
 
+    @app.post("/api/relatability/qualitative-audit")
+    def audit_qualitative_relatability():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = engine.ai_relatability.audit(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "audit_qualitative_relatability", payload, error, started
+            )
+        decision = result.get("decision")
+        status_code = (
+            200 if decision in {"PASS", NON_AI_PASS_DECISION}
+            else 503 if decision == "JUDGE_UNAVAILABLE"
+            else 422
+        )
+        return audited_agent_response(
+            "audit_qualitative_relatability",
+            payload,
+            result,
+            status_code,
+            started,
+        )
+
+    def owned_outcome_query_scope() -> dict[str, Any]:
+        return {
+            field: request.args.get(field)
+            for field in (
+                "content_id", "campaign_id", "offer_id",
+                "source_platform", "source_id",
+            )
+            if request.args.get(field) is not None
+        }
+
+    @app.post("/api/owned-outcomes/events")
+    def ingest_owned_outcome_event():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            result = engine.owned_outcomes.ingest_event(payload)
+        except IdempotencyConflict as error:
+            result = {
+                "status": "error",
+                "code": "IDEMPOTENCY_KEY_CONFLICT",
+                "error": str(error),
+            }
+            return audited_agent_response(
+                "ingest_owned_outcome_event", payload, result, 409, started
+            )
+        except ValueError as error:
+            return audited_invalid_request(
+                "ingest_owned_outcome_event", payload, error, started
+            )
+        return audited_agent_response(
+            "ingest_owned_outcome_event", payload, result,
+            201 if result["created"] else 200, started,
+        )
+
+    @app.get("/api/owned-outcomes/events")
+    def list_owned_outcome_events():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        parameters = request.args.to_dict(flat=True)
+        try:
+            scope = owned_outcome_query_scope()
+            filters = engine.owned_outcomes._attribution(
+                scope, require_all=False
+            )
+            limit = max(1, min(500, int(request.args.get("limit", "200"))))
+            events = engine.store.owned_outcome_events(filters, limit=limit)
+        except ValueError as error:
+            return audited_invalid_request(
+                "list_owned_outcome_events", parameters, error, started
+            )
+        result = {
+            "status": "ok", "contract": "owned_attribution_event_v1",
+            "events": events, "count": len(events), "limit": limit,
+        }
+        return audited_agent_response(
+            "list_owned_outcome_events", {**scope, "limit": limit}, result,
+            started_at=started,
+        )
+
+    @app.post("/api/owned-outcomes/retention-samples")
+    def ingest_owned_retention_sample():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            result = engine.owned_outcomes.ingest_retention_sample(payload)
+        except IdempotencyConflict as error:
+            result = {
+                "status": "error",
+                "code": "IDEMPOTENCY_KEY_CONFLICT",
+                "error": str(error),
+            }
+            return audited_agent_response(
+                "ingest_owned_retention_sample", payload, result, 409, started
+            )
+        except ValueError as error:
+            return audited_invalid_request(
+                "ingest_owned_retention_sample", payload, error, started
+            )
+        return audited_agent_response(
+            "ingest_owned_retention_sample", payload, result,
+            201 if result["created"] else 200, started,
+        )
+
+    @app.get("/api/owned-outcomes/retention-samples")
+    def list_owned_retention_samples():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        parameters = request.args.to_dict(flat=True)
+        try:
+            scope = owned_outcome_query_scope()
+            filters = engine.owned_outcomes._attribution(
+                scope, require_all=False
+            )
+            limit = max(1, min(2000, int(request.args.get("limit", "500"))))
+            samples = engine.store.owned_retention_samples(filters, limit=limit)
+        except ValueError as error:
+            return audited_invalid_request(
+                "list_owned_retention_samples", parameters, error, started
+            )
+        result = {
+            "status": "ok", "contract": "owned_retention_sample_v1",
+            "samples": samples, "count": len(samples), "limit": limit,
+        }
+        return audited_agent_response(
+            "list_owned_retention_samples", {**scope, "limit": limit}, result,
+            started_at=started,
+        )
+
+    @app.get("/api/owned-outcomes/summary")
+    def summarize_owned_outcomes():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        parameters = request.args.to_dict(flat=True)
+        try:
+            scope = owned_outcome_query_scope()
+            result = engine.owned_outcomes.summary(scope)
+        except ValueError as error:
+            return audited_invalid_request(
+                "summarize_owned_outcomes", parameters, error, started
+            )
+        return audited_agent_response(
+            "summarize_owned_outcomes", scope, result, started_at=started
+        )
+
     @app.post("/api/script-intelligence/briefs")
     def build_script_intelligence_brief():
         denied = require_agent_auth()
@@ -731,7 +1002,12 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             return denied
         started = time.monotonic()
         payload = json_body()
-        result = engine.script_intelligence.build_brief(payload)
+        try:
+            result = engine.script_intelligence.build_brief(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "build_script_brief", payload, error, started
+            )
         status_code = 201 if result.get("status") == "ready" else 409
         return audited_agent_response(
             "build_script_brief", payload, result, status_code, started
@@ -790,11 +1066,22 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             return denied
         started = time.monotonic()
         payload = json_body()
-        brief = engine.script_intelligence.build_brief(payload)
+        try:
+            brief = engine.script_intelligence.build_brief(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "run_trend_to_script", payload, error, started
+            )
         if brief.get("status") != "ready":
+            variant_unavailable = (
+                brief.get("code") == "SCRIPT_VARIANT_INDEX_NOT_AVAILABLE"
+            )
             result = {
                 "status": "not_ready",
-                "phase": "evidence_acquisition",
+                "phase": (
+                    "variant_selection"
+                    if variant_unavailable else "evidence_acquisition"
+                ),
                 "brief_attempt": brief,
                 "script_generated": False,
             }

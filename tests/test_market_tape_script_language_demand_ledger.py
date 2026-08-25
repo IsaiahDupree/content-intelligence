@@ -10,7 +10,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from services.market_tape.config import MarketTapeConfig
-from services.market_tape.store import MarketTapeStore, SCHEMA_VERSION
+from services.market_tape.store import (
+    MarketTapeStore,
+    SCHEMA_VERSION,
+    ScriptLanguageDemandClaimConflict,
+)
 
 
 UTC = timezone.utc
@@ -55,7 +59,7 @@ def _request(
     }
 
 
-def test_schema_v12_adds_append_only_demand_ledger(tmp_path):
+def test_current_schema_keeps_append_only_demand_and_lineage_ledgers(tmp_path):
     store = MarketTapeStore(_config(tmp_path))
     event = store.enqueue_script_language_demand(_request())
 
@@ -84,7 +88,7 @@ def test_schema_v12_adds_append_only_demand_ledger(tmp_path):
             ).fetchall()
         }
 
-    assert schema_version == str(SCHEMA_VERSION) == "12"
+    assert schema_version == str(SCHEMA_VERSION) == "15"
     assert {
         "event_id",
         "demand_id",
@@ -157,20 +161,17 @@ def test_enqueue_deduplicates_normalized_identity_but_keeps_lineage(tmp_path):
     assert second["demand_id"] == first["demand_id"]
     assert second["enqueued"] is False
     assert second["deduplicated"] is True
-    assert second["idempotent"] is True
+    assert second["idempotent"] is False
     assert len(second["events"]) == 1
-    assert second["source_receipt_id"] == "brief-receipt-001"
-    assert second["evidence_trend_id"] == "trend-001"
-    assert changed_snapshot["demand_id"] != first["demand_id"]
+    assert second["source_receipt_id"] == "later-receipt"
+    assert second["evidence_trend_id"] == "trend-is-lineage-not-identity"
+    assert changed_snapshot["demand_id"] == first["demand_id"]
 
     requested = store.list_script_language_demands(
         state="requested",
         as_of=datetime(2026, 8, 24, 14, tzinfo=UTC),
     )
-    assert {row["demand_id"] for row in requested} == {
-        first["demand_id"],
-        changed_snapshot["demand_id"],
-    }
+    assert {row["demand_id"] for row in requested} == {first["demand_id"]}
 
 
 def test_expired_lease_reclaims_with_next_attempt_and_terminal_is_idempotent(
@@ -282,3 +283,50 @@ def test_two_concurrent_claimers_cannot_claim_the_same_demand(tmp_path):
             (demand["demand_id"],),
         ).fetchone()[0]
     assert claim_count == 1
+
+
+def test_expected_demand_id_mismatch_is_atomic_and_appends_no_claim(tmp_path):
+    store = MarketTapeStore(_config(tmp_path))
+    first = store.enqueue_script_language_demand(
+        _request(
+            snapshot_id="expected-first-snapshot",
+            source_receipt_id="expected-first-receipt",
+            requested_at=datetime(2026, 8, 24, 12, tzinfo=UTC),
+        )
+    )
+    second_request = _request(
+        snapshot_id="expected-second-snapshot",
+        source_receipt_id="expected-second-receipt",
+        requested_at=datetime(2026, 8, 24, 13, tzinfo=UTC),
+    )
+    second_request["topic"] = "AI Automation"
+    second = store.enqueue_script_language_demand(second_request)
+    assert first["demand_id"] != second["demand_id"]
+
+    with pytest.raises(ScriptLanguageDemandClaimConflict) as raised:
+        store.claim_next_script_language_demand(
+            600,
+            expected_demand_id=second["demand_id"],
+        )
+
+    assert raised.value.payload() == {
+        "status": "error",
+        "state": "conflict",
+        "code": "SCRIPT_LANGUAGE_DEMAND_CLAIM_CONFLICT",
+        "error": "expected_demand_id does not match the next claimable demand",
+        "expected_demand_id": second["demand_id"],
+        "next_demand_id": first["demand_id"],
+        "mutation_applied": False,
+    }
+    with store.connect() as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM mt_script_language_demand_events
+               WHERE event_type='claimed'"""
+        ).fetchone()[0] == 0
+
+    claimed = store.claim_next_script_language_demand(
+        600,
+        expected_demand_id=first["demand_id"],
+    )
+    assert claimed is not None
+    assert claimed["demand_id"] == first["demand_id"]

@@ -315,6 +315,13 @@ class NarrativeCoherenceService:
 
     def audit(self, payload: dict[str, Any]) -> dict[str, Any]:
         """One-shot audit of an arbitrary {timeline, evidence_summary} payload."""
+        binding = {
+            "stored_script_bound": False,
+            "script_id": None,
+            "script_sha256": None,
+        }
+        if hasattr(self.store, "bind_script_audit_payload"):
+            payload, binding = self.store.bind_script_audit_payload(payload)
         timeline = payload.get("timeline") or []
         defects = rules_audit(timeline, payload.get("evidence_summary"))
         judgment = None
@@ -325,7 +332,12 @@ class NarrativeCoherenceService:
         record = self.store.put_audit(
             "narrative_coherence", subject_id and str(subject_id), decision,
             100.0 if decision == "PASS" else 0.0,
-            {"defects": defects, "llm_judgment": judgment, "attempts": 1},
+            {
+                "defects": defects,
+                "llm_judgment": judgment,
+                "attempts": 1,
+                "input_binding": binding,
+            },
         )
         return record
 

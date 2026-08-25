@@ -12,6 +12,7 @@ as a single unit, on demand.
 
 from __future__ import annotations
 
+import os
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
@@ -21,7 +22,15 @@ from .collector import MarketTapeCollector
 from .config import MarketTapeConfig
 from .store import MarketTapeStore
 
-DEFAULT_TRANSCRIPT_STORAGE_ROOT = Path("/Volumes/My Passport/MarketTape/transcript-bank")
+DEFAULT_TRANSCRIPT_STORAGE_ROOT = Path(
+    os.getenv(
+        "MARKET_TAPE_TRANSCRIPT_STORAGE_ROOT",
+        str(
+            Path.home()
+            / "Library/Application Support/ContentQuality/data/transcript-bank"
+        ),
+    )
+).expanduser()
 TRANSCRIPT_FAILURE_STATES = {"failed", "blocked_runtime", "audit_failed"}
 
 
