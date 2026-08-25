@@ -20,6 +20,8 @@ from datetime import datetime, date
 from dataclasses import dataclass, field
 from uuid import uuid4
 
+from services.content_quality.script_quality import MAX_QUALITY_REWRITE_ATTEMPTS
+from services.spoken_script_admission import admit_spoken_components
 from .models import NarrativeGoal, NarrativePillar, WeeklyPlan, ScheduledSlot
 
 logger = logging.getLogger(__name__)
@@ -339,18 +341,17 @@ Make the hook scroll-stopping and the content valuable for the target audience."
     async def convert_brief_to_script(
         self,
         brief: ContentBriefFromNarrative
-    ) -> str:
-        """Convert a content brief to a video script using AI."""
+    ) -> Dict[str, Any]:
+        """Return a quality-admitted script package or an explicit block."""
         
         if not self.openai_api_key:
-            # Fallback: generate basic script from brief
-            return self._generate_basic_script(brief)
+            return self._admit_basic_script(brief)
         
         try:
             import openai
             client = openai.OpenAI(api_key=self.openai_api_key)
             
-            prompt = f"""Write a short-form video script (30 seconds, ~75 words) based on this brief:
+            prompt = f"""Write only the body of a short-form video script based on this brief:
 
 Topic: {brief.topic}
 Hook: {brief.hook}
@@ -359,12 +360,12 @@ Call to Action: {brief.call_to_action}
 Tone: {brief.tone}
 Pillar: {brief.pillar}
 
-Write a natural, conversational script that:
-1. Opens with an attention-grabbing hook
-2. Delivers value quickly
-3. Ends with a clear call-to-action
+The supplied hook and CTA are assembled separately, so do not repeat them.
+Use only the supplied brief fields. Do not invent statistics, results,
+customers, personal experience, first-party claims, or available assets.
+Do not imitate or mention a source identity, likeness, or voice.
 
-Format: Just the script text, no labels or timestamps."""
+Format: body text only, no labels or timestamps."""
 
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -376,30 +377,110 @@ Format: Just the script text, no labels or timestamps."""
                 max_tokens=200
             )
             
-            return response.choices[0].message.content.strip()
+            body = response.choices[0].message.content.strip()
+            components = self._basic_components(brief)
+            components["context"] = [{
+                "node_id": "narrative_ai_body",
+                "text": body,
+            }]
+            return self._admit_components(brief, components)
             
         except Exception as e:
             logger.error(f"AI script generation failed: {e}")
-            return self._generate_basic_script(brief)
+            return self._provider_blocked_package(type(e).__name__)
     
     def _generate_basic_script(self, brief: ContentBriefFromNarrative) -> str:
-        """Generate a basic script from brief without AI."""
-        lines = [
-            brief.hook,
-            "",
-            f"Today I want to share something about {brief.topic.lower()}.",
-            "",
-        ]
-        
-        for i, point in enumerate(brief.key_points[:3], 1):
-            lines.append(f"{point}.")
-        
-        lines.extend([
-            "",
-            brief.call_to_action
-        ])
-        
-        return "\n".join(lines)
+        """Assemble supplied brief text without adding claims."""
+        values = [brief.hook, *brief.key_points[:3], brief.call_to_action]
+        return " ".join(str(value).strip() for value in values if str(value).strip())
+
+    def _basic_components(
+        self, brief: ContentBriefFromNarrative
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        components: Dict[str, List[Dict[str, Any]]] = {}
+        if brief.hook.strip():
+            components["hook"] = [{
+                "node_id": "narrative_hook", "text": brief.hook,
+            }]
+        roles = ("stakes", "claim", "method", "payoff")
+        for index, point in enumerate(brief.key_points[:4]):
+            if str(point).strip():
+                components.setdefault(roles[index], []).append({
+                    "node_id": f"narrative_point_{index + 1}",
+                    "text": str(point),
+                })
+        if brief.call_to_action.strip():
+            components["cta"] = [{
+                "node_id": "narrative_cta", "text": brief.call_to_action,
+            }]
+        return components
+
+    def _admit_basic_script(self, brief: ContentBriefFromNarrative) -> Dict[str, Any]:
+        return self._admit_components(brief, self._basic_components(brief))
+
+    def _admit_components(
+        self,
+        brief: ContentBriefFromNarrative,
+        components: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        admission = admit_spoken_components(
+            components,
+            family="evidence_story",
+            seed=brief.id,
+            target_seconds=max(1.0, float(brief.target_duration_seconds)),
+            # Narrative briefs have no receipt-resolved evidence linkage.
+            evidence_phrases=(),
+        )
+        package = {
+            "status": admission["status"],
+            "transcript": admission["transcript"] if admission["status"] == "ready" else "",
+            "block_reason": admission["block_reason"],
+            "rhetorical_structure": admission["rhetorical_structure"],
+            "owner_quality": admission["owner_quality"],
+            "claim_safety": admission["claim_safety"],
+            "delivery_visual_plan": admission["delivery_visual_plan"],
+            "quality_revision": admission["revision"],
+            "rights": admission["rights"],
+        }
+        if admission["status"] != "ready":
+            package["blocked_candidate"] = {
+                "transcript": admission["transcript"],
+                "timeline": admission["timeline"],
+            }
+        return package
+
+    def _provider_blocked_package(self, error_type: str) -> Dict[str, Any]:
+        return {
+            "status": "blocked_provider_error",
+            "transcript": "",
+            "block_reason": f"provider_error:{error_type}",
+            "rhetorical_structure": {},
+            "owner_quality": {},
+            "claim_safety": {},
+            "delivery_visual_plan": {
+                "contract": "delivery_visual_plan_v1",
+                "cue_count": 0,
+                "cues": [],
+                "maximum_interrupt_gap_seconds": 3.0,
+                "interrupt_schedule": [],
+                "asset_policy": {
+                    "owned_or_licensed_assets_required": True,
+                    "reference_clips_used": False,
+                    "reference_identity_likeness_or_voice_used": False,
+                },
+            },
+            "quality_revision": {
+                "contract": "bounded_script_quality_rewrite_v1",
+                "maximum_attempts": MAX_QUALITY_REWRITE_ATTEMPTS,
+                "attempt_count": 0,
+                "attempts": [],
+            },
+            "rights": {
+                "source_clips_used": False,
+                "source_identity_likeness_or_voice_used": False,
+                "owned_or_licensed_assets_required": True,
+            },
+        }
     
     async def create_clip_plan_from_brief(
         self,
@@ -441,6 +522,7 @@ Format: Just the script text, no labels or timestamps."""
         results = {
             "briefs_generated": 0,
             "scripts_generated": 0,
+            "scripts_blocked": 0,
             "clip_plans_created": 0,
             "content": []
         }
@@ -455,9 +537,22 @@ Format: Just the script text, no labels or timestamps."""
         
         # Convert each brief to script and clip plan
         for brief in briefs:
-            script = await self.convert_brief_to_script(brief)
+            script_package = await self.convert_brief_to_script(brief)
+            if script_package["status"] != "ready":
+                results["scripts_blocked"] += 1
+                results["content"].append({
+                    "brief": brief.to_dict(),
+                    "script": "",
+                    "script_package": script_package,
+                    "clip_plan": {
+                        "status": "blocked_script_quality",
+                        "reason": script_package["block_reason"],
+                    },
+                })
+                continue
+
+            script = script_package["transcript"]
             results["scripts_generated"] += 1
-            
             clip_plan = await self.create_clip_plan_from_brief(brief, script)
             if clip_plan.get("status") != "error":
                 results["clip_plans_created"] += 1
@@ -465,6 +560,7 @@ Format: Just the script text, no labels or timestamps."""
             results["content"].append({
                 "brief": brief.to_dict(),
                 "script": script,
+                "script_package": script_package,
                 "clip_plan": clip_plan
             })
         

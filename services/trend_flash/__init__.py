@@ -14,7 +14,7 @@ from .flash_generator import (
     FlashGenerator,
     TrendFlashContent,
     get_flash_generator,
-    SCRIPT_TEMPLATES
+    SCRIPT_VARIANT_GUIDANCE
 )
 
 from .remotion_shipper import (
@@ -34,7 +34,7 @@ __all__ = [
     "FlashGenerator",
     "TrendFlashContent",
     "get_flash_generator",
-    "SCRIPT_TEMPLATES",
+    "SCRIPT_VARIANT_GUIDANCE",
     
     # Shipper
     "RemotionShipper",

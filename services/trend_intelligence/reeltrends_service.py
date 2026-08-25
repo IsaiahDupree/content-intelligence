@@ -20,6 +20,7 @@ from enum import Enum
 import httpx
 from openai import AsyncOpenAI
 from loguru import logger
+from services.spoken_script_admission import admit_spoken_components
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
@@ -89,6 +90,10 @@ class ScriptResult:
     topic: str
     tone: str
     format: str
+    status: str = "pending_quality"
+    transcript: str = ""
+    block_reason: str = ""
+    quality_metadata: Dict[str, Any] = field(default_factory=dict)
     generated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     
     def to_dict(self) -> Dict:
@@ -269,7 +274,11 @@ Rules:
 - Hook must grab attention in first 2 seconds
 - End with clear CTA
 - Be conversational, not salesy
-- Make it authentic and engaging"""
+- Use only the topic and niche supplied above
+- Do not invent statistics, results, customers, personal experience, or first-party claims
+- Do not imitate or mention any source creator's identity, likeness, or voice
+- Visual notes may use owned or licensed assets only; never request reference clips
+- Make it direct and engaging"""
 
         try:
             response = await self.client.chat.completions.create(
@@ -306,15 +315,55 @@ Rules:
                 for b in data["beats"]
             ]
             
+            admission = self._admit_script(topic, beats, timing["total"])
+            quality_metadata = {
+                key: admission[key]
+                for key in (
+                    "contract", "rhetorical_structure", "owner_quality",
+                    "claim_safety", "delivery_visual_plan", "revision", "rights",
+                    "blocking_failure_codes",
+                )
+            }
+            quality_metadata["unadmitted_alternative_hooks_discarded"] = len(
+                data.get("hooks", [])
+            )
+            admitted_beats = []
+            if admission["status"] == "ready":
+                cues = admission["delivery_visual_plan"].get("cues", [])
+                for index, item in enumerate(admission["timeline"]):
+                    start = float(item.get("start", item.get("start_seconds", 0.0)))
+                    end = float(item.get("end", item.get("end_seconds", start)))
+                    cue = cues[index] if index < len(cues) else {}
+                    visual_mode = cue.get("visual", {}).get(
+                        "mode", "owned_supporting_visual"
+                    )
+                    script_text = str(item.get("text") or "")
+                    admitted_beats.append(ScriptBeat(
+                        name=str(item.get("source_name") or item.get("quality_role")),
+                        duration_seconds=max(1, int(round(end - start))),
+                        script=script_text,
+                        visual_notes=f"{visual_mode}; owned or licensed assets only",
+                        word_count=len(script_text.split()),
+                    ))
+            else:
+                quality_metadata["blocked_candidate"] = {
+                    "transcript": admission["transcript"],
+                    "timeline": admission["timeline"],
+                }
+
             return ScriptResult(
-                beats=beats,
+                beats=admitted_beats,
                 total_duration=timing["total"],
-                estimated_word_count=sum(b.word_count for b in beats),
-                hooks=data.get("hooks", []),
+                estimated_word_count=sum(b.word_count for b in admitted_beats),
+                hooks=[],
                 hashtag_suggestions=data.get("hashtag_suggestions", []),
                 topic=topic,
                 tone=tone.value,
-                format=format.value
+                format=format.value,
+                status=admission["status"],
+                transcript=admission["transcript"] if admitted_beats else "",
+                block_reason=admission["block_reason"] or "",
+                quality_metadata=quality_metadata,
             )
             
         except json.JSONDecodeError as e:
@@ -324,6 +373,38 @@ Rules:
         except Exception as e:
             logger.error(f"Script generation error: {e}")
             raise
+
+    def _admit_script(
+        self,
+        topic: str,
+        beats: List[ScriptBeat],
+        target_seconds: int,
+    ) -> Dict[str, Any]:
+        role_by_name = {
+            "hook": "hook",
+            "build_up": "stakes",
+            "context": "context",
+            "proof": "proof",
+            "punchline": "payoff",
+            "action": "method",
+            "cta": "cta",
+        }
+        components: Dict[str, List[Dict[str, Any]]] = {}
+        for index, beat in enumerate(beats):
+            role = "hook" if index == 0 else role_by_name.get(beat.name, "context")
+            components.setdefault(role, []).append({
+                "node_id": f"reeltrends_{index + 1}",
+                "source_name": beat.name,
+                "text": beat.script,
+            })
+        return admit_spoken_components(
+            components,
+            family="evidence_story",
+            seed=topic,
+            target_seconds=float(target_seconds),
+            # Topic text is not receipt evidence and cannot bypass claim checks.
+            evidence_phrases=(),
+        )
     
     # =========================================================================
     # Captions Generator

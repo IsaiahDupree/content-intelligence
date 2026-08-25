@@ -26,8 +26,9 @@ A script's beat timeline is audited strictly in viewer order:
    - `DANGLING_REFERENT` — "these stories" / "those complaints" must have an
      antecedent in an earlier beat (singular/plural variants both count).
    - `EVIDENCE_NEVER_VOICED` — if the script has backend evidence
-     (`evidence_summary` with nonzero counts), some beat must tell the
-     audience where it comes from.
+     (`evidence_summary` with nonzero counts), some beat must present the
+     source-bound human context. Corpus size and source-system details stay in
+     receipts rather than spoken copy.
    - `CONTEXT_AFTER_DEPENDENT_CLAIM` — that context beat must come BEFORE the
      first `claim`/`proof` beat that leans on it.
    - `CLAIM_BEFORE_SETUP` — the timeline may not open on a claim/proof.
@@ -58,9 +59,9 @@ truthy-but-not-boolean `coherent` value is never a pass.
 
 Every audit is persisted to `cq_audits` with `audit_type = "narrative_coherence"`,
 so `GET /api/scripts/{script_id}` reports it in `gates.latest_audits` and it
-participates in `gates.ready_for_render` as one of six required decisions,
-including the separately named qualitative relatability decision and the
-immutable transcript-cohort comparison.
+participates in `gates.ready_for_render`. New scripts require eight hash-bound
+decisions: the original six plus transcript-style fit and owner-calibrated
+quality.
 
 ## Endpoints
 
@@ -143,14 +144,13 @@ fix the judge (see Configuration); do not retry expecting a different answer.
 ## The script-generation pathway (for agents)
 
 The full evidence-first pathway on `:6010`, in order. Nothing renders without
-all six gates; nothing publishes without the foundry dispatcher's separate
-auto-approval policy on top.
+all applicable gates; publishing has a separate approval policy on top.
 
 The integrated workflow currently emits
 `generation_contract = "evidence_bound_category_script_v9"`. That contract
 binds each generated script to its immutable brief, selected source moment,
-performance-qualified cohort manifest, transcript payload snapshots, and the
-six persisted pre-render gate decisions. A consumer must treat a different
+performance-qualified cohort manifest, transcript payload snapshots, and all
+applicable persisted pre-render decisions. A consumer must treat a different
 generation-contract value as a different script contract, not silently coerce
 it to v9.
 
@@ -192,13 +192,14 @@ curl -s -X POST $BASE/api/relatability/script-audit  -H 'content-type: applicati
 curl -s -X POST $BASE/api/attention/script-audit     -H 'content-type: application/json' -d @script.json
 curl -s -X POST $BASE/api/attention/video-preflight  -H 'content-type: application/json' -d @script.json
 
-# 5. Handoff check — all six gates must be accepted and hash-bound.
+# 5. Handoff check — all applicable gates must be accepted and hash-bound.
 curl -s $BASE/api/scripts/{script_id}
 # -> {"gates": {"ready_for_render": true, "required_decisions": {
 #      "narrative_coherence": "PASS", "relatability_script": "PASS",
 #      "relatability_ai_qualitative": "PASS",
 #      "relatability_transcript_cohort": "PASS",
-#      "attention_script": "PASS", "attention_video_preflight": "PASS"}}}
+#      "attention_script": "PASS", "attention_video_preflight": "PASS",
+#      "transcript_style_fit": "PASS", "owner_calibrated_quality": "PASS"}}}
 ```
 
 Generation reject codes an agent must handle: `REJECT_NO_RECEIPTS`,
@@ -218,7 +219,7 @@ variants retain the same cohort ID and evidence hash. A missing source variant
 returns `SCRIPT_VARIANT_INDEX_NOT_AVAILABLE` without starting acquisition; an
 invalid type or fixed-bound violation returns an audited `INVALID_REQUEST`.
 Variants 0, 1, and 2 therefore produce three source-backed scripts, each of
-which must independently satisfy the same six hash-bound gates.
+which must independently satisfy the same applicable hash-bound gates.
 
 Human-moment extraction never paraphrases the source. It evaluates contiguous
 windows no longer than 10 words, records source offsets and immutable transcript

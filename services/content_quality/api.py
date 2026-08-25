@@ -26,6 +26,7 @@ from .reference_corpus import (
     ReferenceCorpusService,
     instagram_source_reader_from_env,
 )
+from .script_experiments import register_script_experiment_routes
 
 
 DEFAULT_MARKET_TAPE = Path.home() / "Library/Application Support/ContentIntelligence/data/market-tape.sqlite3"
@@ -74,6 +75,8 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     )
     app.extensions["market_tape_demand_client"] = demand_client
     app.extensions["content_quality_engine"] = engine
+    script_experiments = engine.script_experiments
+    app.extensions["script_experiment_telemetry"] = script_experiments
     reference_reader = app.config.get("REFERENCE_SOURCE_READER")
     if reference_reader is None:
         reference_reader = instagram_source_reader_from_env()
@@ -83,7 +86,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         source_reader=reference_reader,
     )
     app.extensions["reference_corpus"] = reference_corpus
-    marketing_script_compiler = MarketingScriptCompiler(reference_corpus)
+    marketing_script_compiler = MarketingScriptCompiler(
+        reference_corpus,
+        script_experiments=script_experiments,
+    )
     app.extensions["marketing_script_compiler"] = marketing_script_compiler
 
     @app.errorhandler(ValueError)
@@ -288,7 +294,9 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             f"{principal}|{operation}|{created_at}|".encode() + encoded_parameters
         ).hexdigest()[:24]
         row_count = 1
-        for collection_key in ("briefs", "events", "samples"):
+        for collection_key in (
+            "briefs", "events", "samples", "experiments", "snapshots"
+        ):
             if isinstance(result.get(collection_key), list):
                 row_count = len(result[collection_key])
                 break
@@ -345,6 +353,15 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             400,
             started_at,
         )
+
+    register_script_experiment_routes(
+        app,
+        script_experiments,
+        json_body=json_body,
+        require_auth=require_agent_auth,
+        audited_response=audited_agent_response,
+        invalid_response=audited_invalid_request,
+    )
 
     @app.get("/api/reference-corpus/health")
     def reference_corpus_health():
@@ -870,6 +887,46 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "causal_policy": (
                         "observed drops are facts; reasons are refused without causal evidence; "
                         "AI explanations are labelled interpretation_not_fact"
+                    ),
+                },
+                "register_script_experiment": {
+                    "method": "POST",
+                    "path": "/api/script-experiments",
+                    "contract": "script_experiment_v1",
+                    "required": [
+                        "brief_id", "script_id", "script_sha256|script_text",
+                        "workflow_seed|workflow_id",
+                    ],
+                    "effect": (
+                        "derive and persist one immutable experiment ID from "
+                        "script and workflow lineage"
+                    ),
+                },
+                "ingest_script_experiment_metrics": {
+                    "method": "POST",
+                    "path": "/api/script-experiments/metrics",
+                    "contract": "script_metric_snapshot_v1",
+                    "required": [
+                        "idempotency_key", "experiment_id", "source_platform",
+                        "provider_post_id", "provider_receipt_id", "observed_at",
+                        "view_denominator_basis", "metrics",
+                    ],
+                    "supported_metrics": [
+                        "views", "hold_1s_views", "hold_3s_views",
+                        "completed_views", "shares", "saves", "cta_clicks",
+                        "cta_leads", "cta_signups", "cta_trials",
+                        "cta_purchases",
+                    ],
+                },
+                "rollup_script_experiment_metrics": {
+                    "method": "GET",
+                    "path": "/api/script-experiments/rollup",
+                    "required_one_of": [
+                        ["experiment_id"], ["script_id"], ["workflow_id"],
+                    ],
+                    "measurement": (
+                        "latest cumulative count per post and metric; "
+                        "denominator-weighted descriptive rates"
                     ),
                 },
                 "reference_corpus_status": {

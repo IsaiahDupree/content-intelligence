@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .ai_relatability import NON_AI_PASS_DECISION
+from .script_quality import MAX_QUALITY_REWRITE_ATTEMPTS
 from .contracts import (
     ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
     SCRIPT_INTELLIGENCE_BRIEF_CONTRACT,
@@ -108,6 +109,83 @@ def _lower_first(value: str) -> str:
     return value[:1].lower() + value[1:] if value else value
 
 
+def candidate_quality_failure_codes(
+    decisions: dict[str, bool], audits: dict[str, Any]
+) -> list[str]:
+    """Flatten failed quality findings into a stable revision receipt."""
+
+    codes: list[str] = []
+    owner = audits.get("owner_calibrated_quality") or {}
+    owner_findings = owner.get("findings") or {}
+    owner_quality = owner_findings.get("quality") or {}
+    if not decisions.get("owner_quality", False):
+        codes.extend(owner_quality.get("failure_codes") or ["OWNER_QUALITY"])
+
+    relatability = audits.get("relatability") or {}
+    if not decisions.get("relatability", False):
+        codes.extend(
+            f"RELATABILITY_{str(value).upper()}"
+            for value in (relatability.get("findings") or {}).get("failures") or []
+        )
+
+    qualitative = audits.get("qualitative_relatability") or {}
+    if not decisions.get("qualitative_relatability", False):
+        codes.append(
+            "QUALITATIVE_" + str(qualitative.get("decision") or "FAILED")
+        )
+
+    if not decisions.get("cohort_integrity", False):
+        codes.append("COHORT_INTEGRITY")
+
+    style = audits.get("transcript_style") or {}
+    style_findings = style.get("findings") or {}
+    if not decisions.get("transcript_style", False):
+        codes.extend(
+            f"STYLE_{str(value).upper()}"
+            for value in style_findings.get("failed_checks") or []
+        )
+        if not (style_findings.get("copy_gate") or {}).get("passed", False):
+            codes.append("EXACT_COPY_GATE")
+
+    for decision_key, audit_key, prefix in (
+        ("attention", "attention", "ATTENTION"),
+        ("video_preflight", "video_preflight", "VIDEO_PREFLIGHT"),
+    ):
+        if decisions.get(decision_key, False):
+            continue
+        findings = (audits.get(audit_key) or {}).get("findings") or {}
+        values = findings.get("failures") or ["FAILED"]
+        codes.extend(f"{prefix}_{str(value).upper()}" for value in values)
+
+    if not decisions.get("narrative", False):
+        codes.append("NARRATIVE_COHERENCE")
+    return list(dict.fromkeys(codes))
+
+
+def is_retryable_quality_failure(
+    decisions: dict[str, bool], audits: dict[str, Any]
+) -> bool:
+    """Retry wording and structure failures, never evidence or rights failures."""
+
+    if not decisions.get("cohort_integrity", False):
+        return False
+    qualitative = audits.get("qualitative_relatability") or {}
+    if qualitative.get("decision") == "JUDGE_UNAVAILABLE":
+        return False
+    copy_gate = (
+        (audits.get("transcript_style") or {}).get("findings") or {}
+    ).get("copy_gate") or {}
+    if copy_gate.get("passed") is False:
+        return False
+    return any(
+        not decisions.get(key, False)
+        for key in (
+            "owner_quality", "qualitative_relatability", "transcript_style",
+            "attention", "video_preflight",
+        )
+    )
+
+
 class ScriptIntelligenceService:
     """One bounded interface for evidence selection, writing, and all gates."""
 
@@ -123,6 +201,7 @@ class ScriptIntelligenceService:
         relatability: Any,
         ai_relatability: Any,
         attention: Any,
+        script_experiments: Any,
         transcript_storage_root: str | Path,
         demand_enqueuer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
@@ -135,6 +214,7 @@ class ScriptIntelligenceService:
         self.relatability = relatability
         self.ai_relatability = ai_relatability
         self.attention = attention
+        self.script_experiments = script_experiments
         self.transcript_storage_root = Path(transcript_storage_root).expanduser()
         self.demand_enqueuer = demand_enqueuer
 
@@ -1322,6 +1402,112 @@ class ScriptIntelligenceService:
         stored = self.store.put_script_brief(brief, brief_receipt["receipt_id"])
         return {**stored, "receipt_id": brief_receipt["receipt_id"]}
 
+    def _audit_script_candidate(
+        self,
+        generated: dict[str, Any],
+        brief: dict[str, Any],
+        bank: Any,
+    ) -> dict[str, Any]:
+        relatability = self.relatability.audit(generated)
+        qualitative_relatability = self.ai_relatability.audit(generated)
+        style_fit = self.style_guides.audit({
+            "script_id": generated["script_id"],
+            "style_guide_id": generated["style_guide_id"],
+            "style_guide_receipt_id": generated["style_guide_receipt_id"],
+            "target_duration_seconds": generated["timeline"][-1]["end"],
+        })
+        attention = self.attention.script_audit(generated)
+        preflight = self.attention.video_preflight(generated)
+        stored_script = self.store.script(generated["script_id"])
+        if stored_script is None:
+            raise RuntimeError("generated script was not persisted")
+        cohort_audit = bank.audit_script_against_cohort(
+            script_id=generated["script_id"],
+            script_text=generated["text"],
+            cohort_manifest_path=brief["language"]["cohort_manifest_path"],
+            expected_cohort_id=brief["language"]["cohort_id"],
+            expected_cohort_manifest_sha256=brief["language"][
+                "cohort_manifest_sha256"
+            ],
+        )
+        cohort_pass = (
+            cohort_audit.get("decision") == "PASS_PREDICTED_RELATABILITY"
+        )
+        cohort_quality_audit = self.store.put_audit(
+            "relatability_transcript_cohort",
+            generated["script_id"],
+            "PASS" if cohort_pass else "REJECT_NOT_RELATABLE",
+            float(cohort_audit.get("score") or 0.0),
+            {
+                "cohort_id": brief["language"]["cohort_id"],
+                "expected_cohort_id": cohort_audit.get("expected_cohort_id"),
+                "actual_cohort_id": cohort_audit.get("actual_cohort_id"),
+                "market_tape_audit_id": cohort_audit.get("audit_id"),
+                "script_sha256": cohort_audit.get("script_sha256"),
+                "cohort_manifest_sha256": cohort_audit.get(
+                    "cohort_manifest_sha256"
+                ),
+                "expected_cohort_manifest_sha256": cohort_audit.get(
+                    "expected_cohort_manifest_sha256"
+                ),
+                "actual_cohort_manifest_sha256": cohort_audit.get(
+                    "actual_cohort_manifest_sha256"
+                ),
+                "cohort_manifest_binding_valid": cohort_audit.get(
+                    "cohort_manifest_binding_valid"
+                ),
+                "findings": cohort_audit.get("findings") or {},
+                "input_binding": {
+                    "contract": "stored_script_audit_binding_v1",
+                    "stored_script_bound": True,
+                    "script_id": generated["script_id"],
+                    "script_sha256": self.store.script_audit_sha256(
+                        stored_script
+                    ),
+                },
+            },
+        )
+        owner_quality_audit = generated.get("owner_quality_audit") or {
+            "audit_id": generated.get("owner_quality_audit_id"),
+            "decision": (
+                "PASS"
+                if generated.get("owner_quality", {}).get("decision") == "PASS"
+                else "REVISE_OWNER_QUALITY"
+            ),
+            "score": generated.get("owner_quality", {}).get("score", 0.0),
+            "findings": {
+                "quality": generated.get("owner_quality") or {},
+                "revision": generated.get("quality_revision") or {},
+            },
+        }
+        decisions = {
+            "narrative": (
+                generated.get("narrative_coherence", {}).get("decision") == "PASS"
+            ),
+            "owner_quality": owner_quality_audit["decision"] == "PASS",
+            "relatability": relatability["decision"] == "PASS",
+            "qualitative_relatability": (
+                qualitative_relatability["decision"]
+                in {"PASS", NON_AI_PASS_DECISION}
+            ),
+            "cohort_integrity": cohort_pass,
+            "transcript_style": style_fit["decision"] == "PASS",
+            "attention": attention["decision"] == "PASS",
+            "video_preflight": preflight["decision"] == "PASS",
+        }
+        return {
+            "decisions": decisions,
+            "audits": {
+                "owner_calibrated_quality": owner_quality_audit,
+                "relatability": relatability,
+                "qualitative_relatability": qualitative_relatability,
+                "transcript_cohort_relatability": cohort_quality_audit,
+                "transcript_style": style_fit,
+                "attention": attention,
+                "video_preflight": preflight,
+            },
+        }
+
     def generate_and_audit(self, payload: dict[str, Any]) -> dict[str, Any]:
         brief_id = str(payload.get("brief_id") or "").strip()
         if not brief_id:
@@ -1357,123 +1543,198 @@ class ScriptIntelligenceService:
                 str(value) for value in payload.get("owned_proof") or []
                 if str(value).strip()
             ]
-        generated = self.scripts.generate(generation_input)
+        if payload.get("owned_proof_receipt_ids"):
+            generation_input["owned_proof_receipt_ids"] = [
+                str(value)
+                for value in payload.get("owned_proof_receipt_ids") or []
+                if str(value).strip()
+            ]
         created_at = utc_now()
         request_sha256 = canonical_sha256({
             "brief_id": brief_id,
             "owned_proof": generation_input.get("owned_proof") or [],
+            "owned_proof_receipt_ids": generation_input.get(
+                "owned_proof_receipt_ids"
+            ) or [],
         })
-        if generated.get("status") == "rejected":
-            workflow_id = "workflow_" + canonical_sha256({
-                "brief_id": brief_id,
-                "request_sha256": request_sha256,
-                "result": generated,
-                "created_at": created_at,
-            })[:24]
-            run = {
-                "workflow_id": workflow_id,
-                "brief_id": brief_id,
-                "script_id": None,
-                "state": "rejected",
-                "stage_receipts": {},
-                "result": generated,
-                "created_at": created_at,
-            }
-            self.store.put_workflow_run(run)
-            return {**generated, "workflow_id": workflow_id, "brief_id": brief_id}
-
-        relatability = self.relatability.audit(generated)
-        qualitative_relatability = self.ai_relatability.audit(generated)
-        style_fit = self.style_guides.audit({
-            "script_id": generated["script_id"],
-            "style_guide_id": generated["style_guide_id"],
-            "style_guide_receipt_id": generated[
-                "style_guide_receipt_id"
-            ],
-            "target_duration_seconds": generated["timeline"][-1]["end"],
-        })
-        attention = self.attention.script_audit(generated)
-        preflight = self.attention.video_preflight(generated)
-
         from .transcript_bank import TranscriptBank
 
         bank = TranscriptBank(self.tape.path, self.transcript_storage_root)
-        cohort_audit = bank.audit_script_against_cohort(
-            script_id=generated["script_id"],
-            script_text=generated["text"],
-            cohort_manifest_path=brief["language"]["cohort_manifest_path"],
-            expected_cohort_id=brief["language"]["cohort_id"],
-            expected_cohort_manifest_sha256=brief["language"][
-                "cohort_manifest_sha256"
-            ],
-        )
-        cohort_pass = cohort_audit.get("decision") == "PASS_PREDICTED_RELATABILITY"
-        cohort_quality_audit = self.store.put_audit(
-            "relatability_transcript_cohort",
+        attempts: list[dict[str, Any]] = []
+        generated: dict[str, Any] = {}
+        candidate: dict[str, Any] = {}
+        parent_script_id: str | None = None
+        approved = False
+        retryable = False
+        for attempt_index in range(MAX_QUALITY_REWRITE_ATTEMPTS):
+            candidate_input = dict(generation_input)
+            candidate_input["quality_attempt"] = attempt_index
+            if parent_script_id:
+                candidate_input["parent_script_id"] = parent_script_id
+            generated = self.scripts.generate(candidate_input)
+            if generated.get("status") == "rejected":
+                rejection_revision = {
+                    "contract": "bounded_script_quality_rewrite_v1",
+                    "maximum_attempts": MAX_QUALITY_REWRITE_ATTEMPTS,
+                    "attempt_count": len(attempts) + 1,
+                    "attempts": attempts,
+                    "final_rejection_code": generated.get("code"),
+                    "parent_script_id": parent_script_id,
+                }
+                rejected = {**generated, "quality_revision": rejection_revision}
+                workflow_id = "workflow_" + canonical_sha256({
+                    "brief_id": brief_id,
+                    "request_sha256": request_sha256,
+                    "result": rejected,
+                    "created_at": created_at,
+                })[:24]
+                run = {
+                    "workflow_id": workflow_id,
+                    "brief_id": brief_id,
+                    "script_id": parent_script_id,
+                    "state": "rejected",
+                    "stage_receipts": {},
+                    "result": rejected,
+                    "created_at": created_at,
+                }
+                self.store.put_workflow_run(run)
+                return {
+                    **rejected, "workflow_id": workflow_id,
+                    "brief_id": brief_id,
+                }
+
+            candidate = self._audit_script_candidate(generated, brief, bank)
+            decisions = candidate["decisions"]
+            audits = candidate["audits"]
+            approved = all(decisions.values())
+            failure_codes = candidate_quality_failure_codes(decisions, audits)
+            retryable = (
+                not approved
+                and is_retryable_quality_failure(decisions, audits)
+            )
+            retry_scheduled = (
+                retryable
+                and attempt_index + 1 < MAX_QUALITY_REWRITE_ATTEMPTS
+            )
+            stored_script = self.store.script(generated["script_id"])
+            if stored_script is None:
+                raise RuntimeError("generated script was not persisted")
+            style_audit = audits["transcript_style"]
+            copy_gate = (style_audit.get("findings") or {}).get(
+                "copy_gate"
+            ) or {}
+            local_revision = generated.get("quality_revision") or {}
+            repair_actions = list(local_revision.get("repair_actions") or [])
+            if retry_scheduled:
+                repair_actions.extend((
+                    "rhetorical_structure_rotation",
+                    "full_quality_re_audit",
+                ))
+            audit_ids = {
+                name: audit.get("audit_id")
+                for name, audit in audits.items()
+                if audit.get("audit_id")
+            }
+            attempts.append({
+                "attempt": attempt_index + 1,
+                "script_id": generated["script_id"],
+                "script_sha256": self.store.script_audit_sha256(stored_script),
+                "parent_script_id": local_revision.get("parent_script_id"),
+                "parent_script_sha256": local_revision.get(
+                    "parent_script_sha256"
+                ),
+                "rhetorical_structure_id": (
+                    generated.get("rhetorical_structure") or {}
+                ).get("structure_id"),
+                "initial_owner_failure_codes": local_revision.get(
+                    "initial_failure_codes"
+                ) or [],
+                "failure_codes": failure_codes,
+                "repair_actions": list(dict.fromkeys(repair_actions)),
+                "source_text_modified": bool(
+                    local_revision.get("source_text_modified")
+                ),
+                "decisions": decisions,
+                "audit_ids": audit_ids,
+                "exact_copy_audit_id": style_audit.get("audit_id"),
+                "exact_copy_passed": bool(copy_gate.get("passed")),
+                "approved": approved,
+                "retry_scheduled": retry_scheduled,
+            })
+            if not retry_scheduled:
+                break
+            parent_script_id = generated["script_id"]
+
+        decisions = candidate["decisions"]
+        audits = candidate["audits"]
+        exact_copy_ids = [
+            item["exact_copy_audit_id"] for item in attempts
+            if item.get("exact_copy_audit_id")
+        ]
+        revision = {
+            "contract": "bounded_script_quality_rewrite_v1",
+            "maximum_attempts": MAX_QUALITY_REWRITE_ATTEMPTS,
+            "attempt_count": len(attempts),
+            "attempts": attempts,
+            "final_script_id": generated["script_id"],
+            "final_script_sha256": attempts[-1]["script_sha256"],
+            "final_failure_codes": attempts[-1]["failure_codes"],
+            "exact_copy_audit_ids": exact_copy_ids,
+            "final_exact_copy_audit_id": (
+                exact_copy_ids[-1] if exact_copy_ids else None
+            ),
+            "final_exact_copy_passed": attempts[-1]["exact_copy_passed"],
+            "exhausted": bool(
+                not approved
+                and retryable
+                and len(attempts) == MAX_QUALITY_REWRITE_ATTEMPTS
+            ),
+        }
+        revision_audit = self.store.put_audit(
+            "bounded_script_quality_rewrite",
             generated["script_id"],
-            "PASS" if cohort_pass else "REJECT_NOT_RELATABLE",
-            float(cohort_audit.get("score") or 0.0),
+            "PASS" if approved else "REVISE",
+            100.0 if approved else 0.0,
             {
-                "cohort_id": brief["language"]["cohort_id"],
-                "expected_cohort_id": cohort_audit.get("expected_cohort_id"),
-                "actual_cohort_id": cohort_audit.get("actual_cohort_id"),
-                "market_tape_audit_id": cohort_audit.get("audit_id"),
-                "script_sha256": cohort_audit.get("script_sha256"),
-                "cohort_manifest_sha256": cohort_audit.get("cohort_manifest_sha256"),
-                "expected_cohort_manifest_sha256": cohort_audit.get(
-                    "expected_cohort_manifest_sha256"
-                ),
-                "actual_cohort_manifest_sha256": cohort_audit.get(
-                    "actual_cohort_manifest_sha256"
-                ),
-                "cohort_manifest_binding_valid": cohort_audit.get(
-                    "cohort_manifest_binding_valid"
-                ),
-                "findings": cohort_audit.get("findings") or {},
+                "revision": revision,
                 "input_binding": {
                     "contract": "stored_script_audit_binding_v1",
                     "stored_script_bound": True,
                     "script_id": generated["script_id"],
-                    "script_sha256": self.store.script_audit_sha256(generated),
+                    "script_sha256": attempts[-1]["script_sha256"],
                 },
             },
         )
-        decisions = {
-            "narrative": generated.get("narrative_coherence", {}).get("decision") == "PASS",
-            "relatability": relatability["decision"] == "PASS",
-            "qualitative_relatability": (
-                qualitative_relatability["decision"]
-                in {"PASS", NON_AI_PASS_DECISION}
-            ),
-            "cohort_integrity": cohort_pass,
-            "transcript_style": style_fit["decision"] == "PASS",
-            "attention": attention["decision"] == "PASS",
-            "video_preflight": preflight["decision"] == "PASS",
-        }
-        approved = all(decisions.values())
+        revision["audit_id"] = revision_audit["audit_id"]
         workflow_id = "workflow_" + canonical_sha256({
             "brief_id": brief_id,
             "script_id": generated["script_id"],
             "request_sha256": request_sha256,
-            "audit_ids": [
-                relatability["audit_id"], qualitative_relatability["audit_id"],
-                attention["audit_id"], preflight["audit_id"],
-                cohort_quality_audit["audit_id"], style_fit["audit_id"],
-            ],
+            "revision_audit_id": revision_audit["audit_id"],
         })[:24]
         stage_receipts = {
             "brief_receipt_id": self.store.script_brief_receipt_id(brief_id),
             "narrative_audit_id": self.store.script_gate_summary(
                 generated["script_id"]
             )["latest_audits"].get("narrative_coherence", {}).get("audit_id"),
-            "relatability_audit_id": relatability["audit_id"],
-            "qualitative_relatability_audit_id": qualitative_relatability[
-                "audit_id"
-            ],
-            "cohort_relatability_audit_id": cohort_quality_audit["audit_id"],
-            "transcript_style_audit_id": style_fit["audit_id"],
-            "attention_audit_id": attention["audit_id"],
-            "video_preflight_audit_id": preflight["audit_id"],
+            "owner_quality_audit_id": audits[
+                "owner_calibrated_quality"
+            ]["audit_id"],
+            "relatability_audit_id": audits["relatability"]["audit_id"],
+            "qualitative_relatability_audit_id": audits[
+                "qualitative_relatability"
+            ]["audit_id"],
+            "cohort_relatability_audit_id": audits[
+                "transcript_cohort_relatability"
+            ]["audit_id"],
+            "transcript_style_audit_id": audits[
+                "transcript_style"
+            ]["audit_id"],
+            "attention_audit_id": audits["attention"]["audit_id"],
+            "video_preflight_audit_id": audits[
+                "video_preflight"
+            ]["audit_id"],
+            "bounded_rewrite_audit_id": revision_audit["audit_id"],
         }
         result = {
             "status": "approved" if approved else "revise",
@@ -1481,17 +1742,44 @@ class ScriptIntelligenceService:
             "workflow_id": workflow_id,
             "script": generated,
             "decisions": decisions,
-            "audits": {
-                "relatability": relatability,
-                "qualitative_relatability": qualitative_relatability,
-                "transcript_cohort_relatability": cohort_quality_audit,
-                "transcript_style": style_fit,
-                "attention": attention,
-                "video_preflight": preflight,
-            },
+            "audits": audits,
+            "quality_revision": revision,
             "ready_for_render": approved,
             "owned_retention_status": "no_owned_outcomes",
         }
+        if approved:
+            registration = self.script_experiments.register_experiment({
+                "brief_id": brief_id,
+                "script_id": generated["script_id"],
+                "script_text": generated["text"],
+                "workflow_id": workflow_id,
+                "generation_contract": SCRIPT_GENERATION_CONTRACT,
+                "metadata": {
+                    "registration_source": "script_intelligence_approval",
+                    "owner_quality_audit_id": stage_receipts[
+                        "owner_quality_audit_id"
+                    ],
+                    "bounded_rewrite_audit_id": stage_receipts[
+                        "bounded_rewrite_audit_id"
+                    ],
+                },
+            })
+            experiment = registration["experiment"]
+            result["script_experiment_id"] = experiment["experiment_id"]
+            result["script_experiment_registration"] = {
+                "status": registration["status"],
+                "created": registration["created"],
+                "experiment": experiment,
+            }
+            stage_receipts["script_experiment_id"] = experiment[
+                "experiment_id"
+            ]
+        else:
+            result["script_experiment_id"] = None
+            result["script_experiment_registration"] = {
+                "status": "not_registered",
+                "reason": "script_not_approved_for_render",
+            }
         self.store.put_workflow_run({
             "workflow_id": workflow_id,
             "brief_id": brief_id,

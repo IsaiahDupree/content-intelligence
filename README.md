@@ -16,6 +16,8 @@ The local transcript bank turns performance-qualified Market Tape observations i
 
 The aggregate transcript style-guide service turns those verified, cross-creator receipts into reusable cadence, hook, structure, phrasing, and direct-address targets. Script briefs freeze the selected guide, generation applies it, and a required post-generation audit checks both style fit and source-wording overlap before render readiness. Operating contract and examples: [docs/TIKTOK-TRANSCRIPT-STYLE-GUIDE-SERVICE.md](docs/TIKTOK-TRANSCRIPT-STYLE-GUIDE-SERVICE.md).
 
+Script experiment outcome contracts are documented in [docs/SCRIPT-EXPERIMENT-TELEMETRY-V1.md](docs/SCRIPT-EXPERIMENT-TELEMETRY-V1.md).
+
 The unified intelligence endpoint is bounded and live-scale: it uses indexed latest-row seeks instead of materialized prediction/observation cross-products, reuses one time-windowed keyword rowset, and reports component latency plus whether its candidate scan was exhaustive or truncated. Unvalidated model probabilities cannot influence candidate preselection.
 
 Install or update unattended operation:

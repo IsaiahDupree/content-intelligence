@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 from loguru import logger
 from sqlalchemy import create_engine, text
+from services.spoken_script_admission import admit_spoken_components
 
 try:
     from openai import OpenAI
@@ -59,6 +60,8 @@ class TrendFlashContent:
     
     # Status
     status: str = "pending"
+    block_reason: str = ""
+    quality_metadata: Dict = field(default_factory=dict)
     
     def to_dict(self) -> Dict:
         return {
@@ -84,32 +87,16 @@ class TrendFlashContent:
             "follow_up_prompt": self.follow_up_prompt,
             "video_type": self.video_type,
             "video_path": self.video_path,
-            "status": self.status
+            "status": self.status,
+            "block_reason": self.block_reason or None,
+            "quality": self.quality_metadata,
         }
 
 
-SCRIPT_TEMPLATES = {
-    "educational": {
-        "hook": "everyone's talking about {trend} today — here's the part they're missing.",
-        "context": "it's popping up on {platforms}, and the comments are all saying \"{question}\"",
-        "take": "the real move is {rule}.",
-        "action": "do this: {step1}, {step2}, {step3}.",
-        "cta": "comment \"{keyword}\" and i'll send the exact workflow."
-    },
-    "contrarian": {
-        "hook": "everyone's wrong about {trend} — here's what actually works.",
-        "context": "i've seen 100+ comments this week getting this backwards.",
-        "take": "forget {common}. instead, {contrarian}.",
-        "action": "here's the real play: {step1}, {step2}.",
-        "cta": "comment \"{keyword}\" if you want the full breakdown."
-    },
-    "meme": {
-        "hook": "{trend} is everywhere rn and honestly? same.",
-        "context": "my timeline is just {observation}.",
-        "take": "but real talk, here's what actually matters:",
-        "action": "{step1}, {step2}.",
-        "cta": "drop a 🔥 if you feel this."
-    }
+SCRIPT_VARIANT_GUIDANCE = {
+    "educational": "explain one supported change, then one supported action",
+    "contrarian": "contrast two supplied facts without declaring a consensus",
+    "meme": "use concise phrasing without inventing personal experience",
 }
 
 
@@ -186,12 +173,48 @@ class FlashGenerator:
         
         # Generate script
         script = await self._generate_script(cluster, variant)
-        content.script_hook = script.get("hook", "")
-        content.script_context = script.get("context", "")
-        content.script_take = script.get("take", "")
-        content.script_action = script.get("action", "")
-        content.script_cta = script.get("cta", "")
-        content.full_script = self._build_full_script(script)
+        admission = self._admit_script(cluster, script)
+        content.quality_metadata = {
+            key: admission[key]
+            for key in (
+                "contract", "rhetorical_structure", "owner_quality",
+                "claim_safety", "delivery_visual_plan", "revision", "rights",
+                "blocking_failure_codes",
+            )
+        }
+        if script.get("_generation_error"):
+            content.quality_metadata["provider_error"] = script["_generation_error"]
+            content.status = "blocked_provider_error"
+            content.block_reason = str(script["_generation_error"])
+            content.quality_metadata["blocked_candidate"] = {
+                "transcript": admission["transcript"],
+                "timeline": admission["timeline"],
+            }
+            self._save_content(content)
+            logger.warning(f"Content blocked by provider error: {content.id}")
+            return content
+        if admission["status"] != "ready":
+            content.status = "blocked_quality"
+            content.block_reason = admission["block_reason"]
+            content.quality_metadata["blocked_candidate"] = {
+                "transcript": admission["transcript"],
+                "timeline": admission["timeline"],
+            }
+            self._save_content(content)
+            logger.warning(f"Content blocked by script quality: {content.id}")
+            return content
+
+        admitted_script = {
+            str(item.get("source_field")): str(item.get("text") or "")
+            for item in admission["timeline"]
+            if item.get("source_field")
+        }
+        content.script_hook = admitted_script.get("hook", "")
+        content.script_context = admitted_script.get("context", "")
+        content.script_take = admitted_script.get("take", "")
+        content.script_action = admitted_script.get("action", "")
+        content.script_cta = admitted_script.get("cta", "")
+        content.full_script = admission["transcript"]
         
         # Generate titles
         titles = await self._generate_titles(cluster)
@@ -201,7 +224,7 @@ class FlashGenerator:
         content.title_twitter = titles.get("twitter", "")
         
         # Generate captions
-        content.captions = self._generate_captions(script)
+        content.captions = self._generate_captions(admitted_script)
         
         # Generate comment replies
         content.comment_replies = await self._generate_replies(cluster)
@@ -222,15 +245,19 @@ class FlashGenerator:
         return content
     
     async def _generate_script(self, cluster: TrendCluster, variant: str) -> Dict:
-        """Generate script using AI or templates."""
+        """Generate an AI candidate, or a source-only candidate that will gate."""
         if self.client:
             return await self._generate_script_ai(cluster, variant)
-        return self._generate_script_template(cluster, variant)
+        candidate = self._source_only_candidate(cluster)
+        candidate["_generation_error"] = "provider_unavailable"
+        return candidate
     
     async def _generate_script_ai(self, cluster: TrendCluster, variant: str) -> Dict:
         """Generate script using AI."""
         try:
-            template = SCRIPT_TEMPLATES.get(variant, SCRIPT_TEMPLATES["educational"])
+            guidance = SCRIPT_VARIANT_GUIDANCE.get(
+                variant, SCRIPT_VARIANT_GUIDANCE["educational"]
+            )
             
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -239,21 +266,20 @@ class FlashGenerator:
                         "role": "system",
                         "content": f"""Generate a trend flash video script.
 
-Topic: {cluster.topic}
+Topic label: {cluster.topic}
+Supplied summary: {cluster.summary}
 Top Questions: {', '.join(cluster.top_questions[:3])}
 Platforms: {', '.join(cluster.platforms)}
 Intent Keywords: {', '.join(cluster.intent_keywords_found)}
 
-Use this {variant} template structure:
-- Hook (0-2s): {template['hook']}
-- Context (2-7s): {template['context']}
-- Take (7-20s): {template['take']}
-- Action (20-35s): {template['action']}
-- CTA (last 3s): {template['cta']}
+Variant guidance: {guidance}
 
 Return JSON with: hook, context, take, action, cta
 Each should be a complete, ready-to-read sentence.
-Keep it casual, punchy, and actionable."""
+Keep it concise and spoken.
+Use only the supplied fields. Do not invent statistics, results, consensus,
+personal experience, first-party claims, offers, or unavailable assets.
+Do not imitate or mention a source creator's identity, likeness, or voice."""
                     }
                 ],
                 temperature=0.7,
@@ -265,40 +291,46 @@ Keep it casual, punchy, and actionable."""
             
         except Exception as e:
             logger.warning(f"AI script generation failed: {e}")
-            return self._generate_script_template(cluster, variant)
+            candidate = self._source_only_candidate(cluster)
+            candidate["_generation_error"] = f"provider_error:{type(e).__name__}"
+            return candidate
     
-    def _generate_script_template(self, cluster: TrendCluster, variant: str) -> Dict:
-        """Generate script using templates."""
-        template = SCRIPT_TEMPLATES.get(variant, SCRIPT_TEMPLATES["educational"])
-        
-        # Get platforms string
-        platforms = " and ".join(cluster.platforms[:2]) if cluster.platforms else "social media"
-        
-        # Get question
-        question = cluster.top_questions[0] if cluster.top_questions else "how do I do this?"
-        
-        # Generate keyword CTA
-        keyword = cluster.topic.split()[0].lower() if cluster.topic else "workflow"
-        
+    def _source_only_candidate(self, cluster: TrendCluster) -> Dict:
+        """Return supplied fields only; the quality gate decides sufficiency."""
         return {
-            "hook": template["hook"].format(trend=cluster.topic),
-            "context": template["context"].format(
-                platforms=platforms,
-                question=question[:50]
-            ),
-            "take": template["take"].format(
-                rule="focus on consistency over perfection",
-                common="overthinking it",
-                contrarian="just start and iterate"
-            ),
-            "action": template["action"].format(
-                step1="start with what you have",
-                step2="post consistently",
-                step3="engage with your audience"
-            ),
-            "cta": template["cta"].format(keyword=keyword)
+            "hook": cluster.top_questions[0] if cluster.top_questions else cluster.topic,
+            "context": cluster.summary,
+            "take": "",
+            "action": "",
+            "cta": "",
         }
-    
+
+    def _admit_script(self, cluster: TrendCluster, script: Dict) -> Dict:
+        role_by_field = {
+            "hook": "hook",
+            "context": "context",
+            "take": "claim",
+            "action": "method",
+            "cta": "cta",
+        }
+        components = {
+            role: [{
+                "node_id": f"trend_flash_{field_name}",
+                "source_field": field_name,
+                "text": str(script.get(field_name) or ""),
+            }]
+            for field_name, role in role_by_field.items()
+            if str(script.get(field_name) or "").strip()
+        }
+        return admit_spoken_components(
+            components,
+            family="evidence_story",
+            seed=cluster.id,
+            target_seconds=38.0,
+            # This legacy cluster has no receipt-resolved evidence linkage.
+            evidence_phrases=(),
+        )
+
     def _build_full_script(self, script: Dict) -> str:
         """Build full script from parts."""
         parts = [

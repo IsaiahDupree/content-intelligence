@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -170,6 +171,20 @@ def test_compiler_persists_an_approved_idempotent_package(tmp_path: Path) -> Non
     assert first["script"]["beats"][0]["block"] == "hook"
     assert first["script"]["beats"][-1]["block"] == "call_to_action"
     assert first["script"]["beats"][-1]["end_seconds"] == 60.0
+    assert first["script"]["rhetorical_structure"]["contract"] == (
+        "evidence_safe_rhetorical_structure_v1"
+    )
+    plan = first["script"]["delivery_visual_plan"]
+    assert plan["contract"] == "delivery_visual_plan_v1"
+    assert plan["cue_count"] >= len(first["script"]["beats"])
+    assert plan["actual_maximum_visual_interrupt_gap_seconds"] <= 3.0
+    assert plan["asset_policy"]["reference_clips_used"] is False
+    assert first["quality"]["owner_calibrated"]["decision"] == "PASS"
+    assert first["revision"]["attempt_count"] <= 3
+    assert first["revision"]["final_exact_copy_audit_id"] == first[
+        "corpus_audit"
+    ]["audit_id"]
+    assert first["revision"]["source_proof_text_modified"] is False
     assert compiler.get(first["script_id"]) == first
     assert store.corpus_status(CORPUS_ID)["counts"] == {
         "items": 6,
@@ -195,6 +210,98 @@ def test_source_backed_proof_requires_a_receipt(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="requires at least one source_receipt_id"):
         MarketingScriptCompiler(store).compile(payload)
+
+
+def test_experience_proof_rejects_an_unresolved_receipt(tmp_path: Path) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["narrative"]["proof"] = {
+        "statement": "I opened the inbox and sent the waiting client a clear reply",
+        "evidence_type": "experience",
+        "source_receipt_ids": ["caller-self-attested"],
+    }
+
+    with pytest.raises(ValueError, match="UNKNOWN_OWNED_EVIDENCE_RECEIPT"):
+        MarketingScriptCompiler(store).compile(payload)
+
+
+def test_experience_proof_requires_exact_file_backing(tmp_path: Path) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    statement = "I opened the inbox and sent the waiting client a clear reply"
+    source_file = tmp_path / "owned-client-note.txt"
+    source_file.write_text(
+        "Saved owner note. " + statement + ". End of note.",
+        encoding="utf-8",
+    )
+    receipt = store.put_owned_evidence(
+        statement=statement,
+        evidence_kind="owner_note",
+        owner_id="isaiah",
+        source_path=source_file,
+    )
+    payload = request_payload()
+    payload["narrative"]["proof"] = {
+        "statement": statement,
+        "evidence_type": "experience",
+        "source_receipt_ids": [receipt["receipt_id"]],
+    }
+
+    package = MarketingScriptCompiler(store).compile(payload)
+
+    assert package["proof_evidence_gate"]["required"] is True
+    assert package["proof_evidence_gate"]["passed"] is True
+    assert package["proof_evidence_gate"]["receipt_ids"] == [
+        receipt["receipt_id"]
+    ]
+    assert statement in package["script"]["transcript"]
+    source_file.write_text("The bound statement was removed.", encoding="utf-8")
+    with pytest.raises(ValueError, match="INVALID_OWNED_EVIDENCE_BINDING"):
+        MarketingScriptCompiler(store).compile(payload)
+
+
+def test_qualitative_failure_is_rewritten_three_times_and_keeps_a_plan(
+    tmp_path: Path,
+) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["title"] = "Generic internal wording"
+    payload["narrative"] = {
+        "hook": "The content machine uses a typed contract",
+        "problem": "The workflow boundary needs a script receipt",
+        "stakes": "The routing rules use a matrix row",
+        "reframe": "The visible result is a production decision",
+        "steps": [
+            "use the provider configuration",
+            "use the provider configuration",
+        ],
+        "proof": {
+            "statement": "The saved source says the same words",
+            "evidence_type": "worked_example",
+            "source_receipt_ids": [],
+        },
+        "takeaway": "The output receipt is the visible state",
+        "cta": {
+            "text": "Follow for more",
+            "action": "follow",
+            "destination": "",
+        },
+    }
+
+    package = MarketingScriptCompiler(store).compile(payload)
+
+    assert package["status"] == "revise"
+    assert package["revision"]["attempt_count"] == 3
+    assert len(package["revision"]["exact_copy_audit_ids"]) == 3
+    assert len({
+        item["structure_id"] for item in package["revision"]["attempts"]
+    }) == 3
+    assert package["revision"]["source_proof_text_modified"] is False
+    assert package["script"]["delivery_visual_plan"]["cue_count"] >= len(
+        package["script"]["beats"]
+    )
+    assert package["script"]["delivery_visual_plan"]["asset_policy"][
+        "reference_clips_used"
+    ] is False
 
 
 def test_authenticated_http_compiles_and_retrieves_package(tmp_path: Path) -> None:
@@ -232,6 +339,16 @@ def test_authenticated_http_compiles_and_retrieves_package(tmp_path: Path) -> No
     assert denied.status_code == 401
     assert written.status_code == 200
     assert package["status"] == "approved"
+    assert package["script_experiment_id"].startswith("sxp_")
+    experiment = app.extensions["script_experiment_telemetry"].experiment(
+        package["script_experiment_id"]
+    )
+    assert experiment is not None
+    assert experiment["script_id"] == package["script_id"]
+    assert experiment["workflow_id"] == package["workflow_id"]
+    assert experiment["script_sha256"] == hashlib.sha256(
+        package["script"]["transcript"].encode("utf-8")
+    ).hexdigest()
     assert fetched.status_code == 200
     assert json.loads(fetched.data)["result_sha256"] == package["result_sha256"]
 

@@ -847,6 +847,22 @@ def test_authenticated_source_moment_variants_share_cohort_and_pass_all_gates(
         assert script["text"].startswith(moment["situation"] + ".")
         assert script["evidence_summary"]["viral_transcript_patterns"] >= 5
         assert script["evidence_summary"]["creator_count"] >= 3
+        assert "public creator videos" not in script["text"].casefold()
+        assert script["owner_quality"]["judgments"][
+            "technical_language_leakage"
+        ]["corpus_count_narration_hits"] == []
+        plan = script["delivery_visual_plan"]
+        assert plan["maximum_visual_interrupt_gap_seconds"] == 3.0
+        assert plan["actual_maximum_visual_interrupt_gap_seconds"] <= 3.0
+        assert plan["cues"][-1]["end_seconds"] == script["timeline"][-1][
+            "end"
+        ]
+        assert brief["human_context"]["moment_receipt_id"] not in script[
+            "source_receipt_ids"
+        ]
+        assert brief["human_context"]["moment_receipt_id"] in script[
+            "evidence_binding_receipt_ids"
+        ]
         source_transcript_ids = {
             row["transcript_id"] for row in brief["language"]["sources"]
         }
@@ -865,21 +881,305 @@ def test_authenticated_source_moment_variants_share_cohort_and_pass_all_gates(
         assert set(stored_run["stage_receipts"]) == {
             "brief_receipt_id",
             "narrative_audit_id",
+            "owner_quality_audit_id",
             "relatability_audit_id",
             "qualitative_relatability_audit_id",
             "cohort_relatability_audit_id",
             "transcript_style_audit_id",
             "attention_audit_id",
             "video_preflight_audit_id",
+            "bounded_rewrite_audit_id",
+            "script_experiment_id",
         }
         assert all(stored_run["stage_receipts"].values())
+        experiment_id = workflow["script_experiment_id"]
+        assert experiment_id == stored_run["stage_receipts"][
+            "script_experiment_id"
+        ]
+        registration = workflow["script_experiment_registration"]
+        assert registration["status"] in {"created", "idempotent_replay"}
+        experiment = engine.script_experiments.experiment(experiment_id)
+        assert experiment is not None
+        assert experiment["brief_id"] == brief["brief_id"]
+        assert experiment["script_id"] == script["script_id"]
+        assert experiment["workflow_id"] == workflow["workflow_id"]
+        assert experiment["script_sha256"] == hashlib.sha256(
+            script["text"].encode("utf-8")
+        ).hexdigest()
         gates = engine.store.script_gate_summary(script["script_id"])
         assert gates["ready_for_render"] is True
-        assert len(gates["latest_audits"]) == 7
+        assert len(gates["latest_audits"]) == 9
+        assert gates["latest_audits"][
+            "owner_calibrated_quality"
+        ]["decision"] == "PASS"
+        assert "bounded_script_quality_rewrite" in gates["latest_audits"]
         assert all(
             audit["stored_script_binding_valid"]
             for audit in gates["latest_audits"].values()
         )
+
+
+def test_recent_script_opening_is_a_blocking_owner_quality_finding(tmp_path):
+    _app, engine = app_and_engine(tmp_path)
+    brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    })
+    assert brief["status"] == "ready", brief
+    first = engine.scripts.generate(dict(brief["generation_input"]))
+    assert first["status"] == "generated_pending_gates", first
+
+    next_input = dict(brief["generation_input"])
+    next_input["brief_id"] = "distinct-owner-quality-brief"
+    next_input["audience"] = "independent software founders"
+    second = engine.scripts.generate(next_input)
+
+    repeated = second["owner_quality"]["judgments"]["repeated_phrasing"]
+    assert repeated["prior_opening_matches"] >= 1
+    assert repeated["passed"] is False
+    assert "OWNER_REPEATED_PHRASING" in second["owner_quality"][
+        "failure_codes"
+    ]
+    assert second["owner_quality"]["decision"] == "REVISE"
+    assert second["delivery_visual_plan"][
+        "actual_maximum_visual_interrupt_gap_seconds"
+    ] <= 3.0
+
+
+def test_owner_quality_workflow_stops_after_three_full_audits(tmp_path):
+    _app, engine = app_and_engine(tmp_path)
+    first_brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    })
+    first = engine.scripts.generate(dict(first_brief["generation_input"]))
+    assert first["status"] == "generated_pending_gates", first
+
+    next_brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "independent software founders",
+        "objective": "qualified_attention",
+    })
+    assert next_brief["human_context"]["selected_moment"]["situation"] == (
+        first_brief["human_context"]["selected_moment"]["situation"]
+    )
+    result = engine.script_intelligence.generate_and_audit({
+        "brief_id": next_brief["brief_id"],
+    })
+
+    revision = result["quality_revision"]
+    assert result["status"] == "revise"
+    assert result["script_experiment_id"] is None
+    assert result["script_experiment_registration"] == {
+        "status": "not_registered",
+        "reason": "script_not_approved_for_render",
+    }
+    assert engine.script_experiments.experiments({
+        "script_id": result["script"]["script_id"]
+    }) == []
+    assert revision["maximum_attempts"] == 3
+    assert revision["attempt_count"] == 3
+    assert revision["exhausted"] is True
+    assert all(
+        "OWNER_REPEATED_PHRASING" in item["failure_codes"]
+        for item in revision["attempts"]
+    )
+    for item in revision["attempts"]:
+        stored = engine.store.script(item["script_id"])
+        assert stored["delivery_visual_plan"][
+            "actual_maximum_visual_interrupt_gap_seconds"
+        ] <= 3.0
+    run = engine.store.workflow_runs(
+        script_id=result["script"]["script_id"], limit=1
+    )[0]
+    assert run["stage_receipts"]["owner_quality_audit_id"]
+    assert run["stage_receipts"]["bounded_rewrite_audit_id"]
+
+
+def test_human_moment_and_owned_claims_fail_closed_without_stored_binding(
+    tmp_path,
+):
+    _app, engine = app_and_engine(tmp_path)
+    brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    })
+    base = dict(brief["generation_input"])
+
+    altered = {**base, "human_moment": dict(base["human_moment"])}
+    altered["human_moment"]["situation"] = "A caller supplied this new moment"
+    unbound_moment = engine.scripts.generate(altered)
+    assert unbound_moment["code"] == "REJECT_UNBOUND_HUMAN_MOMENT"
+
+    statement = "I opened the inbox and sent the waiting client a clear reply"
+    unbound_claim = engine.scripts.generate({
+        **base,
+        "owned_proof": [statement],
+    })
+    assert unbound_claim["code"] == "REJECT_UNBOUND_OWNED_PROOF"
+
+    statement_sha = hashlib.sha256(statement.encode("utf-8")).hexdigest()
+    forged = engine.store.put_receipt(
+        "owned_claim_evidence",
+        "owned",
+        "isaiah",
+        None,
+        {
+            "contract": "owned_claim_evidence_v1",
+            "statement": statement,
+            "statement_sha256": statement_sha,
+            "evidence_kind": "caller_note",
+            "owner_id": "isaiah",
+            "ownership_attested": True,
+            "first_person_authorized": True,
+            "evidence_receipt_ids": [],
+            "evidence_sha256": "0" * 64,
+        },
+    )
+    forged_claim = engine.scripts.generate({
+        **base,
+        "owned_proof": [statement],
+        "owned_proof_receipt_ids": [forged["receipt_id"]],
+    })
+    assert forged_claim["code"] == "REJECT_INVALID_OWNED_PROOF_RECEIPT"
+
+    owned_file = tmp_path / "owned-reply-note.txt"
+    owned_file.write_text(
+        "Saved owner note. " + statement + ". End of note.",
+        encoding="utf-8",
+    )
+    valid = engine.store.put_owned_claim_receipt(
+        statement=statement,
+        evidence_kind="owner_note",
+        owner_id="isaiah",
+        evidence_path=owned_file,
+    )
+    generated = engine.scripts.generate({
+        **base,
+        "owned_proof": [statement],
+        "owned_proof_receipt_ids": [valid["receipt_id"]],
+    })
+
+    assert generated["status"] == "generated_pending_gates", generated
+    assert statement in generated["text"]
+    assert valid["receipt_id"] in generated["evidence_binding_receipt_ids"]
+    assert valid["receipt_id"] not in generated["source_receipt_ids"]
+    assert generated["speaker_claim_gate"]["decision"] == "PASS"
+    assert "first_person_authorized" not in valid["payload"]
+    assert "ownership_attested" not in valid["payload"]
+    source_receipt = engine.store.receipt(
+        valid["payload"]["evidence_receipt_ids"][0]
+    )
+    assert source_receipt["payload"]["statement_sha256"] == statement_sha
+    assert source_receipt["payload"]["source_sha256"] == hashlib.sha256(
+        owned_file.read_bytes()
+    ).hexdigest()
+
+
+def test_public_first_person_source_is_attributed_not_adopted(tmp_path):
+    _app, engine = app_and_engine(tmp_path)
+    source_text = (
+        "I felt burned out and stuck when AI automation made the client wait "
+        "while I kept building the app. The tools kept multiplying while the "
+        "same inbox stayed open. A useful change was to name the pressure, show "
+        "one result, and keep the next step small enough to try in one workday."
+    )
+    payload = {
+        "text": source_text,
+        "segments": [
+            {"start": 0.0, "end": 12.0, "text": source_text.split(". ")[0]},
+            {"start": 12.0, "end": 45.0, "text": source_text},
+        ],
+    }
+    payload_sha = canonical_sha256(payload)
+    transcript_path = tmp_path / "transcript-0.json"
+    transcript_path.write_text(
+        json.dumps(payload, sort_keys=True), encoding="utf-8"
+    )
+    with closing(sqlite3.connect(engine.tape.path)) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM mt_transcript_artifacts "
+            "WHERE transcript_id='whisper-script-0'"
+        ).fetchone()
+        source_row = dict(row)
+        audit = json.loads(source_row["audit_json"])
+        audit["transcript_payload_sha256"] = payload_sha
+        connection.execute(
+            "UPDATE mt_content_genomes SET transcript=?, "
+            "transcript_embedding_ref=? WHERE video_id=?",
+            (
+                source_text,
+                f"sha256:{payload_sha}",
+                "youtube:video:script-source-0",
+            ),
+        )
+        new_row = {
+            **source_row,
+            "transcript_id": "whisper-script-first-person",
+            "transcript_path": str(transcript_path),
+            "transcript_sha256": payload_sha,
+            "word_count": len(source_text.split()),
+            "audit_json": json.dumps(audit, sort_keys=True),
+            "created_at": "2099-08-25T00:00:00+00:00",
+        }
+        columns = list(new_row)
+        connection.execute(
+            f"INSERT INTO mt_transcript_artifacts ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            [new_row[column] for column in columns],
+        )
+        connection.execute(
+            "INSERT INTO mt_transcript_payload_snapshots VALUES (?, ?, ?, ?)",
+            (
+                new_row["transcript_id"],
+                payload_sha,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                new_row["created_at"],
+            ),
+        )
+        connection.commit()
+
+    video_ids = [
+        f"youtube:video:script-source-{index}" for index in range(5)
+    ]
+    discovery = engine.viral.discover_for_videos(
+        "AI automation", video_ids, limit=5
+    )
+    moments = engine.audience.human_moments(
+        "AI automation",
+        "software founders",
+        limit=1,
+        video_ids=[video_ids[0]],
+        require_immutable_artifacts=True,
+    )
+    assert discovery["receipt_count"] == 5
+    assert moments["status"] == "complete", moments
+    moment = moments["moments"][0]
+    assert " I" in moment["situation"] or moment["situation"].startswith("I ")
+
+    generated = engine.scripts.generate({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+        "claim": "Reduce the wait before adding another step",
+        "brief_id": "public-first-person-attribution-test",
+        "human_moment": {
+            **moment,
+            "source_moment_receipt_id": moments["receipt"]["receipt_id"],
+        },
+        "receipt_ids": [item["receipt_id"] for item in discovery["receipts"]],
+    })
+
+    assert generated["status"] == "generated_pending_gates", generated
+    assert f"One person said, “{moment['situation']}" in generated["text"]
+    gate = generated["speaker_claim_gate"]
+    assert gate["public_first_person_excerpt_present"] is True
+    assert gate["public_first_person_excerpt_attributed"] is True
+    assert gate["template_first_person_inferred_from_source"] is False
 
 
 def test_variant_selector_rejects_invalid_or_unavailable_indexes_with_audit(
@@ -1007,6 +1307,9 @@ def test_configured_ai_relatability_failure_blocks_render(tmp_path):
     assert result["ready_for_render"] is False
     assert result["decisions"]["qualitative_relatability"] is False
     assert audit["decision"] == "JUDGE_UNAVAILABLE"
+    assert result["script"]["delivery_visual_plan"][
+        "actual_maximum_visual_interrupt_gap_seconds"
+    ] <= 3.0
 
 
 def test_one_call_product_route_builds_brief_and_audits_script(tmp_path):

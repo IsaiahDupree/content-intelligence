@@ -13,11 +13,22 @@ from .reference_corpus import (
     utc_now,
     words,
 )
+from .script_quality import (
+    ANGLE_STRUCTURE,
+    MAX_QUALITY_REWRITE_ATTEMPTS,
+    arrange_role_components,
+    audit_owner_calibrated_quality,
+    build_delivery_visual_plan,
+    owner_repair_actions,
+    repair_timeline_for_owner_quality,
+    retime_timeline,
+    select_rhetorical_structure,
+)
 
 
 REQUEST_CONTRACT = "reference_marketing_script_request_v1"
 PACKAGE_CONTRACT = "reference_marketing_script_package_v1"
-COMPILER_VERSION = "reference_marketing_script_compiler_v1"
+COMPILER_VERSION = "reference_marketing_script_compiler_v2"
 SPOKEN_WORDS_PER_SECOND = 2.35
 
 OBJECTIVES = ("awareness", "educate", "engage", "convert")
@@ -29,7 +40,11 @@ PROOF_TYPES = (
     "sourced_fact",
     "hypothesis",
 )
-SOURCE_REQUIRED_PROOF_TYPES = ("owned_measurement", "sourced_fact")
+SOURCE_REQUIRED_PROOF_TYPES = ("sourced_fact",)
+OWNED_REQUIRED_PROOF_TYPES = ("experience", "owned_measurement")
+FIRST_PERSON_WORDS = {
+    "i", "i'm", "i've", "me", "my", "mine", "we", "we've", "our", "ours",
+}
 
 JARGON_WORDS = (
     "infrastructure", "orchestration", "configuration", "pipeline",
@@ -39,7 +54,12 @@ LEADING_STEP_RE = re.compile(
     r"^(?:step\s+\d+\s*[:,.-]?|first|second|third|fourth|next|then|finally)\s*[:,.-]?\s*",
     re.IGNORECASE,
 )
-STEP_TRANSITIONS = ("First", "Next", "Then", "Finally")
+STEP_OPENERS = {
+    "contrast_reveal": ("", "Now: ", "One more check: ", "Last: "),
+    "stakes_then_method": ("Start here: ", "", "Also: ", "Finish here: "),
+    "proof_bridge": ("Try this: ", "", "Now: ", "Close with: "),
+    "myth_turn": ("Check this: ", "", "Also: ", "Last: "),
+}
 
 
 def _text(value: Any, field: str, *, maximum: int = 1200) -> str:
@@ -97,9 +117,26 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
         for value in (raw_proof.get("source_receipt_ids") or [])
         if str(value).strip()
     })
+    proof_statement = _text(
+        raw_proof.get("statement"),
+        "narrative.proof.statement",
+        maximum=1200,
+    )
+    first_person_claim = bool(
+        {token.casefold().replace("’", "'") for token in words(proof_statement)}
+        & FIRST_PERSON_WORDS
+    )
+    owned_binding_required = (
+        proof_type in OWNED_REQUIRED_PROOF_TYPES or first_person_claim
+    )
     if proof_type in SOURCE_REQUIRED_PROOF_TYPES and not source_receipt_ids:
         raise ValueError(
             f"{proof_type} proof requires at least one source_receipt_id"
+        )
+    if owned_binding_required and not source_receipt_ids:
+        raise ValueError(
+            "experience, owned measurement, and first-person proof require "
+            "stored owned evidence"
         )
 
     raw_cta = narrative.get("cta")
@@ -141,11 +178,7 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "steps": steps,
             "proof": {
-                "statement": _text(
-                    raw_proof.get("statement"),
-                    "narrative.proof.statement",
-                    maximum=1200,
-                ),
+                "statement": proof_statement,
                 "evidence_type": proof_type,
                 "source_receipt_ids": source_receipt_ids,
             },
@@ -158,107 +191,85 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _step_text(value: str, index: int, total: int) -> str:
+def _step_text(value: str, index: int, structure_id: str) -> str:
     clean = LEADING_STEP_RE.sub("", value).strip()
-    if index < len(STEP_TRANSITIONS):
-        transition = STEP_TRANSITIONS[index]
-    else:
-        transition = f"Step {index + 1}"
-    if total == 2 and index == 1:
-        transition = "Then"
-    return _finish_sentence(f"{transition}, {clean}")
+    openers = STEP_OPENERS.get(structure_id, ())
+    opener = openers[index] if index < len(openers) else ""
+    line = f"{opener}{clean}" if opener else clean[:1].upper() + clean[1:]
+    return _finish_sentence(line)
 
 
-def _build_beats(request: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_beats(
+    request: dict[str, Any], structure: dict[str, Any]
+) -> list[dict[str, Any]]:
     narrative = request["narrative"]
-    beats = [
-        {
+    components: dict[str, list[dict[str, Any]]] = {
+        "hook": [{
             "node_id": "hook",
             "block": "hook",
             "purpose": "earn attention",
             "text": _finish_sentence(narrative["hook"]),
-        },
-        {
+        }],
+        "problem": [{
             "node_id": "problem",
             "block": "problem",
             "purpose": "create recognition",
             "text": _finish_sentence(narrative["problem"]),
-        },
-        {
+        }],
+        "stakes": [{
             "node_id": "stakes",
             "block": "stakes",
             "purpose": "make the consequence concrete",
             "text": _finish_sentence(narrative["stakes"]),
-        },
-        {
+        }],
+        "reframe": [{
             "node_id": "reframe",
             "block": "reframe",
             "purpose": "replace the weak mental model",
             "text": _finish_sentence(narrative["reframe"]),
-        },
-    ]
-    total_steps = len(narrative["steps"])
-    for index, step in enumerate(narrative["steps"]):
-        beats.append({
+        }],
+        "steps": [{
             "node_id": f"step_{index + 1}",
             "block": "teaching_step",
             "purpose": "give a usable action",
-            "text": _step_text(step, index, total_steps),
-        })
+            "text": _step_text(step, index, structure["structure_id"]),
+        } for index, step in enumerate(narrative["steps"])],
+    }
     proof_text = narrative["proof"]["statement"]
-    if (
-        narrative["proof"]["evidence_type"] == "worked_example"
-        and not proof_text.lower().startswith("for example")
-    ):
-        proof_text = "For example, " + proof_text[0].lower() + proof_text[1:]
-    beats.extend((
-        {
+    components.update({
+        "proof": [{
             "node_id": "proof",
             "block": "proof",
             "purpose": "make the lesson believable",
             "text": _finish_sentence(proof_text),
-        },
-        {
+        }],
+        "takeaway": [{
             "node_id": "takeaway",
             "block": "takeaway",
             "purpose": "compress the lesson",
             "text": _finish_sentence(narrative["takeaway"]),
-        },
-        {
+        }],
+        "cta": [{
             "node_id": "cta",
             "block": "call_to_action",
             "purpose": "give one relevant next step",
             "text": _finish_sentence(narrative["cta"]["text"]),
-        },
-    ))
-    return beats
+        }],
+    })
+    return arrange_role_components(components, structure)
 
 
 def _time_beats(
     beats: list[dict[str, Any]], target_seconds: int
 ) -> list[dict[str, Any]]:
-    total_words = sum(len(words(beat["text"])) for beat in beats)
-    cursor = 0.0
-    timed: list[dict[str, Any]] = []
-    for index, beat in enumerate(beats):
-        count = len(words(beat["text"]))
-        end = (
-            float(target_seconds)
-            if index == len(beats) - 1
-            else cursor + target_seconds * count / max(1, total_words)
-        )
-        timed.append({
-            **beat,
-            "start_seconds": round(cursor, 3),
-            "end_seconds": round(end, 3),
-            "word_count": count,
-        })
-        cursor = end
-    return timed
+    return retime_timeline(beats, target_seconds=float(target_seconds))
 
 
 def _quality_report(
-    request: dict[str, Any], beats: list[dict[str, Any]], transcript: str
+    request: dict[str, Any],
+    beats: list[dict[str, Any]],
+    transcript: str,
+    owner_quality: dict[str, Any],
 ) -> dict[str, Any]:
     transcript_words = words(transcript)
     sentences = [
@@ -340,8 +351,14 @@ def _quality_report(
             "action": request["narrative"]["cta"]["action"],
             "word_count": cta_words,
         },
+        "owner_calibrated_quality": {
+            "passed": owner_quality["decision"] == "PASS",
+            "score": owner_quality["score"],
+            "contract": owner_quality["contract"],
+            "failure_codes": owner_quality["failure_codes"],
+        },
     }
-    weighted = (
+    baseline_weighted = (
         checks["duration_fit"]["score"] * 0.20
         + checks["hook"]["score"] * 0.12
         + checks["plain_language"]["score"] * 0.16
@@ -351,23 +368,64 @@ def _quality_report(
         + checks["value_before_offer"]["score"] * 0.08
         + checks["single_cta"]["score"] * 0.08
     )
+    weighted = baseline_weighted * 0.75 + owner_quality["score"] * 0.25
     failed = [name for name, check in checks.items() if not check["passed"]]
     return {
         "status": "pass" if not failed and weighted >= 80 else "revise",
         "score": round(weighted, 3),
         "checks": checks,
         "failed_checks": failed,
+        "owner_calibrated": owner_quality,
     }
 
 
 class MarketingScriptCompiler:
     """Compile typed marketing briefs against a rights-aware reference corpus."""
 
-    def __init__(self, corpus: ReferenceCorpusService) -> None:
+    def __init__(
+        self,
+        corpus: ReferenceCorpusService,
+        script_experiments: Any | None = None,
+    ) -> None:
         self.corpus = corpus
+        self.script_experiments = script_experiments
 
     def compile(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = _normalize_request(payload)
+        proof_request = request["narrative"]["proof"]
+        proof_first_person = bool(
+            {
+                token.casefold().replace("’", "'")
+                for token in words(proof_request["statement"])
+            }
+            & FIRST_PERSON_WORDS
+        )
+        owned_binding_required = (
+            proof_request["evidence_type"] in OWNED_REQUIRED_PROOF_TYPES
+            or proof_first_person
+        )
+        if owned_binding_required:
+            proof_evidence_gate = self.corpus.validate_owned_evidence(
+                receipt_ids=proof_request["source_receipt_ids"],
+                statement=proof_request["statement"],
+                first_person_claim=proof_first_person,
+            )
+            if not proof_evidence_gate["passed"]:
+                raise ValueError(
+                    "owned proof did not resolve to exact stored evidence: "
+                    + ", ".join(
+                        proof_evidence_gate["failure_codes"]
+                        or ["OWNED_EVIDENCE_REQUIRED"]
+                    )
+                )
+        else:
+            proof_evidence_gate = {
+                "contract": "owned_evidence_validation_v1",
+                "passed": True,
+                "required": False,
+                "receipt_ids": [],
+                "failure_codes": [],
+            }
         request_sha = canonical_sha256(request)
         query = " ".join((
             request["topic"],
@@ -385,23 +443,81 @@ class MarketingScriptCompiler:
         if existing is not None:
             return existing
 
-        beats = _time_beats(
-            _build_beats(request), int(request["target_seconds"])
-        )
-        transcript = " ".join(beat["text"] for beat in beats)
-        quality = _quality_report(request, beats, transcript)
-        audit = self.corpus.audit_content(
-            corpus_id=request["corpus_id"],
-            title=request["title"],
-            script=transcript,
-            objective=request["objective"],
-            target_viewer=request["audience"],
-            target_seconds=request["target_seconds"],
-        )
-        approved = (
-            quality["status"] == "pass"
-            and audit["status"] == "pass"
-            and bool(audit["copy_gate"]["passed"])
+        proof_text = request["narrative"]["proof"]["statement"]
+        attempts: list[dict[str, Any]] = []
+        approved = False
+        beats: list[dict[str, Any]] = []
+        transcript = ""
+        quality: dict[str, Any] = {}
+        audit: dict[str, Any] = {}
+        structure: dict[str, Any] = {}
+        for attempt_index in range(MAX_QUALITY_REWRITE_ATTEMPTS):
+            structure = select_rhetorical_structure(
+                "reference_marketing",
+                seed=request_sha,
+                attempt=attempt_index,
+                preferred=ANGLE_STRUCTURE[request["angle"]],
+            )
+            beats = _time_beats(
+                _build_beats(request, structure), int(request["target_seconds"])
+            )
+            transcript = " ".join(beat["text"] for beat in beats)
+            initial_owner_quality = audit_owner_calibrated_quality(
+                transcript,
+                timeline=beats,
+                protected_phrases=(proof_text,),
+            )
+            repair_actions = owner_repair_actions(initial_owner_quality)
+            repaired = False
+            if repair_actions:
+                revised_beats = repair_timeline_for_owner_quality(
+                    beats,
+                    initial_owner_quality,
+                    protected_phrases=(proof_text,),
+                    attempt=attempt_index + 1,
+                    target_seconds=float(request["target_seconds"]),
+                )
+                repaired = revised_beats != beats
+                beats = revised_beats
+                transcript = " ".join(beat["text"] for beat in beats)
+            owner_quality = audit_owner_calibrated_quality(
+                transcript,
+                timeline=beats,
+                protected_phrases=(proof_text,),
+            )
+            quality = _quality_report(request, beats, transcript, owner_quality)
+            audit = self.corpus.audit_content(
+                corpus_id=request["corpus_id"],
+                title=request["title"],
+                script=transcript,
+                objective=request["objective"],
+                target_viewer=request["audience"],
+                target_seconds=request["target_seconds"],
+            )
+            approved = (
+                quality["status"] == "pass"
+                and audit["status"] == "pass"
+                and bool(audit["copy_gate"]["passed"])
+            )
+            attempts.append({
+                "attempt": attempt_index + 1,
+                "structure_id": structure["structure_id"],
+                "candidate_sha256": canonical_sha256(transcript),
+                "initial_owner_failure_codes": initial_owner_quality[
+                    "failure_codes"
+                ],
+                "repair_actions": repair_actions,
+                "repair_applied": repaired,
+                "owner_decision": owner_quality["decision"],
+                "owner_failure_codes": owner_quality["failure_codes"],
+                "corpus_audit_id": audit["audit_id"],
+                "copy_gate_passed": bool(audit["copy_gate"]["passed"]),
+                "approved": approved,
+            })
+            if approved:
+                break
+        delivery_visual_plan = build_delivery_visual_plan(
+            beats, structure_id=structure["structure_id"]
         )
         created_at = utc_now()
         package = {
@@ -417,15 +533,8 @@ class MarketingScriptCompiler:
                 "objective": request["objective"],
                 "angle": request["angle"],
                 "audience": request["audience"],
-                "value_sequence": [
-                    "recognition",
-                    "stakes",
-                    "reframe",
-                    "steps",
-                    "proof",
-                    "takeaway",
-                    "call_to_action",
-                ],
+                "value_sequence": structure["role_order"],
+                "rhetorical_structure": structure,
                 "offer_id": request["offer"]["offer_id"],
             },
             "script": {
@@ -440,8 +549,11 @@ class MarketingScriptCompiler:
                 ),
                 "transcript": transcript,
                 "beats": beats,
+                "rhetorical_structure": structure,
+                "delivery_visual_plan": delivery_visual_plan,
             },
             "quality": quality,
+            "proof_evidence_gate": proof_evidence_gate,
             "corpus_audit": audit,
             "reference_context": {
                 "contract": context["contract"],
@@ -464,15 +576,66 @@ class MarketingScriptCompiler:
                     audit["copy_gate"]["passed"]
                 ),
             },
+            "revision": {
+                "contract": "bounded_script_quality_rewrite_v1",
+                "maximum_attempts": MAX_QUALITY_REWRITE_ATTEMPTS,
+                "attempt_count": len(attempts),
+                "final_attempt": len(attempts),
+                "attempts": attempts,
+                "exact_copy_audit_ids": [
+                    item["corpus_audit_id"] for item in attempts
+                ],
+                "final_exact_copy_audit_id": audit["audit_id"],
+                "source_proof_text_modified": proof_text not in transcript,
+            },
             "lineage": {
                 "compiler": COMPILER_VERSION,
                 "writer_mode": "deterministic_no_model",
                 "request_sha256": request_sha,
                 "context_result_sha256": context["result_sha256"],
                 "audit_result_sha256": audit["result_sha256"],
+                "exact_copy_audit_ids": [
+                    item["corpus_audit_id"] for item in attempts
+                ],
             },
             "created_at": created_at,
         }
+        if approved and self.script_experiments is not None:
+            brief_id = stable_id("refbrief_", request_sha)
+            workflow_id = stable_id(
+                "refworkflow_", script_id, audit["audit_id"], COMPILER_VERSION
+            )
+            registration = self.script_experiments.register_experiment({
+                "brief_id": brief_id,
+                "script_id": script_id,
+                "script_text": transcript,
+                "workflow_id": workflow_id,
+                "generation_contract": COMPILER_VERSION,
+                "metadata": {
+                    "registration_source": "reference_marketing_compiler",
+                    "corpus_id": request["corpus_id"],
+                    "copy_audit_id": audit["audit_id"],
+                    "owner_quality_contract": owner_quality["contract"],
+                },
+            })
+            package["workflow_id"] = workflow_id
+            package["script_experiment_id"] = registration["experiment"][
+                "experiment_id"
+            ]
+            package["script_experiment_registration"] = {
+                "status": registration["status"],
+                "created": registration["created"],
+                "experiment": registration["experiment"],
+            }
+        else:
+            package["script_experiment_id"] = None
+            package["script_experiment_registration"] = {
+                "status": "not_registered",
+                "reason": (
+                    "compiler_telemetry_not_configured"
+                    if approved else "script_not_approved"
+                ),
+            }
         package["result_sha256"] = canonical_sha256(package)
         return self.corpus.put_script_package(package)
 

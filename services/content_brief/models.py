@@ -19,6 +19,7 @@ class BriefStatus(str, Enum):
     IN_PRODUCTION = "in_production"
     COMPLETED = "completed"
     REJECTED = "rejected"
+    BLOCKED_QUALITY = "blocked_quality"
 
 
 @dataclass
@@ -181,4 +182,3 @@ class EnhancedBrief:
         """Generate brief_id if not provided."""
         if not self.brief_id:
             self.brief_id = str(uuid4())
-

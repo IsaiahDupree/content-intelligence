@@ -28,6 +28,7 @@ from typing import Any, Callable, Iterable
 
 from .visual_bank import EXTRACTOR_VERSION as VISUAL_EXTRACTOR_VERSION
 from .visual_bank import extract_visual_features, tool_version
+from .script_quality import audit_owner_calibrated_quality
 
 
 CORPUS_CONTRACT = "content_reference_corpus_v1"
@@ -36,6 +37,7 @@ AUDIT_CONTRACT = "content_creation_audit_v1"
 ACQUISITION_CONTRACT = "instagram_reference_acquisition_v1"
 EXTRACTION_CONTRACT = "reference_item_extraction_v1"
 SOURCE_RIGHTS_STATE = "public_reference_analysis_only"
+OWNED_EVIDENCE_CONTRACT = "reference_owned_claim_evidence_v1"
 MAX_CORPUS_ITEMS = 240
 MAX_ITEM_PAGE_SIZE = 100
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
@@ -44,12 +46,13 @@ ACTION_WORDS = {
     "reply", "save", "send", "share", "start", "try", "use", "watch",
 }
 MOVE_WORDS = {
-    "after", "before", "because", "but", "first", "later", "next",
-    "now", "so", "then", "until", "when",
+    "after", "before", "because", "but", "later", "so", "until", "when",
 }
 HOOK_WORDS = {
-    "how", "if", "most", "nobody", "stop", "the", "this", "what",
-    "why", "you", "your",
+    "how", "if", "most", "nobody", "stop", "what", "why",
+}
+FIRST_PERSON_WORDS = {
+    "i", "i'm", "i've", "me", "my", "mine", "we", "we've", "our", "ours",
 }
 
 
@@ -320,6 +323,19 @@ class ReferenceCorpusService:
                     captured_at TEXT NOT NULL,
                     FOREIGN KEY(corpus_id) REFERENCES reference_corpora(corpus_id)
                 );
+                CREATE TABLE IF NOT EXISTS reference_owned_evidence (
+                    receipt_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    evidence_kind TEXT NOT NULL,
+                    statement TEXT NOT NULL,
+                    statement_sha256 TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    source_byte_count INTEGER NOT NULL,
+                    perspective_basis TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS reference_items (
                     item_id TEXT PRIMARY KEY,
                     corpus_id TEXT NOT NULL,
@@ -430,6 +446,16 @@ class ReferenceCorpusService:
                 BEGIN
                     SELECT RAISE(ABORT, 'reference script packages are immutable');
                 END;
+                CREATE TRIGGER IF NOT EXISTS reference_owned_evidence_no_update
+                BEFORE UPDATE ON reference_owned_evidence
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned evidence is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS reference_owned_evidence_no_delete
+                BEFORE DELETE ON reference_owned_evidence
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned evidence is immutable');
+                END;
                 """
             )
             connection.commit()
@@ -475,6 +501,122 @@ class ReferenceCorpusService:
             )
             connection.commit()
         return {"receipt_id": receipt_id, "path": str(path), "sha256": payload_sha}
+
+    def put_owned_evidence(
+        self,
+        *,
+        statement: str,
+        evidence_kind: str,
+        owner_id: str,
+        source_path: str | Path,
+    ) -> dict[str, Any]:
+        clean = " ".join(str(statement or "").split()).strip()
+        kind = str(evidence_kind or "").strip().lower()
+        identity = str(owner_id or "").strip()
+        path = Path(source_path).expanduser().resolve()
+        if not clean or not kind or not identity:
+            raise ValueError("statement, evidence_kind, and owner_id are required")
+        if not path.is_file():
+            raise ValueError("source_path must identify an existing file")
+        source_bytes = path.read_bytes()
+        source_text = " ".join(
+            source_bytes.decode("utf-8", errors="strict").split()
+        )
+        if clean not in source_text:
+            raise ValueError("the exact statement is not present in the source file")
+        statement_sha = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+        source_sha = hashlib.sha256(source_bytes).hexdigest()
+        first_person_bound = bool(set(words(clean)) & FIRST_PERSON_WORDS)
+        receipt_id = stable_id(
+            "ownedref_", identity, kind, statement_sha, source_sha,
+            first_person_bound,
+        )
+        created_at = utc_now()
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO reference_owned_evidence(
+                       receipt_id, contract, owner_id, evidence_kind,
+                       statement, statement_sha256, source_path, source_sha256,
+                       source_byte_count, perspective_basis, created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    receipt_id, OWNED_EVIDENCE_CONTRACT, identity, kind,
+                    clean, statement_sha, str(path), source_sha,
+                    len(source_bytes), (
+                        "exact_first_person_statement"
+                        if first_person_bound
+                        else "exact_non_first_person_statement"
+                    ),
+                    created_at,
+                ),
+            )
+            connection.commit()
+        return self.owned_evidence_receipts([receipt_id])[0]
+
+    def owned_evidence_receipts(
+        self, receipt_ids: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        values = [str(item) for item in receipt_ids if str(item).strip()]
+        if not values:
+            return []
+        marks = ",".join("?" for _ in values)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"SELECT * FROM reference_owned_evidence WHERE receipt_id IN ({marks})",
+                values,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def validate_owned_evidence(
+        self,
+        *,
+        receipt_ids: Sequence[str],
+        statement: str,
+        first_person_claim: bool,
+    ) -> dict[str, Any]:
+        clean = " ".join(str(statement or "").split()).strip()
+        values = list(dict.fromkeys(
+            str(item).strip() for item in receipt_ids if str(item).strip()
+        ))
+        rows = self.owned_evidence_receipts(values)
+        failures: list[str] = []
+        if len(rows) != len(values):
+            failures.append("UNKNOWN_OWNED_EVIDENCE_RECEIPT")
+        valid_ids: list[str] = []
+        for row in rows:
+            path = Path(str(row.get("source_path") or "")).expanduser()
+            source_bytes = path.read_bytes() if path.is_file() else b""
+            source_sha = hashlib.sha256(source_bytes).hexdigest()
+            try:
+                source_text = " ".join(source_bytes.decode("utf-8").split())
+            except UnicodeDecodeError:
+                source_text = ""
+            statement_sha = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+            valid = (
+                row.get("contract") == OWNED_EVIDENCE_CONTRACT
+                and row.get("statement") == clean
+                and row.get("statement_sha256") == statement_sha
+                and row.get("source_sha256") == source_sha
+                and int(row.get("source_byte_count") or -1) == len(source_bytes)
+                and clean in source_text
+                and (
+                    not first_person_claim
+                    or row.get("perspective_basis")
+                    == "exact_first_person_statement"
+                )
+            )
+            if valid:
+                valid_ids.append(str(row["receipt_id"]))
+            else:
+                failures.append("INVALID_OWNED_EVIDENCE_BINDING")
+        return {
+            "contract": "owned_evidence_validation_v1",
+            "required": True,
+            "passed": bool(values) and not failures and len(valid_ids) == len(values),
+            "receipt_ids": valid_ids,
+            "failure_codes": list(dict.fromkeys(failures)),
+            "statement_sha256": hashlib.sha256(clean.encode("utf-8")).hexdigest(),
+        }
 
     def _upsert_corpus(
         self,
@@ -2114,14 +2256,33 @@ class ReferenceCorpusService:
         hook_hits = len(set(opening) & HOOK_WORDS)
         move_hits = len(set(script_words) & MOVE_WORDS)
         action_hits = len(set(closing_words) & ACTION_WORDS)
-        digit_hits = len(re.findall(r"\d+", script))
+        opening_text = " ".join(opening)
+        opening_digit_hits = len(re.findall(r"\d+", opening_text))
+        opening_contrast_hits = len(
+            set(opening) & {"but", "instead", "least", "without", "yet"}
+        )
+        owner_quality = audit_owner_calibrated_quality(script)
+        owner_judgments = owner_quality["judgments"]
         expected_words = max(1, round(target_seconds * 2.35))
         pace_fit = max(
             0.0,
             1.0 - abs(len(script_words) - expected_words) / expected_words,
         )
-        hook_score = min(100.0, 35.0 + hook_hits * 18.0 + min(2, digit_hits) * 10.0)
-        flow_score = min(100.0, 30.0 + move_hits * 11.0)
+        hook_score = min(
+            100.0,
+            15.0
+            + hook_hits * 15.0
+            + (15.0 if "?" in script[:240] else 0.0)
+            + min(2, opening_digit_hits) * 15.0
+            + min(2, opening_contrast_hits) * 10.0
+            + owner_judgments["specificity"]["score"] * 0.25,
+        )
+        flow_score = min(
+            100.0,
+            owner_judgments["tension_payoff"]["score"] * 0.55
+            + owner_judgments["spoken_naturalness"]["score"] * 0.25
+            + min(4, move_hits) * 5.0,
+        )
         cta_score = min(100.0, 25.0 + action_hits * 28.0)
         pace_score = round(100.0 * pace_fit, 3)
         max_overlap = 0.0
@@ -2146,14 +2307,30 @@ class ReferenceCorpusService:
             "duration_fit": pace_score,
             "source_evidence": round(evidence_score, 3),
             "originality": copy_score,
+            "spoken_naturalness": owner_judgments[
+                "spoken_naturalness"
+            ]["score"],
+            "specificity": owner_judgments["specificity"]["score"],
+            "tension_payoff": owner_judgments["tension_payoff"]["score"],
+            "technical_language": owner_judgments[
+                "technical_language_leakage"
+            ]["score"],
+            "phrase_originality": owner_judgments[
+                "repeated_phrasing"
+            ]["score"],
         }
         overall = round(
-            scores["hook_clarity"] * 0.20
-            + scores["narrative_flow"] * 0.20
-            + scores["call_to_action"] * 0.15
-            + scores["duration_fit"] * 0.15
-            + scores["source_evidence"] * 0.15
-            + scores["originality"] * 0.15,
+            scores["hook_clarity"] * 0.14
+            + scores["narrative_flow"] * 0.14
+            + scores["call_to_action"] * 0.10
+            + scores["duration_fit"] * 0.12
+            + scores["source_evidence"] * 0.10
+            + scores["originality"] * 0.15
+            + scores["spoken_naturalness"] * 0.08
+            + scores["specificity"] * 0.08
+            + scores["tension_payoff"] * 0.05
+            + scores["technical_language"] * 0.02
+            + scores["phrase_originality"] * 0.02,
             3,
         )
         notes: list[str] = []
@@ -2169,6 +2346,11 @@ class ReferenceCorpusService:
             )
         if max_overlap >= 0.20:
             notes.append("Rewrite source-like five-word phrases before production.")
+        if owner_quality["decision"] != "PASS":
+            notes.extend(
+                f"Resolve owner-quality finding: {code}."
+                for code in owner_quality["failure_codes"]
+            )
         request = {
             "corpus_id": corpus_id,
             "title": title,
@@ -2178,7 +2360,13 @@ class ReferenceCorpusService:
             "target_seconds": target_seconds,
         }
         result = {
-            "status": "pass" if overall >= 70 and max_overlap < 0.20 else "revise",
+            "status": (
+                "pass"
+                if overall >= 70
+                and max_overlap < 0.20
+                and owner_quality["decision"] == "PASS"
+                else "revise"
+            ),
             "contract": AUDIT_CONTRACT,
             "audit_id": stable_id("refaudit_", request, utc_now()),
             "corpus_id": corpus_id,
@@ -2191,6 +2379,7 @@ class ReferenceCorpusService:
             "word_count": len(script_words),
             "overall_score": overall,
             "scores": scores,
+            "quality_judgments": owner_quality,
             "copy_gate": {
                 "passed": max_overlap < 0.20,
                 "maximum_five_word_overlap": round(max_overlap, 6),

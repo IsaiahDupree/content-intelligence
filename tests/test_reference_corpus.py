@@ -144,6 +144,32 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
     assert (tmp_path / "derived" / CORPUS_ID / "corpus-summary.json").is_file()
 
 
+def test_generic_pronouns_and_step_words_do_not_inflate_quality(tmp_path):
+    store = seed_service(tmp_path)
+
+    audit = store.audit_content(
+        corpus_id=CORPUS_ID,
+        title="Generic words",
+        script=(
+            "The this you your. First, the this you your. Next, the this you "
+            "your. Then, the this you your."
+        ),
+        objective="educate",
+        target_viewer="business owners",
+        target_seconds=20,
+    )
+
+    assert audit["status"] == "revise"
+    assert audit["scores"]["hook_clarity"] < 70
+    assert audit["scores"]["narrative_flow"] < 70
+    assert audit["quality_judgments"]["judgments"]["specificity"][
+        "passed"
+    ] is False
+    assert audit["quality_judgments"]["judgments"]["tension_payoff"][
+        "passed"
+    ] is False
+
+
 def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
     reference_root = tmp_path / "reference"
     seed_service(reference_root)

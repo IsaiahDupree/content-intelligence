@@ -7,8 +7,14 @@ Main service for enhanced content brief generation with scoring, clustering, and
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
-from services.event_bus import EventBus
+from services.agent_framework.event_bus import (
+    AgentEvent,
+    AgentEventBus,
+    AgentType,
+    EventType,
+)
 
 from .models import EnhancedBrief, BriefStatus, TrendCard, TrendCluster, BriefAngle, ScriptOutput
 from .scoring import BriefScorer
@@ -28,14 +34,14 @@ class EnhancedBriefService:
     - Script generation
     """
     
-    def __init__(self, event_bus: Optional[EventBus] = None):
+    def __init__(self, event_bus: Optional[AgentEventBus] = None):
         """
         Initialize enhanced brief service.
         
         Args:
             event_bus: Event bus for publishing events
         """
-        self.event_bus = event_bus or EventBus.get_instance()
+        self.event_bus = event_bus or AgentEventBus()
         self.scorer = BriefScorer()
         self.clusterer = TrendClusterer()
         self.angle_generator = AngleGenerator()
@@ -105,20 +111,26 @@ class EnhancedBriefService:
                 # Generate script
                 brief.script_json = self.script_generator.generate_script(brief)
                 brief.script_beats = brief.script_json.segments
+                if brief.script_json.metadata.get("status") == "blocked_quality":
+                    brief.status = BriefStatus.BLOCKED_QUALITY
                 
                 briefs.append(brief)
                 
                 # Emit event
-                from services.event_bus import Topics
                 await self.event_bus.publish(
-                    Topics.CONTENT_BRIEF_GENERATED,
-                    {
-                        "brief_id": brief.brief_id,
-                        "score": score.total,
-                        "angle": angle.promise,
-                        "correlation_id": brief.brief_id
-                    },
-                    brief.brief_id
+                    AgentEvent(
+                        agent_type=AgentType.CONTENT_ANALYZER,
+                        event_type=EventType.PLAN_GENERATED,
+                        title="Content brief generated",
+                        description=angle.promise,
+                        data={
+                            "brief_id": brief.brief_id,
+                            "score": score.total,
+                            "angle": angle.promise,
+                            "correlation_id": brief.brief_id,
+                            "script_status": brief.script_json.metadata.get("status"),
+                        },
+                    )
                 )
         
         logger.info(f"Generated {len(briefs)} briefs above threshold {min_score}")
@@ -126,12 +138,13 @@ class EnhancedBriefService:
     
     def _generate_hook(self, angle: BriefAngle) -> str:
         """Generate hook from angle."""
-        hooks = [
-            f"If you can {angle.intent} {angle.stakes}, you can {angle.promise}",
-            f"The {angle.format} that helps {angle.audience_role}s {angle.intent}",
-            f"Stop doing this (here's the {angle.format} that works)",
-        ]
-        return hooks[0]  # Use first hook for now
+        hooks = (
+            f"{angle.audience_role}: what changes when {angle.stakes} is the constraint?",
+            f"Before you {angle.intent}, check the {angle.stakes} tradeoff.",
+            f"{angle.promise} Start with this lens: {angle.unique_lens}",
+        )
+        seed = sum(ord(character) for character in angle.angle_id)
+        return hooks[seed % len(hooks)]
     
     async def generate_script_from_brief(self, brief: EnhancedBrief) -> ScriptOutput:
         """
@@ -146,6 +159,8 @@ class EnhancedBriefService:
         script = self.script_generator.generate_script(brief)
         brief.script_json = script
         brief.script_beats = script.segments
+        if script.metadata.get("status") == "blocked_quality":
+            brief.status = BriefStatus.BLOCKED_QUALITY
         
         return script
     
@@ -179,4 +194,3 @@ class EnhancedBriefService:
                 ):
                     filtered.append(brief)
         return filtered
-

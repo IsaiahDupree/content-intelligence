@@ -17,7 +17,19 @@ from typing import Any, Sequence
 from .ai_relatability import AIRelatabilityAdjudicator, NON_AI_PASS_DECISION
 from .contracts import is_supported_transcript_audit_contract
 from .narrative_coherence import NarrativeCoherenceService
+from .script_experiments import ScriptExperimentTelemetry
 from .script_intelligence import ScriptIntelligenceService
+from .script_quality import (
+    MAX_QUALITY_REWRITE_ATTEMPTS,
+    OWNER_QUALITY_CONTRACT,
+    arrange_role_components,
+    audit_owner_calibrated_quality,
+    build_delivery_visual_plan,
+    owner_repair_actions,
+    repair_timeline_for_owner_quality,
+    retime_timeline,
+    select_rhetorical_structure,
+)
 from .transcript_bank import immutable_artifact_attestation
 from .transcript_style import TranscriptStyleGuideService
 
@@ -156,10 +168,16 @@ def stable_id(prefix: str, *parts: Any) -> str:
 SCRIPT_IDENTITY_FIELDS = (
     "topic", "audience", "objective", "brief_id", "trend_id",
     "parent_script_id", "variant_index", "variant_selection_contract",
-    "source_receipt_ids", "human_moment", "style_guide_id",
+    "source_receipt_ids", "evidence_binding_receipt_ids", "human_moment",
+    "style_guide_id",
     "style_guide_receipt_id", "style_application",
-    "evidence_summary", "timeline", "text",
+    "speaker_claim_gate",
+    "evidence_summary", "rhetorical_structure", "owner_quality_contract",
+    "owner_quality", "delivery_visual_plan", "quality_revision",
+    "timeline", "text",
 )
+OWNED_CLAIM_EVIDENCE_CONTRACT = "owned_claim_evidence_v1"
+FIRST_PERSON_TOKENS = {"i", "i'm", "i've", "me", "my", "mine", "we", "we've", "our", "ours"}
 
 
 def script_identity_payload(script: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +190,10 @@ class IdempotencyConflict(ValueError):
 
 def words(text: str) -> list[str]:
     return WORD_RE.findall(text or "")
+
+
+def contains_first_person(text: str) -> bool:
+    return bool({token.casefold().replace("’", "'") for token in words(text)} & FIRST_PERSON_TOKENS)
 
 
 def normalized_source_word(value: str) -> str:
@@ -414,9 +436,11 @@ def verified_transcript_patterns(
 class QualityStore:
     SCRIPT_AUDIT_FIELDS = (
         "text", "timeline", "evidence_summary", "source_receipt_ids",
+        "evidence_binding_receipt_ids",
         "audience", "human_moment", "brief_id", "topic", "objective",
         "variant_index", "variant_selection_contract",
         "style_guide_id", "style_guide_receipt_id", "style_application",
+        "speaker_claim_gate",
     )
 
     def __init__(self, path: str | Path):
@@ -691,6 +715,61 @@ class QualityStore:
             ).fetchone()
         return self._receipt_row(stored)
 
+    def put_owned_claim_receipt(
+        self,
+        *,
+        statement: str,
+        evidence_kind: str,
+        owner_id: str,
+        evidence_path: str | Path,
+    ) -> dict[str, Any]:
+        clean = " ".join(str(statement or "").split()).strip()
+        kind = str(evidence_kind or "").strip().lower()
+        identity = str(owner_id or "").strip()
+        if not clean or not kind or not identity:
+            raise ValueError("statement, evidence_kind, and owner_id are required")
+        source_path = Path(evidence_path).expanduser().resolve()
+        if not source_path.is_file():
+            raise ValueError("evidence_path must identify an existing file")
+        source_bytes = source_path.read_bytes()
+        source_text = " ".join(
+            source_bytes.decode("utf-8", errors="strict").split()
+        )
+        if clean not in source_text:
+            raise ValueError("the exact statement is not present in the evidence file")
+        source_sha = hashlib.sha256(source_bytes).hexdigest()
+        source_receipt = self.put_receipt(
+            "owned_evidence_file",
+            "owned_file",
+            str(source_path),
+            None,
+            {
+                "contract": "owned_evidence_file_v1",
+                "owner_id": identity,
+                "source_path": str(source_path),
+                "source_sha256": source_sha,
+                "source_byte_count": len(source_bytes),
+                "statement": clean,
+                "statement_sha256": hashlib.sha256(
+                    clean.encode("utf-8")
+                ).hexdigest(),
+                "perspective_basis": "exact_owned_statement_in_source_bytes",
+            },
+        )
+        payload = {
+            "contract": OWNED_CLAIM_EVIDENCE_CONTRACT,
+            "statement": clean,
+            "statement_sha256": hashlib.sha256(clean.encode("utf-8")).hexdigest(),
+            "evidence_kind": kind,
+            "owner_id": identity,
+            "evidence_receipt_ids": [source_receipt["receipt_id"]],
+            "evidence_sha256": source_sha,
+            "verification_basis": "exact_statement_in_stored_source_bytes",
+        }
+        return self.put_receipt(
+            "owned_claim_evidence", "owned", identity, None, payload
+        )
+
     def receipts(
         self,
         receipt_ids: Sequence[str] | None = None,
@@ -892,6 +971,10 @@ class QualityStore:
             "style_guide_receipt_id"
         ):
             accepted["transcript_style_fit"] = ("PASS",)
+        if isinstance(stored_script, dict) and stored_script.get(
+            "owner_quality_contract"
+        ):
+            accepted["owner_calibrated_quality"] = ("PASS",)
         return {
             "ready_for_render": all(
                 latest.get(kind, {}).get("decision") in decisions
@@ -2744,6 +2827,168 @@ class ScriptService:
         self.narrative = narrative
         self.style_guides = style_guides
 
+    def _source_moment_is_bound(
+        self,
+        human: dict[str, Any],
+        patterns: Sequence[dict[str, Any]],
+    ) -> bool:
+        receipt_id = str(human.get("source_moment_receipt_id") or "").strip()
+        receipt = self.store.receipt(receipt_id) if receipt_id else None
+        if not isinstance(receipt, dict):
+            return False
+        payload = receipt.get("payload") or {}
+        evidence = payload.get("evidence_summary") or {}
+        if (
+            receipt.get("receipt_type") != "audience_human_moments"
+            or receipt.get("source_type") != "market_tape"
+            or evidence.get("contract")
+            != "source_exact_everyday_human_moment_v3"
+            or evidence.get("evidence_kind")
+            != "non_ai_source_language_extraction"
+        ):
+            return False
+        pattern_keys = {
+            (
+                str((item.get("payload") or {}).get("transcript_id") or ""),
+                str((item.get("payload") or {}).get("observation_key") or ""),
+            )
+            for item in patterns
+        }
+        supplied_id = str(human.get("moment_id") or "").strip()
+        supplied_situation = str(human.get("situation") or "").strip()
+        supplied_stakes = str(human.get("stakes") or "").strip()
+        return any(
+            bool(supplied_id)
+            and str(item.get("moment_id") or "") == supplied_id
+            and supplied_id == stable_id(
+                "moment", item.get("source_video_id"), supplied_situation
+            )
+            and str(item.get("situation") or "").strip() == supplied_situation
+            and str(item.get("stakes") or "").strip() == supplied_stakes
+            and all(
+                str(human.get(key) or "") == str(item.get(key) or "")
+                for key in (
+                    "source_video_id",
+                    "source_transcript_id",
+                    "source_observation_key",
+                    "stakes_source_video_id",
+                    "stakes_source_transcript_id",
+                    "stakes_source_observation_key",
+                )
+            )
+            and item.get("basis")
+            == "source_exact_performance_qualified_local_whisper_excerpt"
+            and (
+                str(item.get("source_transcript_id") or ""),
+                str(item.get("source_observation_key") or ""),
+            ) in pattern_keys
+            and (
+                str(item.get("stakes_source_transcript_id") or ""),
+                str(item.get("stakes_source_observation_key") or ""),
+            ) in pattern_keys
+            for item in payload.get("moments") or []
+        )
+
+    def _resolve_owned_claims(
+        self, payload: dict[str, Any], claim: str
+    ) -> tuple[list[str], list[str], dict[str, Any] | None]:
+        raw_values = [
+            " ".join(str(item).split()).strip()
+            for item in payload.get("owned_proof") or []
+            if str(item).strip()
+        ]
+        receipt_ids = list(dict.fromkeys(
+            str(item).strip()
+            for item in payload.get("owned_proof_receipt_ids") or []
+            if str(item).strip()
+        ))
+        if raw_values and not receipt_ids:
+            return [], [], {
+                "status": "rejected",
+                "code": "REJECT_UNBOUND_OWNED_PROOF",
+                "reason": "Owned proof text requires an immutable owned claim receipt.",
+            }
+        receipts = self.store.receipts(receipt_ids) if receipt_ids else []
+        if len(receipts) != len(receipt_ids):
+            found = {str(item.get("receipt_id") or "") for item in receipts}
+            return [], [], {
+                "status": "rejected",
+                "code": "REJECT_UNKNOWN_OWNED_PROOF_RECEIPT",
+                "unknown_receipt_ids": sorted(set(receipt_ids) - found),
+            }
+        statements: list[str] = []
+        for receipt in receipts:
+            evidence = receipt.get("payload") or {}
+            statement = " ".join(str(evidence.get("statement") or "").split()).strip()
+            expected_sha = hashlib.sha256(statement.encode("utf-8")).hexdigest()
+            source_ids = [
+                str(item) for item in evidence.get("evidence_receipt_ids") or []
+                if str(item).strip()
+            ]
+            source_receipt = (
+                self.store.receipt(source_ids[0]) if len(source_ids) == 1 else None
+            )
+            source_payload = (
+                source_receipt.get("payload") or {}
+                if isinstance(source_receipt, dict) else {}
+            )
+            source_path = Path(
+                str(source_payload.get("source_path") or "")
+            ).expanduser()
+            source_bytes = source_path.read_bytes() if source_path.is_file() else b""
+            source_sha = hashlib.sha256(source_bytes).hexdigest()
+            try:
+                source_text = " ".join(source_bytes.decode("utf-8").split())
+            except UnicodeDecodeError:
+                source_text = ""
+            source_valid = (
+                isinstance(source_receipt, dict)
+                and source_receipt.get("receipt_type") == "owned_evidence_file"
+                and source_receipt.get("source_type") == "owned_file"
+                and source_payload.get("contract") == "owned_evidence_file_v1"
+                and source_payload.get("owner_id") == evidence.get("owner_id")
+                and source_payload.get("source_sha256") == source_sha
+                and int(source_payload.get("source_byte_count") or -1)
+                == len(source_bytes)
+                and source_payload.get("statement_sha256") == expected_sha
+                and source_payload.get("statement") == statement
+                and statement in source_text
+                and evidence.get("evidence_sha256") == source_sha
+            )
+            valid = (
+                receipt.get("receipt_type") == "owned_claim_evidence"
+                and receipt.get("source_type") == "owned"
+                and evidence.get("contract") == OWNED_CLAIM_EVIDENCE_CONTRACT
+                and evidence.get("verification_basis")
+                == "exact_statement_in_stored_source_bytes"
+                and evidence.get("statement_sha256") == expected_sha
+                and bool(statement)
+                and source_valid
+                and (
+                    not contains_first_person(statement)
+                    or source_payload.get("perspective_basis")
+                    == "exact_owned_statement_in_source_bytes"
+                )
+            )
+            if not valid:
+                return [], [], {
+                    "status": "rejected",
+                    "code": "REJECT_INVALID_OWNED_PROOF_RECEIPT",
+                    "receipt_id": receipt.get("receipt_id"),
+                }
+            statements.append(statement)
+        if raw_values and set(raw_values) != set(statements):
+            return [], [], {
+                "status": "rejected",
+                "code": "REJECT_OWNED_PROOF_TEXT_MISMATCH",
+            }
+        if contains_first_person(claim) and claim not in statements:
+            return [], [], {
+                "status": "rejected",
+                "code": "REJECT_UNBOUND_FIRST_PERSON_CLAIM",
+            }
+        return statements, receipt_ids, None
+
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
         topic = str(payload.get("topic") or "").strip()
         audience = str(payload.get("audience") or "").strip()
@@ -2753,7 +2998,16 @@ class ScriptService:
         situation = str(human.get("situation") or "").strip()
         stakes = str(human.get("stakes") or "").strip()
         receipt_ids = [str(item) for item in payload.get("receipt_ids") or []]
-        proof = [str(item).strip() for item in payload.get("owned_proof") or [] if str(item).strip()]
+        proof, proof_receipt_ids, proof_rejection = self._resolve_owned_claims(
+            payload, claim
+        )
+        quality_attempt = payload.get("quality_attempt", 0)
+        if type(quality_attempt) is not int or not (
+            0 <= quality_attempt < MAX_QUALITY_REWRITE_ATTEMPTS
+        ):
+            raise ValueError(
+                "quality_attempt must be a bounded zero-based integer"
+            )
         missing = [
             name
             for name, value in (("topic", topic), ("audience", audience), ("claim", claim), ("human_moment.situation", situation), ("human_moment.stakes", stakes))
@@ -2761,6 +3015,8 @@ class ScriptService:
         ]
         if missing:
             raise ValueError("missing required evidence context: " + ", ".join(missing))
+        if proof_rejection is not None:
+            return proof_rejection
         if not receipt_ids:
             return {
                 "status": "rejected",
@@ -2808,6 +3064,15 @@ class ScriptService:
                 "verified_transcript_count": source_count,
                 "creator_count": len(creators),
                 "observed_views_snapshot": observed_views,
+            }
+        if not self._source_moment_is_bound(human, verified_patterns):
+            return {
+                "status": "rejected",
+                "code": "REJECT_UNBOUND_HUMAN_MOMENT",
+                "reason": (
+                    "The human moment must match an immutable audience moment "
+                    "receipt before it can be spoken."
+                ),
             }
         style_receipts = [
             item for item in receipts
@@ -3031,25 +3296,14 @@ class ScriptService:
                 "another tool; that is the first workflow to map."
             )
         elif "software" in situation_terms or {"email", "emails"} & situation_terms:
-            first_person_hook = bool(
-                set(words(situation.lower())) & {"i", "i'm", "i've", "my", "me"}
-            )
             if "software" in situation_terms:
                 stakes_text = (
-                    "Then a customer email lands while I am building. Either I "
-                    "stop the product work to decide the next action, or the "
-                    "customer waits and the request goes cold."
-                    if first_person_hook else
                     "Then a customer email lands while you are building. Either "
                     "you stop the product work to decide the next action, or the "
                     "customer waits and the request goes cold."
                 )
             else:
                 stakes_text = (
-                    "I am in the middle of product work when the inbox fills. "
-                    "Either I stop to decide, reply, schedule, or invoice, or the "
-                    "customer waits."
-                    if first_person_hook else
                     "You are in the middle of product work when the inbox fills. "
                     "Either you stop to decide, reply, schedule, or invoice, or "
                     "the customer waits."
@@ -3103,15 +3357,15 @@ class ScriptService:
                 "usable output."
             )
             method_text = (
-                "Use the viewer's exact problem language. Show the input, show the "
-                "usable output, then explain only what changed."
+                "Put the viewer's exact problem language on screen, show the input "
+                "and usable output, then explain only what changed."
             )
             payoff_text = (
-                "The visible result is a usable output while your product work "
+                "The visible result is a usable output while product work "
                 "stays open."
             )
             cta_text = (
-                "Comment ‘problem’ with the issue that keeps interrupting your "
+                "Comment ‘problem’ with the issue that keeps interrupting the "
                 "week; that is the first workflow to map."
             )
         else:
@@ -3136,7 +3390,18 @@ class ScriptService:
             source_stakes_text = stakes.strip()
             if source_stakes_text[-1] not in ".?!":
                 source_stakes_text += "."
-            stakes_text = f"{source_stakes_text} {contextual_stakes_text}"
+            context_text = (
+                f"One person also said, “{source_stakes_text}”"
+                if contains_first_person(source_stakes_text)
+                else source_stakes_text
+            )
+            context_basis = "source_stakes_exact"
+            stakes_text = contextual_stakes_text
+        else:
+            context_text = (
+                "That pressure is the part to solve before another step is added."
+            )
+            context_basis = "source_hook_bridge"
         preferred_hook_shapes = list(
             style_guide.get("hooks", {}).get("preferred_shapes") or []
         )
@@ -3147,6 +3412,8 @@ class ScriptService:
         hook_text = situation.strip()
         if hook_text[-1] not in ".?!":
             hook_text += "."
+        if contains_first_person(hook_text):
+            hook_text = f"One person said, “{hook_text}”"
         applied_hook = "source_moment_direct"
         if preferred_hook == "question" and not hook_text.endswith("?"):
             hook_text = f"Does this happen to you? {hook_text}"
@@ -3154,10 +3421,14 @@ class ScriptService:
         elif preferred_hook == "contrarian_warning":
             hook_text = f"Don't normalize this. {hook_text}"
             applied_hook = "contrarian_warning_then_source_moment"
-        elif preferred_hook == "personal_receipt" and set(
-            normalized_source_word(token) for token in words(situation)
-        ) & {"i", "i'm", "i've", "my", "me"}:
-            applied_hook = "source_personal_receipt"
+        elif preferred_hook == "personal_receipt" and contains_first_person(
+            situation
+        ):
+            applied_hook = "attributed_source_first_person_quote"
+        source_first_person_attributed = bool(
+            contains_first_person(situation)
+            or contains_first_person(stakes)
+        )
         transitions = list(
             style_guide.get("delivery", {}).get("direction", {}).get(
                 "transitions"
@@ -3189,18 +3460,117 @@ class ScriptService:
             24.0,
             min(45.0, float(target_duration_range.get("median") or 43.0)),
         )
-        cut_points = [0.0, 0.07, 0.19, 0.35, 0.53, 0.72, 0.88, 1.0]
-        times = [round(target_duration * point, 2) for point in cut_points]
-        timeline = [
-            {"start": times[0], "end": times[1], "beat": "human_hook", "text": hook_text},
-            {"start": times[1], "end": times[2], "beat": "stakes", "text": stakes_text},
-            {"start": times[2], "end": times[3], "beat": "proof", "text": proof_line.rstrip(".") + "."},
-            {"start": times[3], "end": times[4], "beat": "claim", "text": claim_text},
-            {"start": times[4], "end": times[5], "beat": "method", "text": method_text},
-            {"start": times[5], "end": times[6], "beat": "payoff", "text": payoff_text},
-            {"start": times[6], "end": times[7], "beat": "cta", "text": cta_text},
-        ]
+        structure = select_rhetorical_structure(
+            "evidence_story",
+            seed="|".join((
+                str(payload.get("brief_id") or ""),
+                str(human.get("moment_id") or ""),
+                topic,
+            )),
+            attempt=quality_attempt,
+        )
+        target_duration = min(48.0, target_duration * 1.0666667)
+        components = {
+            "hook": [{"beat": "human_hook", "text": hook_text}],
+            "stakes": [{"beat": "stakes", "text": stakes_text}],
+            "context": [{"beat": "evidence_context", "text": context_text}],
+            "proof": [{
+                "beat": "proof", "text": proof_line.rstrip(".") + "."
+            }],
+            "claim": [{"beat": "claim", "text": claim_text}],
+            "method": [{"beat": "method", "text": method_text}],
+            "payoff": [{"beat": "payoff", "text": payoff_text}],
+            "cta": [{"beat": "cta", "text": cta_text}],
+        }
+        timeline = retime_timeline(
+            arrange_role_components(components, structure),
+            target_seconds=target_duration,
+        )
         full_text = " ".join(beat["text"] for beat in timeline)
+        parent_script_id = str(payload.get("parent_script_id") or "").strip()
+        current_brief_id = str(payload.get("brief_id") or "").strip()
+        prior_texts = [
+            str(item.get("text") or "")
+            for item in self.store.scripts(limit=20)
+            if str(item.get("script_id") or "") != parent_script_id
+            and not (
+                current_brief_id
+                and str(item.get("brief_id") or "") == current_brief_id
+            )
+            and str(item.get("text") or "").strip()
+        ]
+        protected_phrases = tuple(
+            value for value in (situation, stakes, *proof) if value
+        )
+        initial_owner_quality = audit_owner_calibrated_quality(
+            full_text,
+            timeline=timeline,
+            protected_phrases=protected_phrases,
+            prior_texts=prior_texts,
+        )
+        repair_actions = owner_repair_actions(initial_owner_quality)
+        local_repair_applied = False
+        if repair_actions:
+            revised_timeline = repair_timeline_for_owner_quality(
+                timeline,
+                initial_owner_quality,
+                protected_phrases=protected_phrases,
+                attempt=quality_attempt + 1,
+                target_seconds=target_duration,
+            )
+            local_repair_applied = revised_timeline != timeline
+            timeline = revised_timeline
+            full_text = " ".join(beat["text"] for beat in timeline)
+        owner_quality = audit_owner_calibrated_quality(
+            full_text,
+            timeline=timeline,
+            protected_phrases=protected_phrases,
+            prior_texts=prior_texts,
+        )
+        parent_script = self.store.script(parent_script_id) if parent_script_id else None
+        parent_script_sha256 = (
+            self.store.script_audit_sha256(parent_script)
+            if isinstance(parent_script, dict) else None
+        )
+        quality_revision = {
+            "contract": "bounded_script_quality_rewrite_v1",
+            "attempt": quality_attempt + 1,
+            "maximum_attempts": MAX_QUALITY_REWRITE_ATTEMPTS,
+            "parent_script_id": parent_script_id or None,
+            "parent_script_sha256": parent_script_sha256,
+            "initial_failure_codes": initial_owner_quality["failure_codes"],
+            "repair_actions": repair_actions,
+            "local_repair_applied": local_repair_applied,
+            "final_failure_codes": owner_quality["failure_codes"],
+            "source_text_modified": not all(
+                value in full_text for value in protected_phrases
+            ),
+        }
+        delivery_visual_plan = build_delivery_visual_plan(
+            timeline, structure_id=structure["structure_id"]
+        )
+        moment_receipt_id = str(
+            human.get("source_moment_receipt_id") or ""
+        ).strip()
+        evidence_binding_receipt_ids = list(dict.fromkeys((
+            moment_receipt_id,
+            *proof_receipt_ids,
+        )))
+        speaker_claim_gate = {
+            "contract": "verified_speaker_claim_gate_v1",
+            "decision": "PASS",
+            "source_moment_receipt_id": moment_receipt_id,
+            "source_moment_bound": True,
+            "public_first_person_excerpt_present": (
+                source_first_person_attributed
+            ),
+            "public_first_person_excerpt_attributed": (
+                source_first_person_attributed
+            ),
+            "template_first_person_inferred_from_source": False,
+            "owned_claim_receipt_ids": proof_receipt_ids,
+            "unbound_first_person_claims": [],
+        }
         result = {
             "status": "generated_pending_gates",
             "topic": topic,
@@ -3208,12 +3578,13 @@ class ScriptService:
             "objective": objective,
             "brief_id": payload.get("brief_id"),
             "trend_id": payload.get("trend_id"),
-            "parent_script_id": payload.get("parent_script_id"),
+            "parent_script_id": parent_script_id or None,
             "variant_index": payload.get("variant_index"),
             "variant_selection_contract": payload.get(
                 "variant_selection_contract"
             ),
             "source_receipt_ids": receipt_ids,
+            "evidence_binding_receipt_ids": evidence_binding_receipt_ids,
             "style_guide_id": style_guide["guide_id"],
             "style_guide_receipt_id": style_receipt["receipt_id"],
             "style_application": {
@@ -3224,17 +3595,25 @@ class ScriptService:
                 "target_duration_seconds": target_duration,
                 "actual_voice_or_likeness_imitation": False,
             },
+            "speaker_claim_gate": speaker_claim_gate,
+            "rhetorical_structure": structure,
+            "owner_quality_contract": OWNER_QUALITY_CONTRACT,
+            "owner_quality": owner_quality,
+            "quality_revision": quality_revision,
+            "delivery_visual_plan": delivery_visual_plan,
             "human_moment": dict(human),
             "source_language_binding": {
                 "contract": "source_moment_spoken_binding_v1",
                 "situation_exact_in_hook": situation in hook_text,
                 "stakes_exact_in_timeline": (
                     stakes in hook_text if source_stakes_is_hook
-                    else stakes in stakes_text
+                    else stakes in context_text
                 ),
                 "stakes_exact_location": (
-                    "human_hook" if source_stakes_is_hook else "stakes"
+                    "human_hook"
+                    if source_stakes_is_hook else "evidence_context"
                 ),
+                "evidence_context_basis": context_basis,
                 "contextual_stakes_classification": (
                     "template_expansion_after_source_moment"
                 ),
@@ -3252,6 +3631,7 @@ class ScriptService:
                 ),
                 "generation_contract": payload.get("generation_contract"),
                 "owned_proof_count": len(proof),
+                "owned_proof_receipt_ids": proof_receipt_ids,
                 "style_guide_receipt_id": style_receipt["receipt_id"],
             },
             "timeline": timeline,
@@ -3283,10 +3663,43 @@ class ScriptService:
                 "attempts": len(coherence["attempts"]),
                 "revised": len(coherence["attempts"]) > 1,
             }
+        final_owner_quality = audit_owner_calibrated_quality(
+            result["text"],
+            timeline=result["timeline"],
+            protected_phrases=protected_phrases,
+            prior_texts=prior_texts,
+        )
+        result["owner_quality"] = final_owner_quality
+        result["quality_revision"]["final_failure_codes"] = (
+            final_owner_quality["failure_codes"]
+        )
+        result["delivery_visual_plan"] = build_delivery_visual_plan(
+            result["timeline"], structure_id=structure["structure_id"]
+        )
         result["script_id"] = stable_id(
             "script", script_identity_payload(result)
         )
         result = self.store.put_script(result)
+        owner_quality_audit = self.store.put_audit(
+            "owner_calibrated_quality",
+            result["script_id"],
+            (
+                "PASS"
+                if result["owner_quality"]["decision"] == "PASS"
+                else "REVISE_OWNER_QUALITY"
+            ),
+            float(result["owner_quality"]["score"]),
+            {
+                "quality": result["owner_quality"],
+                "revision": result["quality_revision"],
+                "input_binding": {
+                    "contract": "stored_script_audit_binding_v1",
+                    "stored_script_bound": True,
+                    "script_id": result["script_id"],
+                    "script_sha256": self.store.script_audit_sha256(result),
+                },
+            },
+        )
         if coherence is not None:
             self.store.put_audit(
                 "narrative_coherence", result["script_id"], "PASS", 100.0,
@@ -3301,7 +3714,11 @@ class ScriptService:
                     },
                 },
             )
-        return result
+        return {
+            **result,
+            "owner_quality_audit_id": owner_quality_audit["audit_id"],
+            "owner_quality_audit": owner_quality_audit,
+        }
 
 
 class RelatabilityService:
@@ -3960,6 +4377,7 @@ class ContentQualityEngine:
         script_language_demand_enqueuer: Any = None,
     ):
         self.store = QualityStore(quality_db_path)
+        self.script_experiments = ScriptExperimentTelemetry(self.store.path)
         self.tape = MarketTapeReader(market_tape_path)
         self.narrative = NarrativeCoherenceService(self.store, narrative_llm_runner)
         self.viral = ViralTranscriptService(self.tape, self.store)
@@ -3985,6 +4403,7 @@ class ContentQualityEngine:
             relatability=self.relatability,
             ai_relatability=self.ai_relatability,
             attention=self.attention,
+            script_experiments=self.script_experiments,
             transcript_storage_root=(
                 transcript_storage_root
                 or os.getenv(
@@ -4026,7 +4445,7 @@ class ContentQualityEngine:
                 "audience-intelligence", "viral-transcripts", "evidence-first-scripts",
                 "narrative-coherence", "relatability", "attention", "retention", "learning-memory",
                 "script-intelligence", "owned-outcome-attribution",
-                "transcript-style-guides",
+                "transcript-style-guides", "script-experiment-telemetry",
             ],
             "data_readiness": {
                 "script_intelligence": script_intelligence,
@@ -4042,6 +4461,9 @@ class ContentQualityEngine:
                 "owned_retention": {
                     **owned_outcome_readiness,
                 },
+                "script_experiment_telemetry": (
+                    self.script_experiments.health()
+                ),
                 "tiktok_transcript_style": tiktok_style_readiness,
             },
             "ai_readiness": {
