@@ -24,7 +24,7 @@ from .contracts import is_supported_transcript_audit_contract
 
 AUDIT_TYPE = "relatability_ai_qualitative"
 VERDICT_NAME = "human_relatability_qualitative_verdict"
-VERDICT_CONTRACT = "human_relatability_qualitative_verdict_v3"
+VERDICT_CONTRACT = "human_relatability_qualitative_verdict_v4"
 NON_AI_PASS_DECISION = "PASS_NON_AI"
 MINIMUM_TRANSCRIPTS = 5
 MINIMUM_CREATORS = 3
@@ -46,8 +46,6 @@ class Rubric(BaseModel):
 
 
 class Verdict(BaseModel):
-    relatable: bool
-    score: int
     rubric_scores: Rubric
     audience_moment: str
     why_it_feels_human: list[str]
@@ -359,16 +357,6 @@ def _response_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "relatable": {"type": "boolean"},
-            # Keep the provider schema within the broadly supported Structured
-            # Outputs subset; the 0..100 range is enforced again locally.
-            "score": {
-                "type": "integer",
-                "description": (
-                    "Relatability score on a 0 through 100 scale; 70 or higher "
-                    "is a passing prediction."
-                ),
-            },
             "rubric_scores": {
                 "type": "object",
                 "properties": {
@@ -401,7 +389,7 @@ def _response_schema() -> dict[str, Any]:
             },
         },
         "required": [
-            "relatable", "score", "rubric_scores", "audience_moment",
+            "rubric_scores", "audience_moment",
             "why_it_feels_human", "alienating_language",
             "source_language_used", "rewrite_guidance",
         ],
@@ -498,9 +486,9 @@ def _judge_prompt(
         "internal pipeline jargon, or claims that the sources do not support. "
         "Views prove exposure, not relatability, retention, or conversion. Do "
         "not infer actual audience outcomes. Return only the required JSON.\n\n"
-        "SCORING CONTRACT: score is an integer on a 0 through 100 scale, not a "
-        "1-to-5 rating. Set relatable=true only when score is at least 70. "
-        "Scores 0 through 69 require relatable=false. A concrete source-backed "
+        "SCORING CONTRACT: the service will sum the six rubric fields on a 0 "
+        "through 100 scale and derive the pass decision locally at 70. Do not "
+        "return a separate score or boolean. A concrete source-backed "
         "moment can pass even without measured post-publication outcomes; the "
         "verdict remains a prediction, never an outcome claim. Calculate the "
         "score by awarding: 25 points for a concrete lived moment, 20 for clear "
@@ -514,10 +502,9 @@ def _judge_prompt(
         "A concrete input arriving, a named action, and a visible output is a "
         "concrete moment; do not require or recommend an invented clock time, "
         "biographical detail, or emotion that is absent from the evidence. "
-        "The boolean, score, positive reasons, alienating language, and rewrite "
-        "guidance must be logically consistent. Populate rubric_scores with "
-        "these exact maxima in order: 25, 20, 20, 15, 10, 10. The top-level "
-        "score must equal their sum.\n\n"
+        "The rubric, positive reasons, alienating language, and rewrite guidance "
+        "must be logically consistent. Populate rubric_scores with these exact "
+        "maxima in order: 25, 20, 20, 15, 10, 10.\n\n"
         "RUBRIC CONSISTENCY: score every dimension independently from the "
         "script that is actually present. A named input arriving, a named "
         "action, and a visible output earns visible-input/action/output points. "
@@ -544,17 +531,24 @@ def _validate_judgment(
         value = json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return None
-    if not isinstance(value, dict) or set(value) != set(_response_schema()["required"]):
+    if not isinstance(value, dict):
         return None
-    if not isinstance(value.get("relatable"), bool):
+    required_fields = set(_response_schema()["required"])
+    legacy_fields = required_fields | {"relatable", "score"}
+    value_fields = set(value)
+    if value_fields != required_fields and value_fields != legacy_fields:
         return None
-    reported_score = value.get("score")
-    if (
-        isinstance(reported_score, bool)
-        or not isinstance(reported_score, int)
-        or not 0 <= reported_score <= 100
-    ):
-        return None
+    legacy_redundant_fields = value_fields == legacy_fields
+    reported_score = value.get("score") if legacy_redundant_fields else None
+    if legacy_redundant_fields:
+        if not isinstance(value.get("relatable"), bool):
+            return None
+        if (
+            isinstance(reported_score, bool)
+            or not isinstance(reported_score, int)
+            or not 0 <= reported_score <= 100
+        ):
+            return None
     rubric_maxima = {
         "concrete_lived_moment": 25,
         "clear_personal_stakes": 20,
@@ -577,7 +571,7 @@ def _validate_judgment(
         return None
     rubric_score = sum(rubric_scores.values())
     semantic_normalizations: list[dict[str, Any]] = []
-    if rubric_score != reported_score:
+    if legacy_redundant_fields and rubric_score != reported_score:
         # Structured Outputs guarantees JSON shape, not arithmetic.  Keep the
         # six bounded rubric dimensions authoritative and calculate their
         # total locally, but never let normalization move a provider verdict
@@ -590,6 +584,11 @@ def _validate_judgment(
         semantic_normalizations.append({
             "code": "score_derived_from_rubric",
             "provider_reported_score": reported_score,
+            "normalized_score": rubric_score,
+        })
+    elif not legacy_redundant_fields:
+        semantic_normalizations.append({
+            "code": "score_and_decision_derived_from_rubric",
             "normalized_score": rubric_score,
         })
     score = rubric_score
@@ -636,8 +635,9 @@ def _validate_judgment(
         and not alienating_language
     ):
         normalized_score = score + 10
-        if (normalized_score >= PASS_THRESHOLD) != (
-            score >= PASS_THRESHOLD
+        if legacy_redundant_fields and (
+            (normalized_score >= PASS_THRESHOLD)
+            != (score >= PASS_THRESHOLD)
         ):
             return None
         rubric_scores = {
@@ -649,19 +649,20 @@ def _validate_judgment(
             "normalized_score": normalized_score,
         })
         score = normalized_score
-    if value["relatable"] != (score >= PASS_THRESHOLD):
+    relatable = score >= PASS_THRESHOLD
+    if legacy_redundant_fields and value["relatable"] != relatable:
         return None
-    if value["relatable"] and (
+    if relatable and (
         not any(item.strip() for item in value["why_it_feels_human"])
         or not source_language_used
     ):
         return None
-    if not value["relatable"] and not any(
+    if not relatable and not any(
         item.strip() for item in value["rewrite_guidance"]
     ):
         return None
     return {
-        "relatable": value["relatable"],
+        "relatable": relatable,
         "score": score,
         "rubric_scores": dict(rubric_scores),
         "audience_moment": value["audience_moment"].strip(),
@@ -706,12 +707,18 @@ def _judgment_attempt_receipt(
         receipt["failure_codes"] = ["response_not_object"]
         return receipt
     failures: list[str] = []
-    if set(value) != set(_response_schema()["required"]):
+    required_fields = set(_response_schema()["required"])
+    legacy_fields = required_fields | {"relatable", "score"}
+    value_fields = set(value)
+    legacy_redundant_fields = value_fields == legacy_fields
+    if value_fields != required_fields and not legacy_redundant_fields:
         failures.append("required_fields_invalid")
-    if not isinstance(value.get("relatable"), bool):
+    if legacy_redundant_fields and not isinstance(
+        value.get("relatable"), bool
+    ):
         failures.append("relatable_type_invalid")
     score = value.get("score")
-    if (
+    if legacy_redundant_fields and (
         isinstance(score, bool)
         or not isinstance(score, int)
         or not 0 <= score <= 100
@@ -744,7 +751,13 @@ def _judgment_attempt_receipt(
         for item in value.get("source_language_used") or []
         if isinstance(item, str) and item.strip()
     }
-    if value.get("relatable") is True and not (reported_terms & supported):
+    rubric_total = (
+        sum(rubric_values)
+        if rubric_values and all(isinstance(item, int) for item in rubric_values)
+        else 0
+    )
+    derived_pass = rubric_total >= PASS_THRESHOLD
+    if derived_pass and not (reported_terms & supported):
         failures.append("passing_verdict_lacks_supported_source_term")
     alienating = [
         str(item).strip()
@@ -759,8 +772,7 @@ def _judgment_attempt_receipt(
     ):
         failures.append("unexplained_non_alienating_zero")
     if (
-        score == 0
-        and rubric_values
+        rubric_values
         and all(item == 0 for item in rubric_values)
         and not str(value.get("audience_moment") or "").strip()
         and all(not (value.get(name) or []) for name in list_fields)
@@ -1057,8 +1069,9 @@ class AIRelatabilityAdjudicator:
                     attempt_prompt = prompt + (
                         "\n\nYour previous response failed the semantic verdict "
                         "contract. Re-evaluate from the supplied script and "
-                        "evidence. Every required explanation must be non-empty, "
-                        "and the boolean must agree with the numeric threshold."
+                        "evidence. Keep every rubric field within its stated "
+                        "bound, include rewrite guidance for a rejection, and "
+                        "cite source language only from evidence.overlap_terms."
                     )
                 try:
                     raw = self.llm_runner(attempt_prompt)

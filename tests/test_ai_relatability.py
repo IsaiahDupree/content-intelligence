@@ -51,6 +51,10 @@ AI_PASS = {
     "source_language_used": ["feel", "stuck", "pressure", "trying"],
     "rewrite_guidance": [],
 }
+AI_RUBRIC_PASS = {
+    key: value for key, value in AI_PASS.items()
+    if key not in {"relatable", "score"}
+}
 
 
 def add_transcript_receipts(
@@ -319,7 +323,7 @@ def test_injected_ai_runner_returns_separately_named_verdict(tmp_path: Path):
     assert '"cross_creator_term_support"' in prompts[0]
     assert '"lineage_verified": true' in prompts[0]
     assert "0 through 100 scale" in prompts[0]
-    assert "at least 70" in prompts[0]
+    assert "derive the pass decision locally at 70" in prompts[0]
     assert "25 points for a concrete lived moment" in prompts[0]
     assert "do not make source-backed language unrelatable" in prompts[0]
     assert "Start non-alienating framing at 10" in prompts[0]
@@ -327,6 +331,29 @@ def test_injected_ai_runner_returns_separately_named_verdict(tmp_path: Path):
     assert verdict["judge_attempt_count"] == 2
     assert verdict["judge_consensus"]["status"] == "pass_consensus"
     assert verdict["judge_consensus"]["pass_votes"] == 2
+
+
+def test_rubric_only_ai_response_derives_score_and_decision_locally(
+    tmp_path: Path,
+):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(AI_RUBRIC_PASS)
+    ).audit(script_with_receipts(store))
+
+    verdict = result["qualitative_verdict"]
+    judgment = verdict["judgment"]
+    assert result["decision"] == "PASS"
+    assert result["score"] == 84.0
+    assert verdict["judge_attempt_count"] == 2
+    assert verdict["judge_consensus"]["status"] == "pass_consensus"
+    assert judgment["relatable"] is True
+    assert judgment["score"] == 84
+    assert judgment["semantic_normalizations"] == [{
+        "code": "score_and_decision_derived_from_rubric",
+        "normalized_score": 84,
+    }]
 
 
 def test_split_ai_votes_require_a_third_valid_consensus_vote(tmp_path: Path):
@@ -505,6 +532,7 @@ def test_all_zero_model_responses_persist_content_free_failure_codes(
     tmp_path: Path,
 ):
     store = QualityStore(tmp_path / "quality.sqlite3")
+    prompts: list[str] = []
     empty = {
         "relatable": False,
         "score": 0,
@@ -522,8 +550,13 @@ def test_all_zero_model_responses_persist_content_free_failure_codes(
         "source_language_used": [],
         "rewrite_guidance": [],
     }
+
+    def runner(prompt: str) -> str:
+        prompts.append(prompt)
+        return json.dumps(empty)
+
     result = AIRelatabilityAdjudicator(
-        store, lambda _prompt: json.dumps(empty)
+        store, runner
     ).audit(script_with_receipts(store))
 
     verdict = result["qualitative_verdict"]
@@ -534,6 +567,8 @@ def test_all_zero_model_responses_persist_content_free_failure_codes(
         "all_zero_empty_verdict" in attempt["failure_codes"]
         for attempt in verdict["judge_attempts"]
     )
+    assert "every rubric field within its stated bound" in prompts[1]
+    assert "boolean must agree" not in prompts[1]
     persisted = json.dumps(result["findings"], sort_keys=True)
     assert '"audience_moment": ""' not in persisted
 
@@ -707,7 +742,7 @@ def test_gpt5_runner_uses_strict_supported_request_contract():
             "status": "completed",
             "content": [{
                 "type": "output_text",
-                "text": json.dumps(AI_PASS),
+                "text": json.dumps(AI_RUBRIC_PASS),
             }],
         }],
     }
@@ -715,7 +750,7 @@ def test_gpt5_runner_uses_strict_supported_request_contract():
         with provider_environment(base_url):
             returned = openai_relatability_runner("judge this")
 
-    assert json.loads(returned) == AI_PASS
+    assert json.loads(returned) == AI_RUBRIC_PASS
     received = OpenAIContractHandler.received[0]
     body = received["body"]
     assert received["path"] == "/v1/responses"
@@ -731,6 +766,8 @@ def test_gpt5_runner_uses_strict_supported_request_contract():
     assert schema["name"] == "Verdict"
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
+    assert "score" not in schema["schema"]["properties"]
+    assert "relatable" not in schema["schema"]["properties"]
     assert "max_completion_tokens" not in body
     assert "temperature" not in body
 
