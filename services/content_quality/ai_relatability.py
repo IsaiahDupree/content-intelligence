@@ -485,6 +485,16 @@ def _judge_prompt(
         "guidance must be logically consistent. Populate rubric_scores with "
         "these exact maxima in order: 25, 20, 20, 15, 10, 10. The top-level "
         "score must equal their sum.\n\n"
+        "RUBRIC CONSISTENCY: score every dimension independently from the "
+        "script that is actually present. A named input arriving, a named "
+        "action, and a visible output earns visible-input/action/output points. "
+        "A direct tradeoff or consequence for the viewer earns personal-stakes "
+        "points; do not demand invented biography or an invented clock time. "
+        "Second-person language such as you or your is direct audience "
+        "perspective. Start non-alienating framing at 10 and deduct only for "
+        "specific alienating language that you also return verbatim in "
+        "alienating_language. Do not return a zero for a dimension whose stated "
+        "criterion is visibly present in the script.\n\n"
         f"AUDIENCE:\n{audience}\n\n"
         f"SCRIPT:\n{text}\n\n"
         "AUDITED SOURCE-LANGUAGE SUMMARY:\n"
@@ -595,13 +605,25 @@ def _validate_judgment(
         item.strip() for item in value["rewrite_guidance"]
     ):
         return None
+    alienating_language = [
+        item.strip() for item in value["alienating_language"]
+        if item.strip().lower() not in {"none", "none identified", "n/a"}
+    ]
+    if (
+        rubric_scores["non_alienating_framing"] == 0
+        and not alienating_language
+    ):
+        # A deduction without identified language is not auditable. Ask the
+        # bounded retry for a self-consistent judgment rather than silently
+        # manufacturing points or accepting unexplained deductions.
+        return None
     return {
         "relatable": value["relatable"],
         "score": score,
         "rubric_scores": dict(rubric_scores),
         "audience_moment": value["audience_moment"].strip(),
         "why_it_feels_human": [item.strip() for item in value["why_it_feels_human"]],
-        "alienating_language": [item.strip() for item in value["alienating_language"]],
+        "alienating_language": alienating_language,
         "source_language_used": source_language_used,
         "rewrite_guidance": [item.strip() for item in value["rewrite_guidance"]],
         "semantic_normalizations": semantic_normalizations,

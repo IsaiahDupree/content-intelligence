@@ -322,6 +322,8 @@ def test_injected_ai_runner_returns_separately_named_verdict(tmp_path: Path):
     assert "at least 70" in prompts[0]
     assert "25 points for a concrete lived moment" in prompts[0]
     assert "do not make source-backed language unrelatable" in prompts[0]
+    assert "Start non-alienating framing at 10" in prompts[0]
+    assert "Second-person language such as you or your" in prompts[0]
 
 
 def test_ai_rejection_is_not_overridden_by_deterministic_pass(tmp_path: Path):
@@ -394,6 +396,35 @@ def test_rejection_normalizes_same_side_rubric_total_and_drops_unsupported_terms
             "removed_count": 1,
         },
     ]
+
+
+def test_unexplained_non_alienating_deduction_retries_fail_closed(
+    tmp_path: Path,
+):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    inconsistent = {
+        **AI_PASS,
+        "relatable": False,
+        "score": 65,
+        "rubric_scores": {
+            "concrete_lived_moment": 25,
+            "clear_personal_stakes": 15,
+            "visible_input_action_output": 10,
+            "source_language_support": 10,
+            "direct_audience_perspective": 5,
+            "non_alienating_framing": 0,
+        },
+        "alienating_language": ["none identified"],
+        "rewrite_guidance": ["Clarify the personal stake."],
+    }
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(inconsistent)
+    ).audit(script_with_receipts(store))
+
+    verdict = result["qualitative_verdict"]
+    assert verdict["decision"] == "JUDGE_UNAVAILABLE"
+    assert verdict["judge_attempt_count"] == 2
+    assert verdict["judge_unavailable_reason"] == "invalid_response_contract"
 
 
 def test_score_normalization_never_crosses_the_pass_threshold(tmp_path: Path):

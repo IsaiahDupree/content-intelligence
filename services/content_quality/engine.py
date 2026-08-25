@@ -2974,9 +2974,10 @@ class ScriptService:
                 + f" and {named_terms[-1]}"
             )
         proof_line = proof[0] if proof else (
-            "In creator videos, I heard this same interruption: "
-            f"{term_phrase} kept coming up because the next step still waited "
-            "on a person."
+            "It keeps coming back to the same friction: "
+            f"{term_phrase} {'stays' if len(named_terms) == 1 else 'stay'} "
+            "tied to a handoff because the next step still "
+            "waits on a person."
         )
         moment_categories = {
             str(value) for value in human.get("moment_categories") or []
@@ -2987,8 +2988,9 @@ class ScriptService:
         claim_text = claim.rstrip(".") + "."
         if {"quote", "form"} & situation_terms:
             stakes_text = (
-                "That is a live buyer waiting. Without automation, the request "
-                "sits in an email while you copy the details into a meeting or invoice."
+                "You are in the middle of product work when the form lands. "
+                "Either you stop to copy the details into a meeting or invoice, "
+                "or a live buyer waits in your inbox."
             )
             claim_text = (
                 "Build the first AI automation around that one handoff: quote "
@@ -2999,14 +3001,18 @@ class ScriptService:
                 "creates the meeting or invoice, and shows the finished result."
             )
             payoff_text = (
-                "The buyer gets a next step while the request is still fresh, "
-                "without pulling you away from the product."
+                "The visible result is a buyer with a next step while your "
+                "product work stays open."
             )
-            cta_text = "Which live request is still waiting in your inbox?"
+            cta_text = (
+                "Comment ‘inbox’ with the live request that keeps waiting; that "
+                "is the first workflow to map."
+            )
         elif "results" in situation_terms:
             stakes_text = (
-                "The gap is the detour: the question starts inside the work, but "
-                "the answer lives somewhere else."
+                "You are in the middle of a customer task when the question "
+                "appears. Either you leave the work to hunt for the answer, or "
+                "the task waits."
             )
             claim_text = (
                 "The first useful version has one job: one question in, one answer "
@@ -3017,31 +3023,36 @@ class ScriptService:
                 "same software. Then compare it with leaving and coming back."
             )
             payoff_text = (
-                "The viewer sees one interruption disappear before hearing how "
-                "the automation works."
+                "The visible result is an answer inside the work, without the "
+                "detour to another tool."
             )
-            cta_text = "Which answer should your product keep inside the work?"
+            cta_text = (
+                "Comment ‘answer’ with the question that keeps sending you to "
+                "another tool; that is the first workflow to map."
+            )
         elif "software" in situation_terms or {"email", "emails"} & situation_terms:
             first_person_hook = bool(
                 set(words(situation.lower())) & {"i", "i'm", "i've", "my", "me"}
             )
             if "software" in situation_terms:
                 stakes_text = (
-                    "Then customer emails land while I am building. Without "
-                    "automation, I stop, decide the next action, and move each "
-                    "request forward myself."
+                    "Then a customer email lands while I am building. Either I "
+                    "stop the product work to decide the next action, or the "
+                    "customer waits and the request goes cold."
                     if first_person_hook else
-                    "Then customer emails land while you are building. Without "
-                    "automation, you stop, decide the next action, and move each "
-                    "request forward yourself."
+                    "Then a customer email lands while you are building. Either "
+                    "you stop the product work to decide the next action, or the "
+                    "customer waits and the request goes cold."
                 )
             else:
                 stakes_text = (
-                    "Seeing the emails is not the job. Each message still waits "
-                    "for me to decide, reply, schedule a meeting, or send an invoice."
+                    "I am in the middle of product work when the inbox fills. "
+                    "Either I stop to decide, reply, schedule, or invoice, or the "
+                    "customer waits."
                     if first_person_hook else
-                    "Seeing the emails is not the job. Each message still waits "
-                    "for you to decide, reply, schedule a meeting, or send an invoice."
+                    "You are in the middle of product work when the inbox fills. "
+                    "Either you stop to decide, reply, schedule, or invoice, or "
+                    "the customer waits."
                 )
             claim_text = (
                 "Build the first AI app around that exact interruption: incoming "
@@ -3053,14 +3064,18 @@ class ScriptService:
                 "schedules the meeting, or prepares the invoice."
             )
             payoff_text = (
-                "The customer gets an answer before the request goes cold, "
-                "without taking the hour you set aside to finish the product."
+                "The visible result is a customer with a next step while your "
+                "product work stays open."
             )
-            cta_text = "Which email keeps stealing your focus every week?"
+            cta_text = (
+                "Comment ‘inbox’ with the email that keeps interrupting your "
+                "week; that is the first workflow to map."
+            )
         elif "time" in moment_categories or "work" in moment_categories:
             stakes_text = (
-                "The gap is visible: the repeated job still waits for a person to "
-                "move it forward."
+                "You are in the middle of product work when the repeated job "
+                "comes back. Either you stop to move it forward, or it waits on "
+                "a person."
             )
             claim_text = (
                 f"For {audience}, show one request enter and one completed task leave."
@@ -3070,13 +3085,18 @@ class ScriptService:
                 "explain only the time the automation gives back."
             )
             payoff_text = (
-                "The viewer watches a recurring job shrink before hearing a feature list."
+                "The visible result is one completed task while your product "
+                "work stays open."
             )
-            cta_text = "Which repeated job should your product finish this week?"
+            cta_text = (
+                "Comment ‘workflow’ with the repeated job that interrupts your "
+                "week; that is the first one to map."
+            )
         elif "problem" in moment_categories:
             stakes_text = (
-                "The gap is concrete: the problem is named, but the next usable "
-                "result is still missing."
+                "You are in the middle of product work when the problem appears. "
+                "Either you stop to make the next usable result, or the customer "
+                "waits."
             )
             claim_text = (
                 f"For {audience}, show that problem move from one input to one "
@@ -3087,21 +3107,29 @@ class ScriptService:
                 "usable output, then explain only what changed."
             )
             payoff_text = (
-                "The viewer sees their problem move before hearing a feature list."
+                "The visible result is a usable output while your product work "
+                "stays open."
             )
-            cta_text = "What problem should your product solve on camera first?"
+            cta_text = (
+                "Comment ‘problem’ with the issue that keeps interrupting your "
+                "week; that is the first workflow to map."
+            )
         else:
             stakes_text = (
-                "The gap is one unwanted step between the work and the answer."
+                "You are in the middle of product work when the extra step "
+                "appears. Either you stop to handle it, or the answer waits."
             )
             method_text = (
                 "Show the unwanted step. Show the answer arrive where the work "
                 "already happens. Then explain only what changed."
             )
             payoff_text = (
-                "The viewer sees the detour disappear before hearing a feature list."
+                "The visible result is an answer where the work already happens."
             )
-            cta_text = "Which unwanted step should your product remove first?"
+            cta_text = (
+                "Comment ‘step’ with the extra task that interrupts your week; "
+                "that is the first workflow to map."
+            )
         source_stakes_is_hook = stakes.strip() == situation.strip()
         contextual_stakes_text = stakes_text
         if not source_stakes_is_hook:

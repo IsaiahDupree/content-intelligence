@@ -660,6 +660,8 @@ def test_production_brief_excludes_unattested_legacy_artifacts_upstream(
         all(attestation["checks"].values())
         for attestation in cohort_findings["artifact_integrity_attestations"]
     )
+    assert "Either you stop" in result["script"]["text"]
+    assert "Comment ‘" in result["script"]["text"]
 
 
 def test_production_lane_selects_newest_valid_artifact_after_attestation(
