@@ -10,7 +10,9 @@ It is not a clone system. It does not preserve source clips or grant direct-use 
 
 ## Current Corpus
 
-- Requested items: 75
+- Requested items: 150
+- Complete extractions: 150
+- Failed extractions: 0
 - Platform: Instagram
 - Rights state: `public_reference_analysis_only`
 - Transcript model: `base.en`
@@ -33,7 +35,7 @@ Each item stores:
 
 ## Content-Creation Use
 
-Ask a specific question through `find`, inspect the returned sources, and send the draft through `audit`. The scorecard measures hook clarity, narrative flow, CTA, target duration fit, source evidence, and originality. Approval requires both a sufficient overall score and a passing copy gate.
+Ask a specific question through `context`, inspect its patterns, cautions, and public source links, use `find` for narrower evidence retrieval, and send the exact draft through `audit`. The scorecard measures hook clarity, narrative flow, CTA, target duration fit, source evidence, and originality. Approval requires both a sufficient overall score and a passing copy gate.
 
 The audit cannot prove that a creative choice caused views. It can show which choices were observed and which source examples support an abstract recommendation.
 

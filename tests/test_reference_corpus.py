@@ -113,6 +113,11 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
         corpus_id=CORPUS_ID, query="engaging hook end result", limit=3
     )
     summary = store.summarize(CORPUS_ID)
+    context = store.agent_context(
+        corpus_id=CORPUS_ID,
+        query="engaging hook with a visible result",
+        evidence_limit=3,
+    )
     audit = store.audit_content(
         corpus_id=CORPUS_ID,
         title="Hook lesson",
@@ -129,6 +134,10 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
     assert status["counts"]["extraction_states"] == {"complete": 1}
     assert found[0]["source_url"].endswith("/DcbyrHsOqg6/")
     assert summary["coverage"]["transcript_count"] == 1
+    assert context["contract"] == "content_reference_agent_context_v1"
+    assert context["coverage"]["item_count"] == 1
+    assert context["evidence"][0]["item_id"] == found[0]["item_id"]
+    assert len(context["result_sha256"]) == 64
     assert audit["copy_gate"]["passed"] is False
     assert audit["rights"]["direct_use_allowed"] is False
     assert store.corpus_status(CORPUS_ID)["counts"]["audits"] == 1
@@ -159,6 +168,19 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
         f"/api/reference-corpus/status?corpus_id={CORPUS_ID}",
         headers=headers,
     )
+    second_page = client.get(
+        f"/api/reference-corpus/items?corpus_id={CORPUS_ID}&offset=1",
+        headers=headers,
+    )
+    context = client.post(
+        "/api/reference-corpus/context",
+        headers=headers,
+        json={
+            "corpus_id": CORPUS_ID,
+            "query": "engaging hook with a visible result",
+            "evidence_limit": 3,
+        },
+    )
     catalog = client.get("/api/agent/catalog", headers=headers)
 
     assert health.status_code == 200
@@ -166,7 +188,15 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
     assert denied.status_code == 401
     assert status.status_code == 200
     assert status.get_json()["counts"]["items"] == 1
+    assert second_page.status_code == 200
+    assert second_page.get_json()["count"] == 0
+    assert second_page.get_json()["total"] == 1
+    assert second_page.get_json()["next_offset"] is None
+    assert context.status_code == 200
+    assert context.get_json()["coverage"]["item_count"] == 1
     names = catalog.get_json()["".join(("oper", "ations"))]
+    assert "build_reference_context" in names
+    assert names["acquire_reference_corpus"]["bounds"]["limit"] == [1, 240]
     assert "audit_against_reference_corpus" in names
     assert names["extract_reference_items"]["bounds"]["limit"] == [1, 3]
 

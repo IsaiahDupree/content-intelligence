@@ -15,21 +15,22 @@
 
 1. Call `health`.
 2. Call `status` and inspect item count, extraction states, and coverage.
-3. Call `find` with the content question. Use returned excerpts and public source links as evidence.
-4. Call `audit` before approving a script or edit plan.
-5. Reject a result when `copy_gate.passed` is false. Rewrite and audit again.
+3. Call `context` with the exact content question. Use its patterns, cautions, and public source links as evidence.
+4. Use `find` when a narrower evidence-only response is needed.
+5. Call `audit` before approving a script or edit plan.
+6. Reject a result when `copy_gate.passed` is false. Rewrite and audit again.
 
 Do not assume a creator's popularity proves a tactic. The corpus provides observed examples, not causal proof. Separate observed clip choices from claimed performance reasons.
 
 ## Write Calls
 
-`acquire` fetches bounded public source data and stores immutable receipts. The limit is 100. `extract` handles at most three clips per API call, derives the transcript, visual facts, contact sheet, and typed analysis, then deletes each source clip.
+`acquire` fetches bounded public source data and stores immutable receipts. The corpus limit is 240. `extract` handles at most three clips per API call, derives the transcript, visual facts, contact sheet, and typed analysis, then deletes each source clip.
 
 For bulk local work, use:
 
 ```bash
 python3 scripts/build_reference_corpus.py acquire \
-  --username personalbrandlaunch --limit 75
+  --username personalbrandlaunch --limit 150
 
 python3 scripts/build_reference_corpus.py extract-all \
   --corpus-id instagram-personalbrandlaunch-reference-v1 \
@@ -37,6 +38,14 @@ python3 scripts/build_reference_corpus.py extract-all \
 ```
 
 The local typed pass is always available. AI enrichment is optional and cannot be a completion gate.
+
+Build question-specific context for an agent:
+
+```bash
+python3 scripts/build_reference_corpus.py context \
+  --corpus-id instagram-personalbrandlaunch-reference-v1 \
+  --query "How should a founder teach a useful lesson without sounding generic?"
+```
 
 Create a consistent local snapshot before copying to removable storage:
 

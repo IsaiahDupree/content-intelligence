@@ -118,6 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     find.add_argument("--limit", type=int, default=8)
     find.set_defaults(handler=run_find)
 
+    context = commands.add_parser("context")
+    context.add_argument("--corpus-id", required=True)
+    context.add_argument("--query", required=True)
+    context.add_argument("--evidence-limit", type=int, default=8)
+    context.set_defaults(handler=run_context)
+
     audit = commands.add_parser("audit")
     audit.add_argument("--corpus-id", required=True)
     audit.add_argument("--title", default="")
@@ -226,6 +232,14 @@ def run_find(args: argparse.Namespace) -> list[dict[str, Any]]:
         corpus_id=args.corpus_id,
         query=args.query,
         limit=args.limit,
+    )
+
+
+def run_context(args: argparse.Namespace) -> dict[str, Any]:
+    return service(args).agent_context(
+        corpus_id=args.corpus_id,
+        query=args.query,
+        evidence_limit=args.evidence_limit,
     )
 
 

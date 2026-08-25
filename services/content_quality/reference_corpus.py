@@ -36,6 +36,8 @@ AUDIT_CONTRACT = "content_creation_audit_v1"
 ACQUISITION_CONTRACT = "instagram_reference_acquisition_v1"
 EXTRACTION_CONTRACT = "reference_item_extraction_v1"
 SOURCE_RIGHTS_STATE = "public_reference_analysis_only"
+MAX_CORPUS_ITEMS = 240
+MAX_ITEM_PAGE_SIZE = 100
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
 ACTION_WORDS = {
     "ask", "book", "check", "comment", "download", "follow", "open",
@@ -546,9 +548,16 @@ class ReferenceCorpusService:
         username = str(username).strip().lower().removeprefix("@").strip()
         if not re.fullmatch(r"[a-z0-9_.]{1,30}", username):
             raise ValueError("username is invalid")
-        if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
+        if limit < 1 or limit > MAX_CORPUS_ITEMS:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_CORPUS_ITEMS}"
+            )
         corpus_id = corpus_id or f"instagram-{safe_name(username)}-reference-v1"
+        with closing(self.connect()) as connection:
+            before_count = int(connection.execute(
+                "SELECT COUNT(*) FROM reference_items WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()[0])
         self._upsert_corpus(
             corpus_id=corpus_id,
             username=username,
@@ -601,6 +610,11 @@ class ReferenceCorpusService:
             max_id = next_id
         selected = list(normalized.values())[:limit]
         self._put_items(selected, observed_at)
+        with closing(self.connect()) as connection:
+            corpus_item_count = int(connection.execute(
+                "SELECT COUNT(*) FROM reference_items WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()[0])
         state = "acquired" if len(selected) >= limit else "partial"
         self._upsert_corpus(
             corpus_id=corpus_id,
@@ -623,6 +637,10 @@ class ReferenceCorpusService:
             "corpus_id": corpus_id,
             "requested_count": limit,
             "acquired_count": len(selected),
+            "before_count": before_count,
+            "added_count": max(0, corpus_item_count - before_count),
+            "corpus_item_count": corpus_item_count,
+            "refreshed_count": min(before_count, len(selected)),
             "page_count": page_count,
             "raw_receipt_count": len(receipts),
             "observed_at": observed_at,
@@ -1309,9 +1327,11 @@ class ReferenceCorpusService:
         corpus_id: str,
         *,
         limit: int = 100,
+        offset: int = 0,
         include_transcript: bool = False,
     ) -> list[dict[str, Any]]:
-        limit = max(1, min(100, int(limit)))
+        limit = max(1, min(MAX_CORPUS_ITEMS, int(limit)))
+        offset = max(0, int(offset))
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """SELECT i.*,
@@ -1333,8 +1353,8 @@ class ReferenceCorpusService:
                    LEFT JOIN reference_extractions e ON e.item_id=i.item_id
                    WHERE i.corpus_id=?
                    ORDER BY i.published_at DESC, i.item_id
-                   LIMIT ?""",
-                (corpus_id, limit),
+                   LIMIT ? OFFSET ?""",
+                (corpus_id, limit, offset),
             ).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:
@@ -1383,7 +1403,7 @@ class ReferenceCorpusService:
         if not query_terms:
             raise ValueError("query must contain a meaningful term")
         candidates = self.list_items(
-            corpus_id, limit=100, include_transcript=True
+            corpus_id, limit=MAX_CORPUS_ITEMS, include_transcript=True
         )
         scored: list[tuple[float, dict[str, Any]]] = []
         max_views = max((int(row.get("views") or 0) for row in candidates), default=1)
@@ -1421,8 +1441,60 @@ class ReferenceCorpusService:
         scored.sort(key=lambda pair: (-pair[0], -pair[1]["views"], pair[1]["item_id"]))
         return [row for _, row in scored[:max(1, min(20, int(limit)))]]
 
+    def agent_context(
+        self,
+        *,
+        corpus_id: str,
+        query: str,
+        evidence_limit: int = 8,
+    ) -> dict[str, Any]:
+        clean_query = str(query or "").strip()
+        evidence = self.find_items(
+            corpus_id=corpus_id,
+            query=clean_query,
+            limit=max(1, min(20, int(evidence_limit))),
+        )
+        summary = self.summarize(corpus_id)
+        context_id = stable_id(
+            "refctx_",
+            corpus_id,
+            clean_query,
+            summary.get("coverage"),
+            summary.get("numeric_profile"),
+            [
+                (row.get("item_id"), row.get("views"), row.get("match_score"))
+                for row in evidence
+            ],
+        )
+        result = {
+            "status": "ok",
+            "contract": "content_reference_agent_context_v1",
+            "context_id": context_id,
+            "corpus_id": corpus_id,
+            "query": clean_query,
+            "coverage": summary.get("coverage") or {},
+            "numeric_profile": summary.get("numeric_profile") or {},
+            "observed_patterns": summary.get("patterns") or {},
+            "descriptive_associations": (
+                summary.get("descriptive_associations") or {}
+            ),
+            "evidence": evidence,
+            "rights": summary.get("rights") or {},
+            "usage_rules": [
+                "Treat observed patterns as hypotheses, not causal proof.",
+                "Use abstract principles and create original wording and visuals.",
+                "Do not use source clips, identity, likeness, or voice.",
+                "Audit the exact draft before generation.",
+            ],
+            "generated_at": utc_now(),
+        }
+        result["result_sha256"] = canonical_sha256(result)
+        return result
+
     def summarize(self, corpus_id: str) -> dict[str, Any]:
-        items = self.list_items(corpus_id, limit=100, include_transcript=False)
+        items = self.list_items(
+            corpus_id, limit=MAX_CORPUS_ITEMS, include_transcript=False
+        )
         extracted = [row for row in items if row.get("extraction_id")]
         semantic_rows = [
             row.get("semantic") or {}
@@ -1942,7 +2014,9 @@ class ReferenceCorpusService:
         if target_seconds < 5 or target_seconds > 3600:
             raise ValueError("target_seconds must be between 5 and 3600")
         corpus = self.corpus_status(corpus_id)
-        rows = self.list_items(corpus_id, limit=100, include_transcript=True)
+        rows = self.list_items(
+            corpus_id, limit=MAX_CORPUS_ITEMS, include_transcript=True
+        )
         script_words = words(script)
         opening = script_words[:30]
         closing_words = script_words[max(0, int(len(script_words) * 0.8)):]

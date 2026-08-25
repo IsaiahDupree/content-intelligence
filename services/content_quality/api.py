@@ -19,6 +19,8 @@ from .demand_client import MarketTapeDemandClient
 from .engine import ContentQualityEngine
 from .narrative_coherence import default_llm_runner, openai_llm_runner
 from .reference_corpus import (
+    MAX_CORPUS_ITEMS,
+    MAX_ITEM_PAGE_SIZE,
     ReferenceCorpusService,
     instagram_source_reader_from_env,
 )
@@ -339,7 +341,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             return denied
         started = time.monotonic()
         corpus_id = str(request.args.get("corpus_id") or "").strip()
-        limit = max(1, min(100, int(request.args.get("limit", "25"))))
+        limit = max(
+            1, min(MAX_ITEM_PAGE_SIZE, int(request.args.get("limit", "25")))
+        )
+        offset = max(0, int(request.args.get("offset", "0")))
         include_text = str(request.args.get("include_transcript") or "").lower() in {
             "1", "true", "yes",
         }
@@ -351,8 +356,13 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 started,
             )
         rows = reference_corpus.list_items(
-            corpus_id, limit=limit, include_transcript=include_text
+            corpus_id,
+            limit=limit,
+            offset=offset,
+            include_transcript=include_text,
         )
+        total = reference_corpus.corpus_status(corpus_id)["counts"]["items"]
+        next_offset = offset + len(rows) if offset + len(rows) < total else None
         result = {
             "status": "ok",
             "contract": "content_reference_item_list_v1",
@@ -360,10 +370,18 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             "items": rows,
             "count": len(rows),
             "limit": limit,
+            "offset": offset,
+            "total": total,
+            "next_offset": next_offset,
         }
         return audited_agent_response(
             "reference_corpus_items",
-            {"corpus_id": corpus_id, "limit": limit, "include_transcript": include_text},
+            {
+                "corpus_id": corpus_id,
+                "limit": limit,
+                "offset": offset,
+                "include_transcript": include_text,
+            },
             result,
             started_at=started,
         )
@@ -415,6 +433,29 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             result, started_at=started,
         )
 
+    @app.post("/api/reference-corpus/context")
+    def reference_corpus_context():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = reference_corpus.agent_context(
+                corpus_id=str(payload.get("corpus_id") or ""),
+                query=str(payload.get("query") or ""),
+                evidence_limit=max(
+                    1, min(20, int(payload.get("evidence_limit") or 8))
+                ),
+            )
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_context", payload, error, started
+            )
+        return audited_agent_response(
+            "reference_corpus_context", payload, result, started_at=started
+        )
+
     @app.post("/api/reference-corpus/audit")
     def reference_corpus_audit():
         denied = require_agent_auth()
@@ -449,7 +490,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         try:
             result = reference_corpus.acquire_instagram(
                 username=str(payload.get("username") or ""),
-                limit=max(1, min(100, int(payload.get("limit") or 75))),
+                limit=max(
+                    1,
+                    min(MAX_CORPUS_ITEMS, int(payload.get("limit") or 75)),
+                ),
                 corpus_id=str(payload.get("corpus_id") or "") or None,
             )
         except ValueError as error:
@@ -559,6 +603,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "method": "GET",
                     "path": "/api/reference-corpus/items",
                     "required": ["corpus_id"],
+                    "optional": ["offset", "include_transcript"],
                     "bounds": {"limit": [1, 100]},
                 },
                 "find_reference_evidence": {
@@ -566,6 +611,12 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "path": "/api/reference-corpus/find",
                     "required": ["corpus_id", "query"],
                     "bounds": {"limit": [1, 20]},
+                },
+                "build_reference_context": {
+                    "method": "POST",
+                    "path": "/api/reference-corpus/context",
+                    "required": ["corpus_id", "query"],
+                    "bounds": {"evidence_limit": [1, 20]},
                 },
                 "summarize_reference_corpus": {
                     "method": "GET",
@@ -585,7 +636,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "method": "POST",
                     "path": "/api/reference-corpus/acquire",
                     "required": ["username"],
-                    "bounds": {"limit": [1, 100]},
+                    "bounds": {"limit": [1, 240]},
                 },
                 "extract_reference_items": {
                     "method": "POST",
