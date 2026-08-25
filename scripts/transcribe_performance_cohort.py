@@ -22,12 +22,9 @@ DEFAULT_TAPE = (
     Path.home()
     / "Library/Application Support/ContentIntelligence/data/market-tape.sqlite3"
 )
-PASSPORT_ROOT = Path("/Volumes/My Passport/MarketTape/transcript-bank")
 DEFAULT_STORAGE = (
-    PASSPORT_ROOT
-    if PASSPORT_ROOT.parent.parent.exists()
-    else Path.home()
-    / "Library/Application Support/ContentIntelligence/data/transcript-bank"
+    Path.home()
+    / "Library/Application Support/ContentQuality/data/transcript-bank"
 )
 
 

@@ -24,8 +24,14 @@ from services.content_quality.transcript_bank import (  # noqa: E402
 )
 
 
-DEFAULT_TAPE = Path.home() / "Library/Application Support/ContentIntelligence/data/market-tape.sqlite3"
-DEFAULT_STORAGE = Path("/Volumes/My Passport/MarketTape/transcript-bank")
+DEFAULT_TAPE = (
+    Path.home()
+    / "Library/Application Support/ContentIntelligence/data/market-tape.sqlite3"
+)
+DEFAULT_STORAGE = (
+    Path.home()
+    / "Library/Application Support/ContentQuality/data/transcript-bank"
+)
 
 
 def _utc_now() -> str:
@@ -53,24 +59,28 @@ def exit_code_for_status(status: str) -> int:
     return 0 if status in {"completed", "partial"} else 2
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
         description="Download and locally Whisper-transcribe the next highest-performing videos."
     )
-    parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument(
+    result.add_argument("--limit", type=int, default=20)
+    result.add_argument(
         "--platform", action="append", choices=("youtube", "tiktok", "instagram", "facebook")
     )
-    parser.add_argument("--model", default="base")
-    parser.add_argument(
+    result.add_argument("--model", default="base")
+    result.add_argument(
         "--topic",
         default="",
         help="Optional related-content filter; requires two metadata and transcript term matches.",
     )
-    parser.add_argument("--cookies-from-browser")
-    parser.add_argument("--tape", type=Path, default=DEFAULT_TAPE)
-    parser.add_argument("--storage-root", type=Path, default=DEFAULT_STORAGE)
-    args = parser.parse_args()
+    result.add_argument("--cookies-from-browser")
+    result.add_argument("--tape", type=Path, default=DEFAULT_TAPE)
+    result.add_argument("--storage-root", type=Path, default=DEFAULT_STORAGE)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
 
     mount_error = storage_mount_error(args.storage_root)
     if mount_error:

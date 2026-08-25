@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts import backfill_transcript_bank, transcribe_performance_cohort
 from scripts.backfill_transcript_bank import exit_code_for_status, storage_mount_error
 from services.content_quality.transcript_bank import model_progress_to_stderr
 
@@ -72,3 +73,32 @@ def test_model_progress_is_routed_away_from_machine_json_stdout(capsys):
     assert json.loads(captured.out) == {"status": "completed"}
     assert "model progress: 75%" in captured.err
     assert "model progress" not in captured.out
+
+
+def test_acquisition_clis_default_internal_and_honor_explicit_storage(tmp_path):
+    expected_internal = (
+        Path.home()
+        / "Library/Application Support/ContentQuality/data/transcript-bank"
+    )
+    explicit_storage = tmp_path / "explicit-legacy-recovery-root"
+
+    backfill_default = backfill_transcript_bank.parser().parse_args([])
+    cohort_default = transcribe_performance_cohort.parser().parse_args(
+        ["--topic", "automation"]
+    )
+    assert backfill_default.storage_root == expected_internal
+    assert cohort_default.storage_root == expected_internal
+
+    backfill_explicit = backfill_transcript_bank.parser().parse_args(
+        ["--storage-root", str(explicit_storage)]
+    )
+    cohort_explicit = transcribe_performance_cohort.parser().parse_args(
+        [
+            "--topic",
+            "automation",
+            "--storage-root",
+            str(explicit_storage),
+        ]
+    )
+    assert backfill_explicit.storage_root == explicit_storage
+    assert cohort_explicit.storage_root == explicit_storage
