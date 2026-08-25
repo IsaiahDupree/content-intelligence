@@ -22,7 +22,7 @@ from .predictor import MarketTapePredictor
 from .store import ClosingSQLiteConnection, MarketTapeStore
 
 
-DATASET_CONTRACT = "market_tape_daily_dataset_v1"
+DATASET_CONTRACT = "market_tape_daily_dataset_v2"
 SNAPSHOT_CONSISTENCY_CONTRACT = "market_tape_dataset_snapshot_consistency_v1"
 EXCLUDED_EXPORT_TABLES = {"mt_sync_outbox"}
 SNAPSHOT_VALIDATION_READ_CHUNK_BYTES = 4 * 1024 * 1024
@@ -170,7 +170,15 @@ class MarketTapeDatasetManager:
             try:
                 prediction_evaluation = self.store.evaluate_predictions(checked_at)
                 prediction_training = MarketTapePredictor(self.config, self.store).train()
-                prediction_forecast = self.store.forecast_active_trends(checked_at)
+                prediction_forecast = {
+                    "state": "delegated_to_capacity_backed_collection_cycle",
+                    "reason": (
+                        "dataset certification cannot create provider-unreserved "
+                        "promoted-model forecasts"
+                    ),
+                    "predictions_added": 0,
+                    "reservations_added": 0,
+                }
                 captured_models = self._capture_models()
                 pinned_source, snapshot_captured_at = self._pin_source_snapshot()
             finally:
@@ -282,7 +290,7 @@ class MarketTapeDatasetManager:
             }
             manifest = {
                 "contract": DATASET_CONTRACT,
-                "schema_version": 1,
+                "schema_version": 2,
                 "certification_id": certification_id,
                 "state": state,
                 "dataset_date": target_date.isoformat(),
@@ -357,6 +365,20 @@ class MarketTapeDatasetManager:
         status["manifest_available"] = bool(
             manifest_path and manifest_path.is_file()
         )
+        lineage_gate = bool(
+            (status.get("gates") or {}).get(
+                "accepted_observation_lineage_complete"
+            )
+        )
+        successful_state = status.get("state") in {"partial", "certified"}
+        if successful_state and (
+            status.get("contract") != DATASET_CONTRACT
+            or (status.get("state") == "certified" and not lineage_gate)
+        ):
+            status["previous_state"] = status.get("state")
+            status["state"] = "needs_recertification"
+            status["reason"] = "accepted_observation_lineage_receipt_missing"
+            status["contract"] = DATASET_CONTRACT
         if self.latest_success_path.is_file():
             try:
                 latest_success = json.loads(
@@ -364,8 +386,26 @@ class MarketTapeDatasetManager:
                 )
             except (OSError, ValueError):
                 latest_success = {}
-            if latest_success:
+            latest_lineage_gate = bool(
+                (latest_success.get("gates") or {}).get(
+                    "accepted_observation_lineage_complete"
+                )
+            )
+            if (
+                latest_success.get("contract") == DATASET_CONTRACT
+                and latest_success.get("state") in {"partial", "certified"}
+                and (
+                    latest_success.get("state") != "certified"
+                    or latest_lineage_gate
+                )
+            ):
                 status["latest_success"] = latest_success
+            elif latest_success:
+                status["latest_success_stale"] = {
+                    "state": "needs_recertification",
+                    "previous_state": latest_success.get("state"),
+                    "reason": "accepted_observation_lineage_receipt_missing",
+                }
         return status
 
     def _acquire_certification_lock(self) -> Optional[TextIO]:
@@ -873,9 +913,13 @@ class MarketTapeDatasetManager:
             acquired_rows = {
                 str(row["platform"]): int(row["videos"])
                 for row in connection.execute(
-                    """SELECT platform, COUNT(*) AS videos
-                       FROM mt_videos WHERE substr(first_seen_at, 1, 10) = ?
-                       GROUP BY platform""",
+                    """SELECT observation.platform,
+                              COUNT(DISTINCT observation.video_id) AS videos
+                       FROM mt_accepted_full_evidence_v1 evidence
+                       JOIN mt_accepted_metric_observations_v1 observation
+                         ON observation.observation_id = evidence.observation_id
+                       WHERE substr(evidence.accepted_at, 1, 10) = ?
+                       GROUP BY observation.platform""",
                     (day,),
                 ).fetchall()
             }
@@ -883,10 +927,36 @@ class MarketTapeDatasetManager:
                 str(row["platform"]): dict(row)
                 for row in connection.execute(
                     """SELECT observation.platform,
-                              COUNT(*) AS collected_observations,
-                              COUNT(DISTINCT observation.video_id) AS collected_videos,
-                              SUM(observation.views > 0) AS observations_with_views,
-                              SUM(observation.creator_followers > 0) AS observations_with_followers
+                              COUNT(*) AS raw_collected_observations,
+                              SUM(EXISTS (
+                                  SELECT 1
+                                  FROM mt_accepted_metric_observations_v1 accepted
+                                  WHERE accepted.observation_id =
+                                        observation.observation_id
+                              )) AS collected_observations,
+                              COUNT(DISTINCT CASE WHEN EXISTS (
+                                  SELECT 1
+                                  FROM mt_accepted_metric_observations_v1 accepted
+                                  WHERE accepted.observation_id =
+                                        observation.observation_id
+                              ) THEN observation.video_id END) AS collected_videos,
+                              SUM(EXISTS (
+                                  SELECT 1
+                                  FROM mt_accepted_metric_observations_v1 accepted
+                                  WHERE accepted.observation_id =
+                                        observation.observation_id
+                              ) AND observation.views > 0) AS observations_with_views,
+                              SUM(EXISTS (
+                                  SELECT 1
+                                  FROM mt_accepted_metric_observations_v1 accepted
+                                  WHERE accepted.observation_id =
+                                        observation.observation_id
+                              ) AND observation.creator_followers > 0) AS observations_with_followers,
+                              SUM(EXISTS (
+                                  SELECT 1
+                                  FROM mt_observation_quality_flags quality
+                                  WHERE quality.observation_id = observation.observation_id
+                              )) AS quarantined_observations
                        FROM mt_market_observations observation
                        JOIN mt_collection_runs run ON run.run_id = observation.run_id
                        WHERE substr(run.started_at, 1, 10) = ?
@@ -899,7 +969,8 @@ class MarketTapeDatasetManager:
                 for row in connection.execute(
                     """SELECT video.platform, COUNT(*) AS trajectory_videos
                        FROM (
-                           SELECT video_id FROM mt_market_observations
+                           SELECT observation.video_id
+                           FROM mt_accepted_metric_observations_v1 observation
                            GROUP BY video_id HAVING COUNT(*) >= 2
                        ) eligible
                        JOIN mt_videos video USING(video_id)
@@ -912,7 +983,9 @@ class MarketTapeDatasetManager:
                 platform_rows.append({
                     "platform": platform,
                     "acquired_videos": acquired_rows.get(platform, 0),
+                    "raw_collected_observations": int(collected.get("raw_collected_observations") or 0),
                     "collected_observations": int(collected.get("collected_observations") or 0),
+                    "quarantined_observations": int(collected.get("quarantined_observations") or 0),
                     "collected_videos": int(collected.get("collected_videos") or 0),
                     "observations_with_views": int(collected.get("observations_with_views") or 0),
                     "observations_with_followers": int(collected.get("observations_with_followers") or 0),
@@ -959,8 +1032,53 @@ class MarketTapeDatasetManager:
                           SUM(text_embedding_ref != '') AS text_embeddings,
                           SUM(visual_embedding_ref != '') AS visual_embeddings,
                           SUM(audio_embedding_ref != '') AS audio_embeddings
-                   FROM mt_content_genomes"""
+                   FROM mt_content_genomes genome
+                   WHERE EXISTS (
+                       SELECT 1
+                       FROM mt_accepted_full_evidence_v1 evidence
+                       WHERE evidence.video_id = genome.video_id
+                   )"""
             ).fetchone())
+            lineage = dict(connection.execute(
+                """SELECT
+                       (SELECT COUNT(*)
+                        FROM mt_accepted_metric_observations_v1)
+                           AS accepted_metric_observations,
+                       (SELECT COUNT(DISTINCT video_id)
+                        FROM mt_accepted_metric_observations_v1)
+                           AS accepted_metric_videos,
+                       (SELECT COUNT(*)
+                        FROM mt_accepted_full_evidence_v1)
+                           AS accepted_full_observations,
+                       (SELECT COUNT(DISTINCT video_id)
+                        FROM mt_accepted_full_evidence_v1)
+                           AS accepted_full_videos,
+                       (SELECT COUNT(*) FROM (
+                            SELECT DISTINCT metric.video_id
+                            FROM mt_accepted_metric_observations_v1 metric
+                            WHERE NOT EXISTS (
+                                SELECT 1
+                                FROM mt_accepted_full_evidence_v1 full_evidence
+                                WHERE full_evidence.video_id = metric.video_id
+                            )
+                        )) AS metric_videos_without_full_evidence,
+                       (SELECT COUNT(*) FROM mt_trend_memberships)
+                           AS raw_trend_memberships,
+                       (SELECT COUNT(*)
+                        FROM mt_accepted_trend_memberships_v1)
+                           AS accepted_trend_memberships"""
+            ).fetchone())
+            lineage["trend_membership_lineage_gap"] = max(
+                0,
+                int(lineage.get("raw_trend_memberships") or 0)
+                - int(lineage.get("accepted_trend_memberships") or 0),
+            )
+            lineage["observation_evidence_contract"] = (
+                "market_tape_accepted_observation_evidence_v1"
+            )
+            lineage["trend_observation_contract"] = (
+                "market_tape_accepted_observation_lineage_v2"
+            )
             source_failures = [dict(row) for row in connection.execute(
                 """SELECT source_id, platform, state, error_code, error_detail,
                           checked_at, next_retry_at
@@ -977,6 +1095,10 @@ class MarketTapeDatasetManager:
                                   ORDER BY predicted_at DESC, prediction_id DESC
                               ) AS row_number
                        FROM mt_predictions
+                       WHERE json_extract(
+                               features_json,
+                               '$.observation_quality_contract'
+                           ) = 'market_tape_accepted_observation_lineage_v2'
                    )
                    SELECT * FROM ranked WHERE row_number = 1
                    ORDER BY probability DESC LIMIT 100"""
@@ -1058,6 +1180,7 @@ class MarketTapeDatasetManager:
                     int(attribution.get("raw_rows") or 0)
                     - int(attribution.get("semantic_rows") or 0),
                 ),
+                **lineage,
             },
             "feature_completeness": genome,
             "prediction_backtest": prediction_evaluation,
@@ -1084,6 +1207,7 @@ class MarketTapeDatasetManager:
         collection = quality["collection"]
         coverage = quality["query_coverage"]
         platform_rows = collection["platforms"]
+        lineage = quality["lineage"]
         prediction_models = quality["prediction_backtest"].get("models", [])
         return {
             "sqlite_integrity": (
@@ -1112,6 +1236,12 @@ class MarketTapeDatasetManager:
             "trajectory_coverage": all(
                 int(row["trajectory_videos"]) > 0 for row in platform_rows.values()
             ),
+            "accepted_observation_lineage_complete": (
+                int(lineage["accepted_full_videos"]) > 0
+                and int(lineage["metric_videos_without_full_evidence"]) == 0
+                and int(lineage["trend_membership_lineage_gap"]) == 0
+                and int(lineage["accepted_trend_memberships"]) > 0
+            ),
             "prediction_model_validated": any(
                 model.get("state") == "validated" for model in prediction_models
             ),
@@ -1124,7 +1254,8 @@ class MarketTapeDatasetManager:
             for key in (
                 "contract", "state", "dataset_date", "checked_at", "created_at",
                 "updated_at", "phase", "progress", "certification_id",
-                "manifest_path", "storage", "gates",
+                "manifest_path", "storage", "gates", "schema_version",
+                "database_schema_version",
             )
             if key in result
         }

@@ -8,6 +8,7 @@ from datetime import timedelta, timezone
 from typing import Any, Dict, List, Sequence
 
 from .base import MarketSource, SourceHTTPError
+from .counters import first_counter, missing_counter_metadata
 from ..models import (
     MarketContent,
     MetricCounters,
@@ -49,6 +50,14 @@ class YouTubeSource(MarketSource):
 
     def credential_material(self) -> Sequence[str]:
         return (self.api_key,)
+
+    def measurement_refresh_batch_size(self) -> int:
+        return 50
+
+    def measurement_request_units_per_batch(self) -> int:
+        # The optional batch edge may reject and fall back to /videos, so hold
+        # both possible requests until the terminal measurement completes.
+        return 2 if self.config.youtube_batch_stats else 1
 
     def discover_performance(
         self,
@@ -341,6 +350,7 @@ class YouTubeSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: List[MarketContent] = []
+            missing_counter_count = 0
             for offset in range(0, len(tracked), 50):
                 if self.request_count >= self.request_budget:
                     break
@@ -372,8 +382,23 @@ class YouTubeSource(MarketSource):
                 for raw in data.get("items", []):
                     if not isinstance(raw, dict) or not raw.get("id"):
                         continue
+                    statistics = raw.get("statistics", {}) or {}
+                    if (
+                        not isinstance(statistics, dict)
+                        or first_counter(statistics.get("viewCount")) is None
+                    ):
+                        missing_counter_count += 1
+                        continue
                     output.append(self._normalize(raw, observed, by_id.get(str(raw["id"]), {})))
-            return self.success_batch(started, output, operation="refresh")
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata=missing_counter_metadata(
+                    missing_counter_count,
+                    "statistics.viewCount",
+                ),
+            )
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -401,8 +426,11 @@ class YouTubeSource(MarketSource):
             observed_at=observed,
             source_id=self.source_id,
             metrics=MetricCounters.from_values(
-                views=statistics.get("viewCount"), likes=statistics.get("likeCount"),
-                comments=statistics.get("commentCount"), shares=0, saves=0,
+                views=first_counter(statistics.get("viewCount")),
+                likes=first_counter(statistics.get("likeCount")),
+                comments=first_counter(statistics.get("commentCount")),
+                shares=0,
+                saves=0,
             ),
             title=title,
             description=description,

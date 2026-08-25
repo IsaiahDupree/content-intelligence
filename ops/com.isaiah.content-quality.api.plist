@@ -16,6 +16,15 @@
   <string>Background</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
+  <!-- launchd's default soft maxfiles is 256. Under the Ops Console's probe pattern this
+       server reached ~400 open market-tape descriptors and started failing every request
+       with OSError 24 (too many open files), taking the narrative-coherence gate down.
+       Headroom, not a fix: see the health cache in services/content_quality/api.py. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>/tmp/content-quality-api.log</string>
   <key>StandardErrorPath</key>

@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 from services.content_quality.api import create_content_quality_app
+from services.content_quality.engine import MarketTapeReader
 
 
 class ContentQualityIntegrationTests(unittest.TestCase):
@@ -14,6 +15,7 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         base = Path(self.tempdir.name)
         tape = base / "market-tape.sqlite3"
+        self.tape = tape
         quality = base / "content-quality.sqlite3"
         with closing(sqlite3.connect(tape)) as connection:
             connection.executescript(
@@ -27,9 +29,10 @@ class ContentQualityIntegrationTests(unittest.TestCase):
                     video_id TEXT PRIMARY KEY, transcript TEXT, opening_words TEXT, hook_type TEXT
                 );
                 CREATE TABLE mt_market_observations (
+                    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     video_id TEXT, views INTEGER, likes INTEGER, comments INTEGER, shares INTEGER,
                     view_velocity REAL, view_acceleration REAL, relative_strength REAL,
-                    observation_key TEXT, observed_at TEXT
+                    observation_key TEXT, observed_at TEXT, source_confidence REAL NOT NULL DEFAULT 1
                 );
                 CREATE TABLE mt_transcript_artifacts (
                     transcript_id TEXT PRIMARY KEY, video_id TEXT, platform TEXT, external_id TEXT,
@@ -72,7 +75,11 @@ class ContentQualityIntegrationTests(unittest.TestCase):
                     (video_id, transcript, "You feel burned out and stuck"),
                 )
                 connection.execute(
-                    "INSERT INTO mt_market_observations VALUES (?, 30000, 1800, 120, 60, 120, 9, 2.4, ?, ?)",
+                    """INSERT INTO mt_market_observations(
+                           video_id, views, likes, comments, shares, view_velocity,
+                           view_acceleration, relative_strength, observation_key,
+                           observed_at, source_confidence
+                       ) VALUES (?, 30000, 1800, 120, 60, 120, 9, 2.4, ?, ?, 1)""",
                     (video_id, observation_key, "2026-08-18T00:00:00Z"),
                 )
                 connection.execute(
@@ -149,6 +156,30 @@ class ContentQualityIntegrationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["normalized"]["kind"], "aggregate_only")
         self.assertNotIn("points", response.get_json()["normalized"])
+
+    def test_market_tape_reader_excludes_zero_confidence_latest_rows(self):
+        with closing(sqlite3.connect(self.tape)) as connection:
+            connection.execute(
+                """INSERT INTO mt_market_observations(
+                       video_id, views, likes, comments, shares, view_velocity,
+                       view_acceleration, relative_strength, observation_key,
+                       observed_at, source_confidence
+                   ) VALUES (?, 999999, 0, 0, 0, 0, 0, 0, ?, ?, 0)""",
+                (
+                    "youtube:video:real-source-0",
+                    "rejected-observation",
+                    "2026-08-19T00:00:00Z",
+                ),
+            )
+
+        reader = MarketTapeReader(self.tape)
+        self.assertEqual(reader.health()["analytics_eligible_observations"], 5)
+        videos = reader.candidates(topic="AI automation", limit=5)
+        source = next(
+            item for item in videos
+            if item["video_id"] == "youtube:video:real-source-0"
+        )
+        self.assertEqual(source["views"], 30000)
 
     def test_real_uploaded_video_is_decoded_and_semantically_audited(self):
         video = Path(self.tempdir.name) / "real-test-pattern.mp4"

@@ -40,7 +40,7 @@ class TikTokAdapter(PlatformAdapter):
     
     def fetch_comments(
         self,
-        platform_post_id str,
+        platform_post_id: str,
         limit: int = 100,
         since: Optional[datetime] = None
     ) -> List[CommentData]:

@@ -188,36 +188,33 @@ def _bounded_keyword_rows(
     )
     with store.connect() as connection:
         return [dict(row) for row in connection.execute(
-            """SELECT video.video_id, video.creator_id, video.platform,
-                      video.published_at, video.title, video.caption,
-                      video.description, video.url, latest.observed_at,
+            """SELECT latest.video_id, latest.creator_id, latest.platform,
+                      evidence.published_at, evidence.title, evidence.caption,
+                      evidence.description, evidence.url, latest.observed_at,
                       latest.views, latest.likes, latest.comments,
                       latest.shares, latest.view_velocity,
-                      genome.hashtags_json,
-                      (SELECT COUNT(*) FROM mt_market_observations counted
-                       WHERE counted.video_id = video.video_id) AS observation_count,
-                      COALESCE((
-                          SELECT json_group_array(attribution.query)
-                          FROM (
-                              SELECT DISTINCT query
-                              FROM mt_discovery_attributions
-                              WHERE video_id = video.video_id AND query != ''
-                          ) attribution
-                      ), '[]') AS discovery_queries_json
-               FROM mt_videos video
-               JOIN mt_market_observations latest
-                 ON latest.observation_id = (
+                      evidence.hashtags_json,
+                      (SELECT COUNT(*)
+                       FROM mt_accepted_metric_observations_v1 counted
+                       WHERE counted.video_id = latest.video_id
+                      ) AS observation_count,
+                      evidence.discovery_queries_json
+               FROM mt_accepted_metric_observations_v1 latest
+               JOIN mt_accepted_full_evidence_v1 evidence
+                 ON evidence.observation_id = latest.observation_id
+               WHERE latest.observation_id = (
                      SELECT current.observation_id
-                     FROM mt_market_observations current
-                     WHERE current.video_id = video.video_id
+                     FROM mt_accepted_metric_observations_v1 current
+                     JOIN mt_accepted_full_evidence_v1 current_evidence
+                       ON current_evidence.observation_id =
+                          current.observation_id
+                     WHERE current.video_id = latest.video_id
                      ORDER BY current.observed_at DESC,
                               current.observation_id DESC
                      LIMIT 1
                  )
-               LEFT JOIN mt_content_genomes genome
-                 ON genome.video_id = video.video_id
-               WHERE video.published_at IS NOT NULL
-                 AND video.published_at >= ?
+                 AND evidence.published_at IS NOT NULL
+                 AND evidence.published_at >= ?
                  AND latest.observed_at >= ?
                ORDER BY latest.observed_at DESC,
                         latest.observation_id DESC

@@ -12,7 +12,11 @@ from flask import Flask
 from services.market_tape.api import register_market_tape_routes
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.intelligence import build_intelligence_snapshot
-from services.market_tape.predictor import ENTRY_HORIZON
+from services.market_tape.predictor import (
+    ENTRY_HORIZON,
+    MODEL_FAMILY,
+    OBSERVATION_QUALITY_CONTRACT,
+)
 from services.market_tape.store import MarketTapeStore
 
 
@@ -99,13 +103,19 @@ def test_intelligence_endpoint_is_bounded_with_active_prediction_history(tmp_pat
                    median_video_velocity, p90_video_velocity, creator_breadth,
                    platform_breadth, top1_concentration, top10_concentration,
                    momentum, acceleration, relative_strength, saturation,
-                   trend_strength, index_version, state
+                   trend_strength, index_version,
+                   observation_quality_contract, state
                ) VALUES(?, ?, 3, 2, 3, 2, 1, 10000, 1000, 100, 50,
                         500, 50, 5, 2, 2, 0.8, 1.0, 2.0, 0.8, 0.4,
                         0.4, 0.7, 1.0, 0.5, 1.2, 0.2, ?,
-                        'trend-strength-v2', 'emerging')""",
+                        'trend-strength-v2', ?, 'emerging')""",
             [
-                (f"scale-trend-{index}", observed, 60.0)
+                (
+                    f"scale-trend-{index}",
+                    observed,
+                    60.0,
+                    OBSERVATION_QUALITY_CONTRACT,
+                )
                 for index in range(trend_count)
             ],
         )
@@ -114,7 +124,7 @@ def test_intelligence_endpoint_is_bounded_with_active_prediction_history(tmp_pat
                    subject_type, subject_id, model_version, predicted_at,
                    horizon, probability, expected_peak_at,
                    expected_remaining_life_hours, features_json
-               ) VALUES('trend', ?, ?, ?, ?, ?, ?, 12.0, '{}')""",
+               ) VALUES('trend', ?, ?, ?, ?, ?, ?, 12.0, ?)""",
             [
                 (
                     f"scale-trend-{index}",
@@ -123,6 +133,11 @@ def test_intelligence_endpoint_is_bounded_with_active_prediction_history(tmp_pat
                     ENTRY_HORIZON,
                     0.99 if index % 2 else 0.01,
                     observed,
+                    json.dumps({
+                        "observation_quality_contract": (
+                            OBSERVATION_QUALITY_CONTRACT
+                        ),
+                    }),
                 )
                 for index in range(trend_count)
             ],
@@ -201,12 +216,17 @@ def test_latest_ineligible_observation_never_falls_back_to_older_eligible_row(
                        creator_breadth, platform_breadth, top1_concentration,
                        top10_concentration, momentum, acceleration,
                        relative_strength, saturation, trend_strength,
-                       index_version, state
+                       index_version, observation_quality_contract, state
                    ) VALUES('latest-state-trend', ?, 3, 2, 3, 2, 1,
                             10000, 1000, 100, 50, 500, 50, 5, 2, 2, 0.8,
                             1.0, 2.0, 0.8, 0.4, 0.4, 0.7, 1.0, 0.5,
-                            1.2, ?, ?, 'trend-strength-v2', 'emerging')""",
-                (observed_at.isoformat(), saturation, strength),
+                            1.2, ?, ?, 'trend-strength-v2', ?, 'emerging')""",
+                (
+                    observed_at.isoformat(),
+                    saturation,
+                    strength,
+                    OBSERVATION_QUALITY_CONTRACT,
+                ),
             )
 
     result = store.trend_opportunities(
@@ -247,11 +267,14 @@ def _write_active_model(config):
     artifact = {
         "contract": "market_tape_trend_predictor_v1",
         "status": "promoted",
-        "model_family": "early-breakout-logistic-v3",
+        "model_family": MODEL_FAMILY,
         "model_purpose": "early_breakout_entry",
         "model_version": model_version,
         "training_dataset_sha256": "b" * 64,
-        "training": {"index_version": "trend-strength-v2"},
+        "training": {
+            "index_version": "trend-strength-v2",
+            "observation_quality_contract": OBSERVATION_QUALITY_CONTRACT,
+        },
         "model": {
             "intercept": 0.0,
             "coefficients": [0.0] * 7,

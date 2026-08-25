@@ -21,10 +21,16 @@ chmod +x \
   "$RUNTIME_ROOT/scripts/run_market_tape_certifier.sh"
 
 PYTHON_BIN="${MARKET_TAPE_PYTHON_BIN:-/opt/homebrew/bin/python3}"
-"$PYTHON_BIN" "$ROOT/scripts/build_market_tape_runtime_env.py" \
+runtime_env_args=(
   --repo-root "$ROOT" \
   --runtime-base "$RUNTIME_BASE" \
   --output "$RUNTIME_ROOT/.env.market-tape"
+)
+if [[ "${MARKET_TAPE_ROTATE_CONTROL_TOKEN:-false}" == "true" ]]; then
+  runtime_env_args+=(--rotate-control-token)
+fi
+"$PYTHON_BIN" "$ROOT/scripts/build_market_tape_runtime_env.py" \
+  "${runtime_env_args[@]}"
 
 "$PYTHON_BIN" -m compileall -q \
   "$RUNTIME_ROOT/market_tape_app.py" \

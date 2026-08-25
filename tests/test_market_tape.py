@@ -24,8 +24,10 @@ from services.market_tape.math import age_bucket, concentration, counter_motion,
 from services.market_tape.migration import (
     MARKET_TAPE_TABLES,
     SupabaseMigrationManager,
+    migration_sql,
     project_ref_from_url,
     validate_migration,
+    verification_sql,
 )
 from services.market_tape.models import (
     MarketContent,
@@ -33,6 +35,7 @@ from services.market_tape.models import (
     ProviderBatch,
     SourceReceipt,
     SourceState,
+    isoformat,
     stable_hash,
 )
 from services.market_tape.sources.base import sanitize
@@ -40,7 +43,10 @@ from services.market_tape.sources.local_research import LocalResearchSource
 from services.market_tape.sources.social import MetaGraphSource
 from services.market_tape.sources.youtube import YouTubeSource
 from services.market_tape.sinks.supabase import ENTITY_SYNC_ORDER, ENTITY_TABLES, SupabaseSink
-from services.market_tape.store import MarketTapeStore
+from services.market_tape.store import (
+    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+    MarketTapeStore,
+)
 
 
 class ProviderTestHandler(BaseHTTPRequestHandler):
@@ -65,6 +71,12 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
             and self.headers.get("Authorization") == "Bearer invalid-token"
         ):
             self._json({"error": "invalid access token"}, status=401)
+            return
+        if (
+            parsed.path == "/123/videos"
+            and self.headers.get("Authorization") == "Bearer quota-token"
+        ):
+            self._json({"error": "authorization or quota denied"}, status=403)
             return
         if parsed.path.startswith("/api/research/status/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
@@ -145,6 +157,10 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
                 trigger_names = []
                 if table == "actp_market_observations":
                     trigger_names.append("actp_market_observations_no_update")
+                if table == "actp_market_observation_quality_flags":
+                    trigger_names.append(
+                        "actp_market_observation_quality_flags_no_update"
+                    )
                 if table == "actp_market_discovery_attributions":
                     trigger_names.append("actp_market_discovery_attributions_no_update")
                 if table == "actp_market_query_attempts":
@@ -608,6 +624,67 @@ def test_transactional_outbox_flushes_to_supabase_rest(provider_server, market_c
     assert any(post["path"] == "/actp_market_source_health" for post in ProviderTestHandler.received_posts)
 
 
+def test_supabase_sink_splits_mixed_payload_shapes(
+    provider_server,
+    market_config,
+    monkeypatch,
+):
+    store = MarketTapeStore(market_config)
+    now = datetime.now(timezone.utc).isoformat()
+    payloads = (
+        {
+            "trend_observation_key": "legacy-shape",
+            "trend_id": "trend:legacy-shape",
+        },
+        {
+            "trend_observation_key": "accepted-shape",
+            "trend_id": "trend:accepted-shape",
+            "observation_quality_contract": (
+                "market_tape_accepted_observation_lineage_v2"
+            ),
+        },
+    )
+    with store.connect() as connection:
+        for payload in payloads:
+            connection.execute(
+                """INSERT INTO mt_sync_outbox(
+                       entity_type, entity_key, payload_json, created_at,
+                       next_attempt_at
+                   ) VALUES('trend_observation', ?, ?, ?, ?)""",
+                (
+                    payload["trend_observation_key"],
+                    json.dumps(payload, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv(
+        "SUPABASE_SERVICE_KEY",
+        "service-role-integration-key-1234567890",
+    )
+    enabled = replace(market_config, supabase_sync_enabled=True)
+    sink = SupabaseSink(enabled, store, rest_base_url=provider_server)
+    try:
+        result = sink.flush()
+    finally:
+        sink.close()
+
+    posts = [
+        post for post in ProviderTestHandler.received_posts
+        if post["path"] == "/actp_trend_observations"
+    ]
+    assert result["state"] == "ready"
+    assert result["synced"] == 2
+    assert result["pending"] == 0
+    assert len(posts) == 2
+    assert all(
+        len({tuple(sorted(row)) for row in post["body"]}) == 1
+        for post in posts
+    )
+
+
 def test_market_tape_migration_contract_matches_outbox_tables():
     validation = validate_migration()
     sink_tables = {definition[0] for definition in ENTITY_TABLES.values()}
@@ -618,6 +695,19 @@ def test_market_tape_migration_contract_matches_outbox_tables():
     assert set(ENTITY_SYNC_ORDER) == set(ENTITY_TABLES)
     assert project_ref_from_url("https://ivhfuhxorppptyuofbgq.supabase.co") == "ivhfuhxorppptyuofbgq"
     assert project_ref_from_url("https://example.com") == ""
+
+    verification = verification_sql().lower()
+    namespace_join = verification.index(
+        "left join pg_catalog.pg_namespace namespace"
+    )
+    relation_join = verification.index("left join pg_catalog.pg_class relation")
+    assert namespace_join < relation_join
+    assert "relation.relnamespace = namespace.oid" in verification
+    assert "namespace.nspname = 'public'" in verification
+    assert (
+        "flag_id = 'counter-regression:' || observation_key"
+        in migration_sql().lower()
+    )
 
 
 def test_market_tape_migration_applies_and_verifies_over_real_http(provider_server):
@@ -1081,6 +1171,56 @@ def test_invalid_facebook_credential_circuit_retries_only_after_token_rotation(
     assert len(ProviderTestHandler.received_gets) == 2
     database_bytes = config.db_path.read_bytes()
     assert b"invalid-token" not in database_bytes
+    assert b"rotated-token" not in database_bytes
+
+
+def test_ambiguous_403_circuit_retries_once_after_token_rotation(
+    provider_server,
+    market_config,
+    monkeypatch,
+):
+    monkeypatch.setenv("FACEBOOK_PAGE_ID", "123")
+    monkeypatch.setenv("FACEBOOK_ACCESS_TOKEN", "quota-token")
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    config = replace(
+        market_config,
+        platforms=["facebook"],
+        topics=["creator economy"],
+        daily_unique_target=10,
+        platform_daily_targets={"facebook": 10},
+        source_quota_backoff_seconds=3600,
+    )
+
+    def source_builder(runtime_config, run_id, budget_for):
+        return [MetaGraphSource(
+            runtime_config,
+            run_id,
+            budget_for("facebook-403-integration", 10),
+            platform="facebook",
+            account_env="FACEBOOK_PAGE_ID",
+            token_envs=("FACEBOOK_ACCESS_TOKEN",),
+            source_id="facebook-403-integration",
+            edge="videos",
+            fields="id,title,description,created_time",
+            base_url=provider_server,
+        )]
+
+    store = MarketTapeStore(config)
+    collector = MarketTapeCollector(config, store, source_builder=source_builder)
+    first = collector.run_cycle("discovery")
+    request_count = len(ProviderTestHandler.received_gets)
+    second = collector.run_cycle("discovery")
+
+    assert first["receipts"][0]["error_code"] == "provider_auth_or_quota"
+    assert second["receipts"][0]["error_code"] == "circuit_open"
+    assert len(ProviderTestHandler.received_gets) == request_count == 1
+
+    monkeypatch.setenv("FACEBOOK_ACCESS_TOKEN", "rotated-token")
+    third = collector.run_cycle("discovery")
+    assert third["receipts"][0]["error_code"] == "provider_http_error"
+    assert len(ProviderTestHandler.received_gets) == 2
+    database_bytes = config.db_path.read_bytes()
+    assert b"quota-token" not in database_bytes
     assert b"rotated-token" not in database_bytes
 
 
@@ -1661,32 +1801,125 @@ def test_discovery_context_trend_backfill_is_idempotent_and_provider_free(market
     store = MarketTapeStore(market_config)
     observed = datetime.now(timezone.utc) - timedelta(hours=1)
     store.start_run("historical-context-run", "archive_bootstrap")
-    item = _content_for_keyword(
-        "historical-context-video",
-        "A measured result from the field",
-        observed,
-        25_000,
-    )
-    store.ingest(item, "historical-context-run")
-    store.finish_run("historical-context-run")
     context = {"niche": "live sports", "query": "live sports latest"}
+    item = replace(
+        _content_for_keyword(
+            "historical-context-video",
+            "A measured result from the field",
+            observed,
+            25_000,
+        ),
+        discovery_context=context,
+    )
+    # Model a historical, fully accepted observation whose immutable discovery
+    # context survived but whose derived trend rows were never built. Calling
+    # ingest() here would exercise today's write path, which already creates the
+    # trend and would leave nothing for this repair routine to backfill.
+    raw_sha, raw_path, raw_bytes = store._archive_raw(item)
+    observed_text = isoformat(item.observed_at)
+    published_text = isoformat(item.published_at)
     with store.connect() as connection:
         connection.execute(
-            """INSERT INTO mt_discovery_attributions(
-                   attribution_key, run_id, video_id, source_id, discovered_at,
-                   surface, query, context_json
+            """INSERT INTO mt_raw_objects(
+                   raw_sha256, object_path, bytes_compressed, first_seen_at,
+                   source_id
+               ) VALUES(?, ?, ?, ?, ?)""",
+            (raw_sha, raw_path, raw_bytes, observed_text, item.source_id),
+        )
+        connection.execute(
+            """INSERT INTO mt_creators(
+                   creator_id, platform, external_id, handle, display_name,
+                   followers, first_seen_at, last_seen_at
                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                "historical-live-sports-attribution",
-                "historical-context-run",
-                item.video_id,
-                item.source_id,
-                observed.isoformat(),
-                "historical_archive",
-                "live sports latest",
-                json.dumps(context),
+                item.creator_id,
+                item.platform,
+                item.creator_external_id,
+                item.creator_handle,
+                item.creator_name,
+                item.creator_followers,
+                observed_text,
+                observed_text,
             ),
         )
+        connection.execute(
+            """INSERT INTO mt_videos(
+                   video_id, platform, external_id, creator_id, published_at,
+                   first_seen_at, last_seen_at, title, caption, description,
+                   language, url, thumbnail_url, media_type, duration_seconds,
+                   source_first_seen
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                item.video_id,
+                item.platform,
+                item.external_id,
+                item.creator_id,
+                published_text,
+                observed_text,
+                observed_text,
+                item.title,
+                item.caption,
+                item.description,
+                item.language,
+                item.url,
+                item.thumbnail_url,
+                item.media_type,
+                item.duration_seconds,
+                "historical-context-run",
+            ),
+        )
+        observation = connection.execute(
+            """INSERT INTO mt_market_observations(
+                   observation_key, run_id, observed_at, wall_clock_date,
+                   video_id, creator_id, platform, source_id,
+                   video_age_seconds, video_age_bucket, views, likes, comments,
+                   shares, saves, creator_followers, view_velocity,
+                   view_acceleration, view_jerk, relative_strength, raw_sha256,
+                   source_confidence
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        0, 0, 0, 0, ?, 1)""",
+            (
+                item.observation_key,
+                "historical-context-run",
+                observed_text,
+                item.observed_at.date().isoformat(),
+                item.video_id,
+                item.creator_id,
+                item.platform,
+                item.source_id,
+                (item.observed_at - item.published_at).total_seconds(),
+                age_bucket(item.published_at, item.observed_at),
+                item.metrics.views,
+                item.metrics.likes,
+                item.metrics.comments,
+                item.metrics.shares,
+                item.metrics.saves,
+                item.creator_followers,
+                raw_sha,
+            ),
+        )
+        observation_id = int(observation.lastrowid)
+        store._record_accepted_observation_evidence(
+            connection,
+            item,
+            observation_id,
+            observed_text,
+            published_text,
+        )
+        store._record_discovery_attributions(
+            connection,
+            item,
+            "historical-context-run",
+            observed_text,
+        )
+        accepted = connection.execute(
+            """SELECT 1 FROM mt_accepted_observation_evidence
+               WHERE observation_id = ? AND evidence_scope = 'full'
+                 AND contract = ?""",
+            (observation_id, ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT),
+        ).fetchone()
+        assert accepted is not None
+    store.finish_run("historical-context-run")
 
     first = store.backfill_context_trends()
     second = store.backfill_context_trends()
@@ -1707,7 +1940,7 @@ def test_discovery_context_trend_backfill_is_idempotent_and_provider_free(market
         ).fetchone()
     assert membership["display_name"] == "Live Sports"
     assert json.loads(membership["evidence_json"])["contract"] == (
-        "discovery-context-trend-backfill-v1"
+        "discovery-context-trend-backfill-v2"
     )
 
 
@@ -1834,7 +2067,10 @@ def test_market_tape_api_is_readable_and_write_control_is_local(market_config):
     app = Flask(__name__)
     register_market_tape_routes(app, market_config)
     client = app.test_client()
-    assert client.get("/api/market-tape/status").status_code == 200
+    status = client.get("/api/market-tape/status")
+    assert status.status_code == 200
+    assert status.get_json()["schema_parity"] is True
+    assert status.get_json()["code_schema_version"] == status.get_json()["database_schema_version"]
     assert client.get("/api/market-tape/intelligence?limit=5").status_code == 200
     assert client.get("/api/market-tape/videos").status_code == 200
     assert client.get("/api/market-tape/trends").status_code == 200
@@ -1863,6 +2099,8 @@ def test_dedicated_market_tape_app_health_and_security_headers(market_config):
 
     assert response.status_code == 200
     assert response.get_json()["service"] == "content-intelligence-market-tape"
+    assert response.get_json()["schema_parity"] is True
+    assert response.get_json()["code_schema_version"] == response.get_json()["database_schema_version"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     assert client.get("/api/market-tape/query-frontier").status_code == 200
     reindex = client.post(
@@ -1871,6 +2109,27 @@ def test_dedicated_market_tape_app_health_and_security_headers(market_config):
     )
     assert reindex.status_code == 200
     assert reindex.get_json()["provider_calls_made"] == 0
+
+
+def test_dedicated_market_tape_health_fails_closed_on_schema_mismatch(market_config):
+    from market_tape_app import create_market_tape_app
+
+    client = create_market_tape_app(market_config).test_client()
+    with sqlite3.connect(market_config.db_path) as connection:
+        connection.execute(
+            "UPDATE mt_meta SET value = '9' WHERE key = 'schema_version'"
+        )
+        connection.commit()
+
+    health = client.get("/health")
+    status = client.get("/api/market-tape/status")
+
+    assert health.status_code == 503
+    assert health.get_json()["status"] == "degraded"
+    assert health.get_json()["schema_parity"] is False
+    assert status.status_code == 200
+    assert status.get_json()["state"] == "degraded_schema_mismatch"
+    assert status.get_json()["schema_parity"] is False
 
 
 def test_market_tape_tick_selects_due_mode_without_external_calls(market_config):

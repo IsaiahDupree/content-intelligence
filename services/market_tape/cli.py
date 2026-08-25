@@ -150,7 +150,10 @@ def main() -> int:
     if args.command == "predictor-status":
         return _print(MarketTapePredictor(config, store).status())
     if args.command == "forecast-trends":
-        return _print(store.forecast_active_trends(limit=args.limit))
+        return _print(MarketTapeCollector(
+            config,
+            store,
+        ).reserve_validation_forecasts(limit=args.limit))
     if args.command == "opportunities":
         return _print(store.trend_opportunities(
             limit=args.limit,

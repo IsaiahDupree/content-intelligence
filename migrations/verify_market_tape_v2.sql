@@ -1,4 +1,4 @@
--- Read-only post-deployment verification for Market Tape V4.
+-- Read-only post-deployment verification for Market Tape V5.
 
 with target_tables(table_name) as (
   values
@@ -7,6 +7,7 @@ with target_tables(table_name) as (
     ('actp_market_discovery_attributions'),
     ('actp_market_query_attempts'),
     ('actp_market_observations'),
+    ('actp_market_observation_quality_flags'),
     ('actp_content_genomes'),
     ('actp_trends'),
     ('actp_trend_memberships'),
@@ -22,11 +23,11 @@ with target_tables(table_name) as (
     coalesce(relation.relrowsecurity, false) as rls_enabled,
     relation.oid as relation_oid
   from target_tables target
-  left join pg_catalog.pg_class relation
-    on relation.relname = target.table_name
   left join pg_catalog.pg_namespace namespace
-    on namespace.oid = relation.relnamespace
-    and namespace.nspname = 'public'
+    on namespace.nspname = 'public'
+  left join pg_catalog.pg_class relation
+    on relation.relnamespace = namespace.oid
+    and relation.relname = target.table_name
 ), policy_state as (
   select
     target.table_name,

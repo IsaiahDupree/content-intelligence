@@ -73,6 +73,15 @@ class LocalResearchSource(MarketSource):
     def missing_credentials(self) -> List[str]:
         return [] if self.credentials_available() else ["local Safari research archive or service"]
 
+    def terminal_metrics_capable(self) -> bool:
+        return False
+
+    def adaptive_query_execution_capable(self) -> bool:
+        # Discovery replays an asynchronous archive. Scheduling a future shared
+        # browser job is observable, but it is not proof that this cycle ran
+        # the proposed query or returned query-bound observations.
+        return False
+
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
         try:
@@ -278,17 +287,162 @@ class LocalResearchSource(MarketSource):
         latest_artifact = max(artifact_timestamps, default=None)
         latest_observed = max((item.observed_at for item in items), default=None)
         now = utc_now()
+        artifact_age_seconds = (
+            max(0.0, (now - latest_artifact).total_seconds())
+            if latest_artifact else None
+        )
+        freshness_at = latest_observed or latest_artifact
+        archive_age_seconds = (
+            max(0.0, (now - freshness_at).total_seconds())
+            if freshness_at else None
+        )
+        stale_after_seconds = max(1, self.config.local_research_refresh_seconds)
+        archive_fresh = bool(
+            archive_age_seconds is not None
+            and archive_age_seconds <= stale_after_seconds
+        )
+        effective_acquisition_state = acquisition_state
+        if (
+            not archive_fresh
+            and acquisition_state in {"completed", "recently_completed", "coordinated"}
+        ):
+            effective_acquisition_state = "stale"
         return {
             "data_mode": "archive_replay",
             "archive_readable": self.platform_archive_dir.is_dir(),
             "latest_artifact_at": isoformat(latest_artifact),
             "latest_observed_at": isoformat(latest_observed),
             "archive_age_seconds": (
-                round(max(0.0, (now - latest_artifact).total_seconds()), 3)
-                if latest_artifact else None
+                round(archive_age_seconds, 3)
+                if archive_age_seconds is not None else None
             ),
-            "acquisition_state": acquisition_state,
+            "artifact_age_seconds": (
+                round(artifact_age_seconds, 3)
+                if artifact_age_seconds is not None else None
+            ),
+            "archive_freshness_basis": (
+                "latest_observed_at"
+                if latest_observed else "latest_artifact_at_fallback"
+                if latest_artifact else "unavailable"
+            ),
+            "archive_fresh": archive_fresh,
+            "archive_stale_after_seconds": stale_after_seconds,
+            "acquisition_state": effective_acquisition_state,
         }
+
+    def _read_schedule_state(self) -> Dict[str, Any]:
+        try:
+            if self.config.local_research_state_path.is_file():
+                payload = json.loads(
+                    self.config.local_research_state_path.read_text(encoding="utf-8")
+                )
+                return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            pass
+        return {}
+
+    def _coordinated_scheduler_state(
+        self,
+        coordinator: str,
+        schedule_state: Dict[str, Any],
+        now: datetime,
+    ) -> Dict[str, Any]:
+        requested_at = parse_datetime(schedule_state.get("requested_at"))
+        requested_age = (
+            max(0.0, (now - requested_at).total_seconds())
+            if requested_at else None
+        )
+        stale_after = max(1, self.config.local_research_refresh_seconds)
+        job_id = str(schedule_state.get("job_id") or "")
+        receipt: Dict[str, Any] = {
+            "state": "stale" if requested_age is None or requested_age >= stale_after
+            else "recently_requested",
+            "coordinator": coordinator,
+            "job_id": job_id or None,
+            "lane_platform": self.api_platform,
+            "latest_age_seconds": (
+                round(requested_age, 3) if requested_age is not None else None
+            ),
+            "stale_after_seconds": stale_after,
+        }
+        if not job_id:
+            return receipt
+
+        try:
+            prior_job = self.request_json(
+                "GET",
+                f"{self.base_url}/api/research/status/{job_id}",
+                headers=_research_headers(),
+            )
+        except Exception as error:
+            receipt.update({
+                "state": (
+                    "stale"
+                    if requested_age is None or requested_age >= stale_after
+                    else "coordinator_status_unavailable"
+                ),
+                "error": sanitize(error),
+            })
+            return receipt
+
+        job_status = str(prior_job.get("status") or "").casefold()
+        lane_names = {self.platform.casefold(), self.api_platform.casefold()}
+        lane_receipt = next((
+            value for value in prior_job.get("platformReceipts", [])
+            if isinstance(value, dict)
+            and str(value.get("platform") or "").casefold()
+            in lane_names
+        ), {})
+        lane_status = str(lane_receipt.get("status") or "").casefold()
+        activity_at = (
+            parse_datetime(lane_receipt.get("completedAt"))
+            or parse_datetime(prior_job.get("completedAt"))
+            or requested_at
+        )
+        activity_age = (
+            max(0.0, (now - activity_at).total_seconds())
+            if activity_at else None
+        )
+        receipt.update({
+            "job_status": job_status or "unknown",
+            "lane_status": lane_status or "unknown",
+            "latest_age_seconds": (
+                round(activity_age, 3) if activity_age is not None else None
+            ),
+        })
+
+        if job_status in {"queued", "running"}:
+            receipt["state"] = "already_running"
+            return receipt
+
+        effective_status = lane_status or job_status
+        if effective_status in {"failed", "partial"}:
+            failure_age = activity_age or 0.0
+            retry_after = max(0, self.config.local_research_failure_retry_seconds)
+            if failure_age < retry_after:
+                receipt.update({
+                    "state": "failed_cooldown",
+                    "retry_in_seconds": round(retry_after - failure_age, 3),
+                })
+            else:
+                receipt["state"] = "failed_retry_due"
+            return receipt
+
+        if effective_status == "completed":
+            receipt["state"] = (
+                "recently_completed"
+                if activity_age is not None and activity_age < stale_after
+                else "stale"
+            )
+            return receipt
+
+        receipt["state"] = (
+            "missing_job_cooldown"
+            if requested_age is not None
+            and requested_age < self.config.local_research_failure_retry_seconds
+            else "stale"
+        )
+        return receipt
 
     def _load_query_attempts(self) -> List[QueryAttempt]:
         if not self.platform_archive_dir.is_dir():
@@ -382,12 +536,16 @@ class LocalResearchSource(MarketSource):
             ),
             None,
         )
-        if self.platform != coordinator:
-            return {"state": "coordinated", "coordinator": coordinator}
-
         now = utc_now()
+        schedule_state = self._read_schedule_state()
+        if self.platform != coordinator:
+            return self._coordinated_scheduler_state(
+                str(coordinator or "unknown"),
+                schedule_state,
+                now,
+            )
+
         query_hash = stable_hash([" ".join(topic.casefold().split()) for topic in self.config.topics])
-        schedule_state: Dict[str, Any] = {}
 
         def save_schedule_state(payload: Dict[str, Any]) -> None:
             self.config.local_research_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,13 +556,6 @@ class LocalResearchSource(MarketSource):
             )
             temporary.replace(self.config.local_research_state_path)
 
-        try:
-            if self.config.local_research_state_path.is_file():
-                schedule_state = json.loads(
-                    self.config.local_research_state_path.read_text(encoding="utf-8")
-                )
-        except (OSError, ValueError):
-            schedule_state = {}
         requested_at = parse_datetime(schedule_state.get("requested_at"))
         age_seconds = (now - requested_at).total_seconds() if requested_at else None
         retry_platforms: List[str] = []

@@ -28,6 +28,11 @@ from typing import Any, Iterable, Sequence
 
 from services.market_tape.source_urls import is_usable_source_url
 
+from .contracts import (
+    CURRENT_TRANSCRIPT_AUDIT_CONTRACT,
+    is_supported_transcript_audit_contract,
+)
+
 
 UTC = timezone.utc
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
@@ -814,21 +819,24 @@ class TranscriptBank:
             parameters.extend(id_values)
         query = f"""
             WITH latest AS (
-                SELECT o.*
-                FROM mt_market_observations o
-                JOIN (
-                    SELECT video_id, MAX(observed_at) AS observed_at
-                    FROM mt_market_observations
-                    GROUP BY video_id
-                ) pick
-                  ON pick.video_id=o.video_id AND pick.observed_at=o.observed_at
+                SELECT o.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY o.video_id
+                           ORDER BY o.observed_at DESC, o.observation_id DESC
+                       ) AS row_number
+                FROM mt_accepted_metric_observations_v1 o
+                JOIN mt_accepted_full_evidence_v1 accepted
+                  ON accepted.observation_id = o.observation_id
             )
             SELECT v.video_id, v.platform, v.external_id, v.creator_id,
-                   v.title, v.caption, v.description, v.url, v.duration_seconds,
+                   e.title, e.caption, e.description, e.url,
+                   e.duration_seconds,
                    o.observation_key, o.observed_at, o.views, o.likes, o.comments,
                    o.shares, o.saves, o.relative_strength
             FROM mt_videos v
-            JOIN latest o ON o.video_id=v.video_id
+            JOIN latest o ON o.video_id=v.video_id AND o.row_number=1
+            JOIN mt_accepted_full_evidence_v1 e
+              ON e.observation_id=o.observation_id
             WHERE {' AND '.join(clauses)}
             ORDER BY o.views DESC, o.relative_strength DESC
             LIMIT ?
@@ -893,56 +901,82 @@ class TranscriptBank:
         platforms: Sequence[str] = ("youtube", "tiktok", "instagram", "facebook"),
         topic: str = "",
         trend_ids: Sequence[str] = (),
+        exclude_creator_ids: Sequence[str] = (),
     ) -> list[Candidate]:
-        """Select highest-performing untranscribed videos for a resumable bank fill."""
+        """Select high-performing untranscribed videos for a resumable bank fill.
+
+        Eligible rows retain the existing accepted-evidence, source, topic,
+        performance, artifact, failure-cooldown, and active-claim gates.  The
+        final ordering admits each creator's strongest eligible video before
+        considering a second video from any creator.  Callers may also exclude
+        creators already represented in an in-progress cohort.
+        """
 
         platform_values = tuple(dict.fromkeys(value.lower() for value in platforms))
+        if not platform_values or limit <= 0:
+            return []
         marks = ",".join("?" for _ in platform_values)
         trend_values = tuple(dict.fromkeys(str(value) for value in trend_ids if str(value)))
+        excluded_creators = tuple(dict.fromkeys(
+            str(value).strip()
+            for value in (exclude_creator_ids or ())
+            if str(value).strip()
+        ))
         filter_terms = tuple(topic_terms(topic))
         selection_time = utc_now()
         runtime_fingerprint = extractor_provenance()["fingerprint"]
         trend_clause = ""
         topic_clause = ""
+        creator_clause = ""
         topic_parameters: tuple[str, ...] = ()
+        creator_parameters: tuple[str, ...] = ()
+        if excluded_creators:
+            creator_marks = ",".join("?" for _ in excluded_creators)
+            creator_clause = f"AND v.creator_id NOT IN ({creator_marks})"
+            creator_parameters = excluded_creators
         if trend_values:
             trend_marks = ",".join("?" for _ in trend_values)
             trend_clause = f"""
                 AND EXISTS (
-                    SELECT 1 FROM mt_trend_memberships target
+                    SELECT 1 FROM mt_accepted_trend_memberships_v1 target
                     WHERE target.video_id = v.video_id
                       AND target.trend_id IN ({trend_marks})
                 )
             """
         elif filter_terms:
             topic_marks = " OR ".join(
-                "LOWER(v.title || ' ' || v.caption || ' ' || v.description) LIKE ?"
+                "LOWER(e.title || ' ' || e.caption || ' ' || e.description) LIKE ?"
                 for _ in filter_terms
             )
             topic_clause = f"AND ({topic_marks})"
             topic_parameters = tuple(f"%{term}%" for term in filter_terms)
         query = f"""
             WITH latest AS (
-                SELECT o.*
-                FROM mt_market_observations o
-                JOIN (
-                    SELECT video_id, MAX(observed_at) AS observed_at
-                    FROM mt_market_observations GROUP BY video_id
-                ) pick ON pick.video_id=o.video_id AND pick.observed_at=o.observed_at
+                SELECT o.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY o.video_id
+                           ORDER BY o.observed_at DESC, o.observation_id DESC
+                       ) AS row_number
+                FROM mt_accepted_metric_observations_v1 o
+                JOIN mt_accepted_full_evidence_v1 accepted
+                  ON accepted.observation_id = o.observation_id
             )
             SELECT v.video_id, v.platform, v.external_id, v.creator_id,
-                   v.title, v.caption, v.description, v.url, v.duration_seconds,
+                   e.title, e.caption, e.description, e.url,
+                   e.duration_seconds,
                    o.observation_key, o.observed_at, o.views, o.likes, o.comments,
                    o.shares, o.saves, o.relative_strength
             FROM mt_videos v
-            JOIN latest o ON o.video_id=v.video_id
+            JOIN latest o ON o.video_id=v.video_id AND o.row_number=1
+            JOIN mt_accepted_full_evidence_v1 e
+              ON e.observation_id=o.observation_id
             LEFT JOIN mt_transcript_artifacts artifact ON artifact.video_id=v.video_id
             WHERE v.platform IN ({marks}) AND artifact.video_id IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM mt_transcript_acquisition_attempts attempt
                   WHERE attempt.video_id=v.video_id
-                    AND attempt.source_url=v.url
+                    AND attempt.source_url=e.url
                     AND attempt.outcome='failure'
                     AND (
                         attempt.retryable=0
@@ -957,13 +991,21 @@ class TranscriptBank:
                   SELECT 1
                   FROM mt_transcript_acquisition_claims claim
                   WHERE claim.video_id=v.video_id
-                    AND claim.source_url=v.url
+                    AND claim.source_url=e.url
                     AND claim.released_at IS NULL
                     AND claim.expires_at > ?
               )
+            {creator_clause}
             {trend_clause}
             {topic_clause}
-            ORDER BY o.views DESC, o.relative_strength DESC
+            ORDER BY
+                ROW_NUMBER() OVER (
+                    PARTITION BY v.creator_id
+                    ORDER BY o.views DESC, o.relative_strength DESC,
+                             o.observed_at DESC, v.video_id
+                ),
+                o.views DESC, o.relative_strength DESC,
+                o.observed_at DESC, v.video_id
             LIMIT ?
         """
         with closing(self.connect()) as connection:
@@ -974,6 +1016,7 @@ class TranscriptBank:
                     selection_time,
                     runtime_fingerprint,
                     selection_time,
+                    *creator_parameters,
                     *trend_values,
                     *topic_parameters,
                     max(limit * 20, 500),
@@ -1032,9 +1075,17 @@ class TranscriptBank:
                 topic_terms=terms,
                 topic_matches=filter_matches or (filter_terms if trend_values else terms),
             ))
-            if len(candidates) >= limit:
-                break
-        return candidates
+
+        first_per_creator: list[Candidate] = []
+        remaining: list[Candidate] = []
+        represented_creators: set[str] = set()
+        for candidate in candidates:
+            if candidate.creator_id not in represented_creators:
+                represented_creators.add(candidate.creator_id)
+                first_per_creator.append(candidate)
+            else:
+                remaining.append(candidate)
+        return [*first_per_creator, *remaining][:limit]
 
     def claim_candidate(
         self,
@@ -1063,18 +1114,23 @@ class TranscriptBank:
             current = connection.execute(
                 """
                 WITH latest AS (
-                    SELECT o.* FROM mt_market_observations o
-                    JOIN (
-                        SELECT video_id, MAX(observed_at) AS observed_at
-                        FROM mt_market_observations GROUP BY video_id
-                    ) pick
-                      ON pick.video_id=o.video_id AND pick.observed_at=o.observed_at
+                    SELECT o.*,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY o.video_id
+                               ORDER BY o.observed_at DESC,
+                                        o.observation_id DESC
+                           ) AS row_number
+                    FROM mt_accepted_metric_observations_v1 o
+                    JOIN mt_accepted_full_evidence_v1 accepted
+                      ON accepted.observation_id = o.observation_id
                 )
-                SELECT v.platform, v.external_id, v.url, v.duration_seconds,
+                SELECT v.platform, v.external_id, e.url, e.duration_seconds,
                        o.views, o.likes, o.comments, o.shares, o.saves,
                        artifact.video_id AS artifact_video_id
                 FROM mt_videos v
-                JOIN latest o ON o.video_id=v.video_id
+                JOIN latest o ON o.video_id=v.video_id AND o.row_number=1
+                JOIN mt_accepted_full_evidence_v1 e
+                  ON e.observation_id=o.observation_id
                 LEFT JOIN mt_transcript_artifacts artifact ON artifact.video_id=v.video_id
                 WHERE v.video_id=?
                 """,
@@ -1373,12 +1429,21 @@ class TranscriptBank:
                 """
                 SELECT COUNT(DISTINCT v.video_id)
                 FROM mt_videos v
+                JOIN mt_accepted_full_evidence_v1 evidence
+                  ON evidence.observation_id = (
+                      SELECT current.observation_id
+                      FROM mt_accepted_full_evidence_v1 current
+                      WHERE current.video_id = v.video_id
+                      ORDER BY current.accepted_at DESC,
+                               current.observation_id DESC
+                      LIMIT 1
+                  )
                 LEFT JOIN mt_transcript_artifacts artifact ON artifact.video_id=v.video_id
                 WHERE artifact.video_id IS NULL
                   AND EXISTS (
                       SELECT 1 FROM mt_transcript_acquisition_attempts attempt
                       WHERE attempt.video_id=v.video_id
-                        AND attempt.source_url=v.url
+                        AND attempt.source_url=evidence.url
                         AND attempt.outcome='failure'
                         AND attempt.retryable=0
                   )
@@ -1388,12 +1453,21 @@ class TranscriptBank:
                 """
                 SELECT COUNT(DISTINCT v.video_id)
                 FROM mt_videos v
+                JOIN mt_accepted_full_evidence_v1 evidence
+                  ON evidence.observation_id = (
+                      SELECT current.observation_id
+                      FROM mt_accepted_full_evidence_v1 current
+                      WHERE current.video_id = v.video_id
+                      ORDER BY current.accepted_at DESC,
+                               current.observation_id DESC
+                      LIMIT 1
+                  )
                 LEFT JOIN mt_transcript_artifacts artifact ON artifact.video_id=v.video_id
                 WHERE artifact.video_id IS NULL
                   AND EXISTS (
                       SELECT 1 FROM mt_transcript_acquisition_attempts attempt
                       WHERE attempt.video_id=v.video_id
-                        AND attempt.source_url=v.url
+                        AND attempt.source_url=evidence.url
                         AND attempt.outcome='failure'
                         AND attempt.retryable=1
                         AND attempt.retry_after > ?
@@ -1424,6 +1498,7 @@ class TranscriptBank:
         model_name: str,
         topic: str = "",
         trend_ids: Sequence[str] = (),
+        exclude_creator_ids: Sequence[str] = (),
         cookies_from_browser: str | None = None,
     ) -> dict[str, Any]:
         started_at = utc_now()
@@ -1433,6 +1508,7 @@ class TranscriptBank:
             platforms=platforms,
             topic=topic,
             trend_ids=trend_ids,
+            exclude_creator_ids=exclude_creator_ids,
         )
         model: Any = None
         runtime_failure: dict[str, str] | None = None
@@ -1594,6 +1670,11 @@ class TranscriptBank:
                 "model": model_name,
                 "topic": topic,
                 "trend_ids": list(trend_ids),
+                "exclude_creator_ids": sorted({
+                    str(value).strip()
+                    for value in exclude_creator_ids
+                    if str(value).strip()
+                }),
                 "platform_policies": {
                     platform: asdict(DEFAULT_POLICIES[platform])
                     for platform in platforms if platform in DEFAULT_POLICIES
@@ -1897,7 +1978,7 @@ class TranscriptBank:
             "timestamped_segments_present": bool(segments),
         }
         return {
-            "contract": "performance_bound_whisper_transcript_v4",
+            "contract": CURRENT_TRANSCRIPT_AUDIT_CONTRACT,
             "decision": "PASS" if all(checks.values()) else "REJECTED",
             "checks": checks,
             "policy": asdict(policy),
@@ -2047,9 +2128,19 @@ class TranscriptBank:
         minimum_creators: int = 3,
         minimum_total_views: int = 100_000,
     ) -> dict[str, Any]:
+        unique_artifacts: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in artifacts:
+            transcript_id = str(item.get("transcript_id") or "").strip()
+            observation_key = str(item.get("observation_key") or "").strip()
+            if not transcript_id or not observation_key:
+                continue
+            unique_artifacts.setdefault((transcript_id, observation_key), item)
         performance_passing = [
-            item for item in artifacts
+            item for item in unique_artifacts.values()
             if item.get("audit", {}).get("decision") == "PASS"
+            and is_supported_transcript_audit_contract(
+                item.get("audit", {}).get("contract")
+            )
         ]
         passing = [
             item for item in performance_passing
@@ -2067,6 +2158,8 @@ class TranscriptBank:
             ).fetchall() if passing else []
         aggregate = {
             "source_artifact_count": len(artifacts),
+            "unique_source_artifact_count": len(unique_artifacts),
+            "duplicate_source_artifact_count": len(artifacts) - len(unique_artifacts),
             "member_count": len(passing),
             "excluded_language_count": len(performance_passing) - len(passing),
             "creator_count": len(creator_rows),
@@ -2133,14 +2226,18 @@ class TranscriptBank:
         manifest_root = self.storage_root / "cohorts"
         manifest_root.mkdir(parents=True, exist_ok=True)
         manifest_path = manifest_root / f"{cohort_id}.json"
+        if manifest_path.is_file():
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return {**existing, "manifest_path": str(manifest_path)}
         atomic_write_json(manifest_path, manifest)
         with closing(self.connect()) as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO mt_transcript_cohorts(
+                INSERT INTO mt_transcript_cohorts(
                     cohort_id, topic, decision, member_ids_json, policy_json,
                     aggregate_metrics_json, audit_json, manifest_path, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cohort_id) DO NOTHING
                 """,
                 (
                     cohort_id, topic, decision, json.dumps(member_ids),
@@ -2359,10 +2456,11 @@ class TranscriptBank:
         with closing(self.connect()) as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO mt_script_relatability_audits(
+                INSERT INTO mt_script_relatability_audits(
                     audit_id, script_id, cohort_id, decision, score, script_sha256,
                     cohort_manifest_sha256, findings_json, receipt_path, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO NOTHING
                 """,
                 (
                     audit_id, script_id, str(manifest.get("cohort_id") or ""), decision,

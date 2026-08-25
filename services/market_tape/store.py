@@ -19,6 +19,7 @@ from .math import age_bucket, concentration, counter_motion, log_velocity, poll_
 from .models import MarketContent, QueryAttempt, SourceReceipt, isoformat, stable_hash, utc_now
 from .predictor import (
     ENTRY_HORIZON,
+    OBSERVATION_QUALITY_CONTRACT,
     PROGRESSION_HORIZON,
     eligible_for_early_entry,
     load_active_model,
@@ -29,7 +30,11 @@ from .predictor import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
+COUNTER_REGRESSION_FLAG_PREFIX = "counter-regression:"
+ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT = (
+    "market_tape_accepted_observation_evidence_v1"
+)
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9'+-]*", re.IGNORECASE)
 STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how",
@@ -40,6 +45,24 @@ OPPORTUNITY_CONTRACT = "market_tape_actionable_opportunities_v1"
 OPPORTUNITY_RANKER_VERSION = "actionable-opportunity-v6"
 TREND_MODEL_ADMISSION_CONTRACT = "market_tape_trend_model_admission_v1"
 TREND_INDEX_VERSION = "trend-strength-v2"
+SCRIPT_LANGUAGE_DEMAND_CONTRACT = "market_tape_script_language_demand_v1"
+SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT = (
+    "market_tape_script_language_demand_event_v1"
+)
+SCRIPT_LANGUAGE_DEMAND_EVENT_TYPES = {
+    "requested",
+    "claimed",
+    "completed",
+    "partial",
+    "blocked",
+    "failed",
+}
+SCRIPT_LANGUAGE_DEMAND_TERMINAL_EVENTS = {
+    "completed",
+    "partial",
+    "blocked",
+    "failed",
+}
 TREND_OUTCOME_COVERAGE_TOLERANCE = timedelta(minutes=30)
 TREND_OUTCOME_COVERAGE_GRACE = timedelta(hours=2)
 ACTIONABLE_TREND_STATES = {"discovering", "emerging", "breakout", "recurring"}
@@ -93,6 +116,55 @@ class ClosingSQLiteConnection(sqlite3.Connection):
             self.close()
 
 
+class CounterRegressionError(ValueError):
+    """A cumulative provider counter moved backwards.
+
+    The raw observation is still committed with an immutable quality flag so
+    the provider response remains auditable, but callers must not count it as
+    an accepted measurement.
+    """
+
+    def __init__(
+        self,
+        *,
+        video_id: str,
+        observation_id: int,
+        views: int,
+        prior_observation_id: int,
+        prior_views: int,
+    ) -> None:
+        self.video_id = video_id
+        self.observation_id = observation_id
+        self.views = views
+        self.prior_observation_id = prior_observation_id
+        self.prior_views = prior_views
+        super().__init__(
+            "cumulative views regressed for "
+            f"{video_id}: {views} < {prior_views}"
+        )
+
+
+def _counter_regression_flag_id(observation_key: Any) -> str:
+    """Return the globally stable identity for one quarantined observation."""
+
+    canonical_observation_key = str(observation_key or "").strip()
+    if not canonical_observation_key:
+        raise ValueError("observation_key is required for a counter-regression flag")
+    return f"{COUNTER_REGRESSION_FLAG_PREFIX}{canonical_observation_key}"
+
+
+def _canonical_observation_quality_sync_payload(
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Remap database-local legacy flag ids at the remote-sync boundary."""
+
+    canonical = dict(payload)
+    canonical["flag_id"] = _counter_regression_flag_id(
+        canonical.get("observation_key")
+    )
+    return canonical
+
+
 class MarketTapeStore:
     def __init__(self, config: MarketTapeConfig):
         self.config = config
@@ -113,6 +185,11 @@ class MarketTapeStore:
 
     def initialize(self) -> None:
         with self.connect() as connection:
+            quality_table_preexisting = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type = 'table'
+                     AND name = 'mt_observation_quality_flags'"""
+            ).fetchone() is not None
             connection.executescript(
                 """
                 PRAGMA journal_mode = WAL;
@@ -311,6 +388,93 @@ class MarketTapeStore:
                     SELECT RAISE(ABORT, 'market observations are append-only');
                 END;
 
+                CREATE TABLE IF NOT EXISTS mt_observation_quality_flags (
+                    flag_id TEXT PRIMARY KEY,
+                    observation_id INTEGER NOT NULL UNIQUE,
+                    run_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    views INTEGER NOT NULL,
+                    prior_observation_id INTEGER NOT NULL,
+                    prior_observed_at TEXT NOT NULL,
+                    prior_views INTEGER NOT NULL,
+                    error_code TEXT NOT NULL,
+                    raw_sha256 TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(observation_id)
+                        REFERENCES mt_market_observations(observation_id),
+                    FOREIGN KEY(prior_observation_id)
+                        REFERENCES mt_market_observations(observation_id),
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id),
+                    FOREIGN KEY(raw_sha256) REFERENCES mt_raw_objects(raw_sha256)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_observation_quality_video_time_idx
+                    ON mt_observation_quality_flags(video_id, observed_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_observation_quality_error_time_idx
+                    ON mt_observation_quality_flags(error_code, detected_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_observation_quality_flags_no_update
+                BEFORE UPDATE ON mt_observation_quality_flags
+                BEGIN
+                    SELECT RAISE(ABORT, 'observation quality flags are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_observation_quality_flags_no_delete
+                BEFORE DELETE ON mt_observation_quality_flags
+                BEGIN
+                    SELECT RAISE(ABORT, 'observation quality flags are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_accepted_observation_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    observation_id INTEGER NOT NULL,
+                    observation_key TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    creator_id TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    contract TEXT NOT NULL,
+                    evidence_scope TEXT NOT NULL CHECK(
+                        evidence_scope IN ('metric_only', 'full')
+                    ),
+                    published_at TEXT,
+                    title TEXT NOT NULL DEFAULT '',
+                    caption TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL DEFAULT '',
+                    thumbnail_url TEXT NOT NULL DEFAULT '',
+                    media_type TEXT NOT NULL DEFAULT 'video',
+                    duration_seconds REAL,
+                    hashtags_json TEXT NOT NULL DEFAULT '[]',
+                    discovery_queries_json TEXT NOT NULL DEFAULT '[]',
+                    discovery_context_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(observation_id, evidence_scope),
+                    FOREIGN KEY(observation_id)
+                        REFERENCES mt_market_observations(observation_id),
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id),
+                    FOREIGN KEY(creator_id) REFERENCES mt_creators(creator_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_accepted_evidence_video_time_idx
+                    ON mt_accepted_observation_evidence(video_id, accepted_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_accepted_evidence_observation_idx
+                    ON mt_accepted_observation_evidence(observation_id, evidence_scope);
+
+                CREATE TRIGGER IF NOT EXISTS mt_accepted_observation_evidence_no_update
+                BEFORE UPDATE ON mt_accepted_observation_evidence
+                BEGIN
+                    SELECT RAISE(ABORT, 'accepted observation evidence is append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_accepted_observation_evidence_no_delete
+                BEFORE DELETE ON mt_accepted_observation_evidence
+                BEGIN
+                    SELECT RAISE(ABORT, 'accepted observation evidence is append-only');
+                END;
+
                 CREATE TABLE IF NOT EXISTS mt_content_genomes (
                     video_id TEXT PRIMARY KEY,
                     schema_version INTEGER NOT NULL DEFAULT 1,
@@ -497,6 +661,34 @@ class MarketTapeStore:
                     FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS mt_trend_membership_lineage (
+                    trend_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    observation_id INTEGER NOT NULL,
+                    linked_at TEXT NOT NULL,
+                    contract TEXT NOT NULL,
+                    PRIMARY KEY(trend_id, video_id, observation_id),
+                    FOREIGN KEY(trend_id, video_id)
+                        REFERENCES mt_trend_memberships(trend_id, video_id),
+                    FOREIGN KEY(observation_id)
+                        REFERENCES mt_market_observations(observation_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_trend_membership_lineage_observation_idx
+                    ON mt_trend_membership_lineage(observation_id);
+
+                CREATE TRIGGER IF NOT EXISTS mt_trend_membership_lineage_no_update
+                BEFORE UPDATE ON mt_trend_membership_lineage
+                BEGIN
+                    SELECT RAISE(ABORT, 'trend membership lineage is append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_trend_membership_lineage_no_delete
+                BEFORE DELETE ON mt_trend_membership_lineage
+                BEGIN
+                    SELECT RAISE(ABORT, 'trend membership lineage is append-only');
+                END;
+
                 CREATE TABLE IF NOT EXISTS mt_trend_observations (
                     trend_observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     trend_id TEXT NOT NULL,
@@ -528,6 +720,8 @@ class MarketTapeStore:
                     saturation REAL NOT NULL,
                     trend_strength REAL NOT NULL,
                     index_version TEXT NOT NULL,
+                    observation_quality_contract TEXT NOT NULL DEFAULT
+                        'legacy_unverified',
                     state TEXT NOT NULL,
                     FOREIGN KEY(trend_id) REFERENCES mt_trends(trend_id)
                 );
@@ -651,6 +845,77 @@ class MarketTapeStore:
                         predicted_at DESC
                     );
 
+                CREATE TABLE IF NOT EXISTS mt_forecast_measurement_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    cohort_key TEXT NOT NULL,
+                    created_run_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    horizon TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    window_open_at TEXT NOT NULL,
+                    deadline_at TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    reserved_request_units INTEGER NOT NULL
+                        CHECK(reserved_request_units > 0),
+                    refresh_batch_size INTEGER NOT NULL
+                        CHECK(refresh_batch_size > 0),
+                    credential_fingerprint TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL CHECK(state IN (
+                        'reserved', 'claimed', 'fulfilled', 'partial',
+                        'failed', 'released', 'expired'
+                    )),
+                    claim_run_id TEXT,
+                    claimed_at TEXT,
+                    claim_expires_at TEXT,
+                    completed_at TEXT,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    selection_sha256 TEXT NOT NULL,
+                    capability_json TEXT NOT NULL DEFAULT '{}',
+                    completion_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(cohort_key, source_id),
+                    FOREIGN KEY(created_run_id) REFERENCES mt_collection_runs(run_id),
+                    FOREIGN KEY(claim_run_id) REFERENCES mt_collection_runs(run_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_forecast_measurement_due_idx
+                    ON mt_forecast_measurement_reservations(
+                        state, window_open_at, deadline_at, source_id
+                    );
+                CREATE INDEX IF NOT EXISTS mt_forecast_measurement_usage_idx
+                    ON mt_forecast_measurement_reservations(
+                        source_id, usage_date, state
+                    );
+                CREATE INDEX IF NOT EXISTS mt_forecast_measurement_cohort_idx
+                    ON mt_forecast_measurement_reservations(
+                        model_version, horizon, created_at DESC
+                    );
+
+                CREATE TABLE IF NOT EXISTS mt_forecast_measurement_assignments (
+                    reservation_id TEXT NOT NULL,
+                    prediction_id INTEGER NOT NULL UNIQUE,
+                    trend_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'reserved', 'claimed', 'fulfilled', 'failed',
+                        'released', 'expired'
+                    )),
+                    completed_at TEXT,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(reservation_id, prediction_id),
+                    FOREIGN KEY(reservation_id)
+                        REFERENCES mt_forecast_measurement_reservations(reservation_id),
+                    FOREIGN KEY(prediction_id) REFERENCES mt_predictions(prediction_id),
+                    FOREIGN KEY(trend_id) REFERENCES mt_trends(trend_id),
+                    FOREIGN KEY(video_id) REFERENCES mt_videos(video_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_forecast_measurement_assignment_video_idx
+                    ON mt_forecast_measurement_assignments(video_id, state);
+                CREATE INDEX IF NOT EXISTS mt_forecast_measurement_assignment_trend_idx
+                    ON mt_forecast_measurement_assignments(trend_id, state);
+
                 -- MT-009: calibration metrics are RECORDED after horizons
                 -- close, not only computed on demand. Append-only snapshots.
                 CREATE TABLE IF NOT EXISTS mt_prediction_calibration (
@@ -659,6 +924,8 @@ class MarketTapeStore:
                     subject_type TEXT NOT NULL,
                     model_version TEXT NOT NULL,
                     horizon TEXT NOT NULL,
+                    observation_quality_contract TEXT NOT NULL
+                        DEFAULT 'legacy_unverified',
                     state TEXT NOT NULL,
                     labels INTEGER NOT NULL,
                     positives INTEGER NOT NULL,
@@ -671,6 +938,66 @@ class MarketTapeStore:
                 );
                 CREATE INDEX IF NOT EXISTS mt_prediction_calibration_model_idx
                     ON mt_prediction_calibration(model_version, horizon, computed_at DESC);
+
+                CREATE TABLE IF NOT EXISTS mt_script_language_demand_events (
+                    event_id TEXT PRIMARY KEY,
+                    demand_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN (
+                        'requested', 'claimed', 'completed', 'partial',
+                        'blocked', 'failed'
+                    )),
+                    attempt_no INTEGER NOT NULL CHECK(attempt_no >= 0),
+                    request_sha256 TEXT NOT NULL,
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    audience TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    evidence_trend_id TEXT NOT NULL DEFAULT '',
+                    snapshot_id TEXT NOT NULL,
+                    lease_until TEXT,
+                    collection_run_id TEXT NOT NULL DEFAULT '',
+                    transcript_run_id TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(demand_id, event_type, attempt_no)
+                );
+
+                CREATE INDEX IF NOT EXISTS
+                    mt_script_language_demand_events_demand_time_idx
+                    ON mt_script_language_demand_events(
+                        demand_id, created_at, event_id
+                    );
+                CREATE INDEX IF NOT EXISTS
+                    mt_script_language_demand_events_type_time_idx
+                    ON mt_script_language_demand_events(
+                        event_type, created_at, demand_id
+                    );
+                CREATE INDEX IF NOT EXISTS
+                    mt_script_language_demand_events_snapshot_time_idx
+                    ON mt_script_language_demand_events(
+                        snapshot_id, created_at, demand_id
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_script_language_demand_events_no_update
+                BEFORE UPDATE ON mt_script_language_demand_events
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'script language demand events are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_script_language_demand_events_no_delete
+                BEFORE DELETE ON mt_script_language_demand_events
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'script language demand events are append-only'
+                    );
+                END;
 
                 CREATE TABLE IF NOT EXISTS mt_sync_outbox (
                     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -762,6 +1089,261 @@ class MarketTapeStore:
                     connection.execute(
                         f"ALTER TABLE mt_trend_observations ADD COLUMN {column} {definition}"
                     )
+            if "observation_quality_contract" not in trend_observation_columns:
+                connection.execute(
+                    """ALTER TABLE mt_trend_observations
+                       ADD COLUMN observation_quality_contract TEXT NOT NULL
+                       DEFAULT 'legacy_unverified'"""
+                )
+            calibration_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(mt_prediction_calibration)"
+                ).fetchall()
+            }
+            if "observation_quality_contract" not in calibration_columns:
+                connection.execute(
+                    """ALTER TABLE mt_prediction_calibration
+                       ADD COLUMN observation_quality_contract TEXT NOT NULL
+                       DEFAULT 'legacy_unverified'"""
+                )
+            quality_backfill = connection.execute(
+                """SELECT value FROM mt_meta
+                   WHERE key = 'counter_regression_backfill_v1'"""
+            ).fetchone()
+            if not quality_table_preexisting or quality_backfill is None:
+                self._flag_counter_regressions(
+                    connection,
+                    detected_at=isoformat(utc_now()),
+                    migration_backfill=True,
+                )
+                connection.execute(
+                    """INSERT INTO mt_meta(key, value)
+                       VALUES('counter_regression_backfill_v1', ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    (isoformat(utc_now()),),
+                )
+            evidence_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(mt_accepted_observation_evidence)"
+                ).fetchall()
+            }
+            if "evidence_id" not in evidence_columns:
+                scope_expression = (
+                    "evidence_scope"
+                    if "evidence_scope" in evidence_columns
+                    else "'metric_only'"
+                )
+                legacy_count = int(connection.execute(
+                    "SELECT COUNT(*) FROM mt_accepted_observation_evidence"
+                ).fetchone()[0])
+                connection.execute(
+                    """ALTER TABLE mt_accepted_observation_evidence
+                       RENAME TO mt_accepted_observation_evidence_v10_archive"""
+                )
+                connection.executescript(
+                    """CREATE TABLE mt_accepted_observation_evidence (
+                           evidence_id TEXT PRIMARY KEY,
+                           observation_id INTEGER NOT NULL,
+                           observation_key TEXT NOT NULL,
+                           video_id TEXT NOT NULL,
+                           creator_id TEXT NOT NULL,
+                           accepted_at TEXT NOT NULL,
+                           contract TEXT NOT NULL,
+                           evidence_scope TEXT NOT NULL CHECK(
+                               evidence_scope IN ('metric_only', 'full')
+                           ),
+                           published_at TEXT,
+                           title TEXT NOT NULL DEFAULT '',
+                           caption TEXT NOT NULL DEFAULT '',
+                           description TEXT NOT NULL DEFAULT '',
+                           language TEXT NOT NULL DEFAULT '',
+                           url TEXT NOT NULL DEFAULT '',
+                           thumbnail_url TEXT NOT NULL DEFAULT '',
+                           media_type TEXT NOT NULL DEFAULT 'video',
+                           duration_seconds REAL,
+                           hashtags_json TEXT NOT NULL DEFAULT '[]',
+                           discovery_queries_json TEXT NOT NULL DEFAULT '[]',
+                           discovery_context_json TEXT NOT NULL DEFAULT '{}',
+                           UNIQUE(observation_id, evidence_scope),
+                           FOREIGN KEY(observation_id)
+                               REFERENCES mt_market_observations(observation_id),
+                           FOREIGN KEY(video_id) REFERENCES mt_videos(video_id),
+                           FOREIGN KEY(creator_id) REFERENCES mt_creators(creator_id)
+                       );
+                       CREATE INDEX mt_accepted_evidence_v11_video_time_idx
+                           ON mt_accepted_observation_evidence(
+                               video_id, accepted_at DESC
+                           );
+                       CREATE INDEX mt_accepted_evidence_v11_observation_idx
+                           ON mt_accepted_observation_evidence(
+                               observation_id, evidence_scope
+                           );"""
+                )
+                connection.execute(
+                    f"""INSERT INTO mt_accepted_observation_evidence(
+                            evidence_id, observation_id, observation_key,
+                            video_id, creator_id, accepted_at, contract,
+                            evidence_scope, published_at, title, caption,
+                            description, language, url, thumbnail_url,
+                            media_type, duration_seconds, hashtags_json,
+                            discovery_queries_json, discovery_context_json
+                        )
+                        SELECT 'accepted:' || observation_key || ':' ||
+                                   {scope_expression},
+                               observation_id, observation_key, video_id,
+                               creator_id, accepted_at, contract,
+                               {scope_expression}, published_at, title, caption,
+                               description, language, url, thumbnail_url,
+                               media_type, duration_seconds, hashtags_json,
+                               discovery_queries_json, discovery_context_json
+                        FROM mt_accepted_observation_evidence_v10_archive"""
+                )
+                connection.executescript(
+                    """CREATE TRIGGER
+                           mt_accepted_observation_evidence_v11_no_update
+                       BEFORE UPDATE ON mt_accepted_observation_evidence
+                       BEGIN
+                           SELECT RAISE(
+                               ABORT,
+                               'accepted observation evidence is append-only'
+                           );
+                       END;
+                       CREATE TRIGGER
+                           mt_accepted_observation_evidence_v11_no_delete
+                       BEFORE DELETE ON mt_accepted_observation_evidence
+                       BEGIN
+                           SELECT RAISE(
+                               ABORT,
+                               'accepted observation evidence is append-only'
+                           );
+                       END;"""
+                )
+                connection.execute(
+                    """INSERT INTO mt_meta(key, value)
+                       VALUES('accepted_observation_scope_identity_migration_v1', ?)
+                       ON CONFLICT(key) DO NOTHING""",
+                    (json.dumps({
+                        "contract": (
+                            "market_tape_accepted_evidence_scope_migration_v1"
+                        ),
+                        "recorded_at": isoformat(utc_now()),
+                        "rows_preserved": legacy_count,
+                        "archived_table": (
+                            "mt_accepted_observation_evidence_v10_archive"
+                        ),
+                        "append_only_per_scope": True,
+                    }, sort_keys=True),),
+                )
+            metric_backfill = connection.execute(
+                """SELECT value FROM mt_meta
+                   WHERE key = 'accepted_observation_metric_backfill_v1'"""
+            ).fetchone()
+            if metric_backfill is None:
+                before = int(connection.execute(
+                    "SELECT COUNT(*) FROM mt_accepted_observation_evidence"
+                ).fetchone()[0])
+                connection.execute(
+                    """INSERT INTO mt_accepted_observation_evidence(
+                           evidence_id, observation_id, observation_key,
+                           video_id, creator_id, accepted_at, contract,
+                           evidence_scope, published_at, title, caption,
+                           description, language, url, thumbnail_url,
+                           media_type, duration_seconds, hashtags_json,
+                           discovery_queries_json, discovery_context_json
+                       )
+                       SELECT 'accepted:' || observation.observation_key ||
+                                  ':metric_only',
+                              observation.observation_id,
+                              observation.observation_key,
+                              observation.video_id,
+                              observation.creator_id,
+                              observation.observed_at,
+                              ?, 'metric_only', NULL, '', '', '', '', '', '',
+                              'video', NULL, '[]', '[]', '{}'
+                       FROM mt_market_observations observation
+                       WHERE observation.source_confidence > 0
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id =
+                                   observation.observation_id
+                         )
+                       ON CONFLICT(observation_id, evidence_scope)
+                       DO NOTHING""",
+                    (ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,),
+                )
+                after = int(connection.execute(
+                    "SELECT COUNT(*) FROM mt_accepted_observation_evidence"
+                ).fetchone()[0])
+                connection.execute(
+                    """INSERT INTO mt_meta(key, value)
+                       VALUES('accepted_observation_metric_backfill_v1', ?)""",
+                    (json.dumps({
+                        "contract": (
+                            "market_tape_accepted_metric_backfill_receipt_v1"
+                        ),
+                        "recorded_at": isoformat(utc_now()),
+                        "rows_added": max(0, after - before),
+                        "descriptive_state_backfilled": False,
+                        "trend_membership_lineage_backfilled": False,
+                        "reason": (
+                            "legacy mutable derived state has no exact raw "
+                            "observation lineage"
+                        ),
+                    }, sort_keys=True),),
+                )
+            connection.executescript(
+                """CREATE VIEW IF NOT EXISTS
+                           mt_accepted_metric_observations_v1 AS
+                       SELECT observation.*
+                       FROM mt_market_observations observation
+                       WHERE observation.source_confidence > 0
+                         AND EXISTS (
+                             SELECT 1
+                             FROM mt_accepted_observation_evidence evidence
+                             WHERE evidence.observation_id =
+                                   observation.observation_id
+                               AND evidence.contract =
+                                   'market_tape_accepted_observation_evidence_v1'
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id =
+                                   observation.observation_id
+                         );
+
+                   CREATE VIEW IF NOT EXISTS mt_accepted_full_evidence_v1 AS
+                       SELECT evidence.*
+                       FROM mt_accepted_observation_evidence evidence
+                       WHERE evidence.contract =
+                                 'market_tape_accepted_observation_evidence_v1'
+                         AND evidence.evidence_scope = 'full'
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id =
+                                   evidence.observation_id
+                         );
+
+                   CREATE VIEW IF NOT EXISTS
+                           mt_accepted_trend_memberships_v1 AS
+                       SELECT membership.*
+                       FROM mt_trend_memberships membership
+                       WHERE EXISTS (
+                           SELECT 1
+                           FROM mt_trend_membership_lineage lineage
+                           JOIN mt_accepted_full_evidence_v1 evidence
+                             ON evidence.observation_id =
+                                lineage.observation_id
+                           WHERE lineage.trend_id = membership.trend_id
+                             AND lineage.video_id = membership.video_id
+                             AND lineage.contract =
+                                 'market_tape_accepted_observation_evidence_v1'
+                       );"""
+            )
             connection.execute(
                 "INSERT INTO mt_meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -833,6 +1415,26 @@ class MarketTapeStore:
             for row in observations:
                 row.pop("observation_id", None)
                 records.append(("observation", row["observation_key"], row))
+            for row in connection.execute(
+                """SELECT quality.*, observation.observation_key,
+                          prior.observation_key AS prior_observation_key
+                   FROM mt_observation_quality_flags quality
+                   JOIN mt_market_observations observation
+                     ON observation.observation_id = quality.observation_id
+                   JOIN mt_market_observations prior
+                     ON prior.observation_id = quality.prior_observation_id
+                   WHERE quality.run_id = ?""",
+                (run_id,),
+            ).fetchall():
+                payload = dict(row)
+                payload.pop("observation_id", None)
+                payload.pop("prior_observation_id", None)
+                payload = _canonical_observation_quality_sync_payload(payload)
+                records.append((
+                    "observation_quality_flag",
+                    payload["flag_id"],
+                    payload,
+                ))
             for row in _select_in(connection, "mt_content_genomes", "video_id", video_ids):
                 records.append(("genome", row["video_id"], row))
             if video_ids:
@@ -888,6 +1490,110 @@ class MarketTapeStore:
             for row in _select_in(connection, "mt_source_health", "source_id", sorted(set(source_ids))):
                 records.append(("source_health", row["source_id"], row))
 
+            # A live insertion can deterministically flag an older same-time
+            # observation, and schema initialization can backfill flags for
+            # completed runs. Carry any such evidence into the next ordinary
+            # run's outbox instead of requiring a manual global reconcile.
+            queued_quality_keys = {
+                _canonical_observation_quality_sync_payload(
+                    json.loads(row["payload_json"])
+                )["flag_id"]
+                for row in connection.execute(
+                    """SELECT payload_json FROM mt_sync_outbox
+                       WHERE entity_type = 'observation_quality_flag'"""
+                ).fetchall()
+            }
+            records = [
+                record
+                for record in records
+                if not (
+                    record[0] == "observation_quality_flag"
+                    and record[1] in queued_quality_keys
+                )
+            ]
+            record_keys = {
+                (entity_type, entity_key)
+                for entity_type, entity_key, _payload in records
+            }
+
+            def add_record_if_absent(
+                entity_type: str,
+                entity_key: str,
+                payload: Dict[str, Any],
+            ) -> None:
+                key = (entity_type, entity_key)
+                if key in record_keys:
+                    return
+                record_keys.add(key)
+                records.append((entity_type, entity_key, payload))
+
+            missing_quality: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+            for row in connection.execute(
+                """SELECT quality.*, observation.observation_key,
+                          prior.observation_key AS prior_observation_key
+                   FROM mt_observation_quality_flags quality
+                   JOIN mt_market_observations observation
+                     ON observation.observation_id = quality.observation_id
+                   JOIN mt_market_observations prior
+                     ON prior.observation_id = quality.prior_observation_id"""
+            ).fetchall():
+                local = dict(row)
+                payload = dict(local)
+                payload.pop("observation_id", None)
+                payload.pop("prior_observation_id", None)
+                payload = _canonical_observation_quality_sync_payload(payload)
+                key = str(payload["flag_id"])
+                if (
+                    key in queued_quality_keys
+                    or ("observation_quality_flag", key) in record_keys
+                ):
+                    continue
+                missing_quality.append((local, payload))
+
+            if missing_quality:
+                observation_ids = sorted({
+                    int(local[column])
+                    for local, _payload in missing_quality
+                    for column in ("observation_id", "prior_observation_id")
+                })
+                parent_observations = _select_in(
+                    connection,
+                    "mt_market_observations",
+                    "observation_id",
+                    observation_ids,
+                )
+                parent_video_ids = sorted({
+                    str(row["video_id"]) for row in parent_observations
+                })
+                parent_creator_ids = sorted({
+                    str(row["creator_id"]) for row in parent_observations
+                })
+                parent_run_ids = sorted({
+                    str(local["run_id"]) for local, _payload in missing_quality
+                })
+                for row in _select_in(
+                    connection, "mt_creators", "creator_id", parent_creator_ids
+                ):
+                    add_record_if_absent("creator", row["creator_id"], row)
+                for row in _select_in(
+                    connection, "mt_collection_runs", "run_id", parent_run_ids
+                ):
+                    add_record_if_absent("run", row["run_id"], row)
+                for row in _select_in(
+                    connection, "mt_videos", "video_id", parent_video_ids
+                ):
+                    add_record_if_absent("video", row["video_id"], row)
+                for row in parent_observations:
+                    payload = dict(row)
+                    payload.pop("observation_id", None)
+                    add_record_if_absent(
+                        "observation", payload["observation_key"], payload
+                    )
+                for _local, payload in missing_quality:
+                    add_record_if_absent(
+                        "observation_quality_flag", payload["flag_id"], payload
+                    )
+
             for entity_type, entity_key, payload in records:
                 connection.execute(
                     """INSERT INTO mt_sync_outbox(
@@ -907,9 +1613,22 @@ class MarketTapeStore:
         with self.connect() as connection:
             existing: Dict[str, set[str]] = {}
             for row in connection.execute(
-                "SELECT entity_type, entity_key FROM mt_sync_outbox"
+                """SELECT entity_type, entity_key FROM mt_sync_outbox
+                   WHERE entity_type != 'observation_quality_flag'"""
             ).fetchall():
-                existing.setdefault(str(row["entity_type"]), set()).add(str(row["entity_key"]))
+                entity_type = str(row["entity_type"])
+                entity_key = str(row["entity_key"])
+                existing.setdefault(entity_type, set()).add(entity_key)
+            for row in connection.execute(
+                """SELECT payload_json FROM mt_sync_outbox
+                   WHERE entity_type = 'observation_quality_flag'"""
+            ).fetchall():
+                payload = _canonical_observation_quality_sync_payload(
+                    json.loads(row["payload_json"])
+                )
+                existing.setdefault("observation_quality_flag", set()).add(
+                    str(payload["flag_id"])
+                )
 
             def add(entity_type: str, entity_key: str, payload: Dict[str, Any]) -> None:
                 keys = existing.setdefault(entity_type, set())
@@ -940,6 +1659,24 @@ class MarketTapeStore:
                 payload = dict(row)
                 payload.pop("observation_id", None)
                 add("observation", payload["observation_key"], payload)
+            for row in connection.execute(
+                """SELECT quality.*, observation.observation_key,
+                          prior.observation_key AS prior_observation_key
+                   FROM mt_observation_quality_flags quality
+                   JOIN mt_market_observations observation
+                     ON observation.observation_id = quality.observation_id
+                   JOIN mt_market_observations prior
+                     ON prior.observation_id = quality.prior_observation_id"""
+            ).fetchall():
+                payload = dict(row)
+                payload.pop("observation_id", None)
+                payload.pop("prior_observation_id", None)
+                payload = _canonical_observation_quality_sync_payload(payload)
+                add(
+                    "observation_quality_flag",
+                    payload["flag_id"],
+                    payload,
+                )
             for row in connection.execute("SELECT * FROM mt_content_genomes").fetchall():
                 payload = dict(row)
                 add("genome", payload["video_id"], payload)
@@ -1022,7 +1759,11 @@ class MarketTapeStore:
         output = []
         for row in rows:
             value = dict(row)
-            value["payload"] = json.loads(value.pop("payload_json"))
+            payload = json.loads(value.pop("payload_json"))
+            if value["entity_type"] == "observation_quality_flag":
+                payload = _canonical_observation_quality_sync_payload(payload)
+                value["entity_key"] = payload["flag_id"]
+            value["payload"] = payload
             output.append(value)
         return output
 
@@ -1179,6 +1920,90 @@ class MarketTapeStore:
                 inserted += int(cursor.rowcount == 1)
         return inserted
 
+    @staticmethod
+    def _flag_counter_regressions(
+        connection: sqlite3.Connection,
+        *,
+        detected_at: str,
+        migration_backfill: bool,
+        video_id: Optional[str] = None,
+    ) -> int:
+        """Append flags for rows below the preceding cumulative maximum.
+
+        Comparing with the preceding maximum, rather than only the immediately
+        previous raw row, keeps a bad zero from making the next still-regressed
+        value look healthy. Observation keys break equal-time ties identically
+        across independent SQLite spools; row ids remain local foreign keys.
+        """
+
+        video_filter = "WHERE observation.video_id = ?" if video_id else ""
+        filter_parameters: Tuple[Any, ...] = (video_id,) if video_id else ()
+        cursor = connection.execute(
+            f"""WITH ordered AS (
+                     SELECT observation.*,
+                            MAX(observation.views) OVER (
+                                PARTITION BY observation.video_id
+                                ORDER BY observation.observed_at,
+                                         observation.observation_key
+                                ROWS BETWEEN UNBOUNDED PRECEDING
+                                         AND 1 PRECEDING
+                            ) AS prior_max_views
+                     FROM mt_market_observations observation
+                     {video_filter}
+                 ), regressions AS (
+                     SELECT ordered.*,
+                            (
+                                SELECT prior.observation_id
+                                FROM mt_market_observations prior
+                                WHERE prior.video_id = ordered.video_id
+                                  AND prior.views = ordered.prior_max_views
+                                  AND (
+                                      prior.observed_at < ordered.observed_at
+                                      OR (
+                                          prior.observed_at = ordered.observed_at
+                                          AND prior.observation_key
+                                              < ordered.observation_key
+                                      )
+                                  )
+                                ORDER BY prior.observed_at DESC,
+                                         prior.observation_key DESC
+                                LIMIT 1
+                            ) AS prior_anchor_id
+                     FROM ordered
+                     WHERE prior_max_views IS NOT NULL
+                       AND views < prior_max_views
+                 )
+                 INSERT INTO mt_observation_quality_flags(
+                     flag_id, observation_id, run_id, video_id, source_id,
+                     detected_at, observed_at, views, prior_observation_id,
+                     prior_observed_at, prior_views, error_code, raw_sha256,
+                     metadata_json
+                 )
+                 SELECT ? || regression.observation_key,
+                        regression.observation_id, regression.run_id,
+                        regression.video_id, regression.source_id, ?,
+                        regression.observed_at, regression.views,
+                        prior.observation_id, prior.observed_at, prior.views,
+                        'counter_regression', regression.raw_sha256, ?
+                 FROM regressions regression
+                 JOIN mt_market_observations prior
+                   ON prior.observation_id = regression.prior_anchor_id
+                 ON CONFLICT(observation_id) DO NOTHING""",
+            (
+                *filter_parameters,
+                COUNTER_REGRESSION_FLAG_PREFIX,
+                detected_at,
+                json.dumps({
+                    "contract": "market_tape_observation_quality_flag_v1",
+                    "detector": "monotonic_cumulative_views_v1",
+                    "migration_backfill": bool(migration_backfill),
+                    "raw_observation_retained": True,
+                    "excluded_from_analytics": True,
+                }, sort_keys=True),
+            ),
+        )
+        return max(0, int(cursor.rowcount))
+
     def ingest(self, item: MarketContent, run_id: str) -> Tuple[bool, bool]:
         """Append an observation. Returns (observation_added, unique_video_added)."""
         raw_sha, raw_path, raw_bytes = self._archive_raw(item)
@@ -1186,22 +2011,97 @@ class MarketTapeStore:
         published = isoformat(item.published_at)
         age_seconds = max(0.0, (item.observed_at - item.published_at).total_seconds()) if item.published_at else None
         bucket = age_bucket(item.published_at, item.observed_at)
+        regression: Optional[Dict[str, Any]] = None
+        result = (False, False)
 
         with self.connect() as connection:
             prior_rows = [dict(row) for row in connection.execute(
-                """SELECT observed_at, views FROM mt_market_observations
-                   WHERE video_id = ? ORDER BY observed_at DESC LIMIT 3""",
-                (item.video_id,),
+                """SELECT observation.observed_at, observation.views
+                   FROM mt_market_observations observation
+                   WHERE observation.video_id = ?
+                     AND (
+                         observation.observed_at < ?
+                         OR (
+                             observation.observed_at = ?
+                             AND observation.observation_key < ?
+                         )
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM mt_observation_quality_flags quality
+                         WHERE quality.observation_id = observation.observation_id
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM mt_accepted_observation_evidence accepted
+                         WHERE accepted.observation_id = observation.observation_id
+                           AND accepted.contract = ?
+                     )
+                   ORDER BY observation.observed_at DESC,
+                            observation.observation_key DESC
+                   LIMIT 3""",
+                (
+                    item.video_id, observed, observed, item.observation_key,
+                    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                ),
             ).fetchall()][::-1]
             motion_rows = prior_rows + [{"observed_at": observed, "views": item.metrics.views}]
             motion = counter_motion(motion_rows)
             cohort = [row[0] for row in connection.execute(
-                """SELECT view_velocity FROM mt_market_observations
-                   WHERE platform = ? AND video_age_bucket = ? AND observed_at >= ?
-                   ORDER BY observed_at DESC LIMIT 500""",
-                (item.platform, bucket, isoformat(item.observed_at - timedelta(days=30))),
+                """SELECT observation.view_velocity
+                   FROM mt_market_observations observation
+                   WHERE observation.platform = ?
+                     AND observation.video_age_bucket = ?
+                     AND observation.observed_at >= ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM mt_observation_quality_flags quality
+                         WHERE quality.observation_id = observation.observation_id
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM mt_accepted_observation_evidence accepted
+                         WHERE accepted.observation_id = observation.observation_id
+                           AND accepted.contract = ?
+                     )
+                   ORDER BY observation.observed_at DESC LIMIT 500""",
+                (
+                    item.platform, bucket,
+                    isoformat(item.observed_at - timedelta(days=30)),
+                    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                ),
             ).fetchall()]
             relative_strength = zscore(motion.velocity, cohort)
+            prior_anchor = connection.execute(
+                """SELECT observation.observation_id,
+                          observation.observed_at, observation.views
+                   FROM mt_market_observations observation
+                   WHERE observation.video_id = ?
+                     AND (
+                         observation.observed_at < ?
+                         OR (
+                             observation.observed_at = ?
+                             AND observation.observation_key < ?
+                         )
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM mt_observation_quality_flags quality
+                         WHERE quality.observation_id = observation.observation_id
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM mt_accepted_observation_evidence accepted
+                         WHERE accepted.observation_id = observation.observation_id
+                           AND accepted.contract = ?
+                     )
+                   ORDER BY observation.views DESC,
+                            observation.observed_at DESC,
+                            observation.observation_key DESC
+                   LIMIT 1""",
+                (
+                    item.video_id, observed, observed, item.observation_key,
+                    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                ),
+            ).fetchone()
+            regresses_prior_counter = bool(
+                prior_anchor
+                and int(item.metrics.views) < int(prior_anchor["views"])
+            )
 
             connection.execute(
                 """INSERT INTO mt_raw_objects(raw_sha256, object_path, bytes_compressed, first_seen_at, source_id)
@@ -1211,14 +2111,11 @@ class MarketTapeStore:
             connection.execute(
                 """INSERT INTO mt_creators(
                        creator_id, platform, external_id, handle, display_name, followers, first_seen_at, last_seen_at
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(creator_id) DO UPDATE SET
-                       handle = CASE WHEN excluded.handle != '' THEN excluded.handle ELSE mt_creators.handle END,
-                       display_name = CASE WHEN excluded.display_name != '' THEN excluded.display_name ELSE mt_creators.display_name END,
-                       followers = MAX(mt_creators.followers, excluded.followers), last_seen_at = excluded.last_seen_at""",
+                   ) VALUES(?, ?, ?, '', '', 0, ?, ?)
+                   ON CONFLICT(creator_id) DO NOTHING""",
                 (
-                    item.creator_id, item.platform, item.creator_external_id, item.creator_handle,
-                    item.creator_name, item.creator_followers, observed, observed,
+                    item.creator_id, item.platform, item.creator_external_id,
+                    observed, observed,
                 ),
             )
             exists = connection.execute("SELECT 1 FROM mt_videos WHERE video_id = ?", (item.video_id,)).fetchone()
@@ -1227,21 +2124,11 @@ class MarketTapeStore:
                        video_id, platform, external_id, creator_id, published_at, first_seen_at, last_seen_at,
                        title, caption, description, language, url, thumbnail_url, media_type,
                        duration_seconds, source_first_seen
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(video_id) DO UPDATE SET
-                       last_seen_at = excluded.last_seen_at,
-                       published_at = COALESCE(mt_videos.published_at, excluded.published_at),
-                       title = CASE WHEN excluded.title != '' THEN excluded.title ELSE mt_videos.title END,
-                       caption = CASE WHEN excluded.caption != '' THEN excluded.caption ELSE mt_videos.caption END,
-                       description = CASE WHEN excluded.description != '' THEN excluded.description ELSE mt_videos.description END,
-                       language = CASE WHEN excluded.language != '' THEN excluded.language ELSE mt_videos.language END,
-                       url = CASE WHEN excluded.url != '' THEN excluded.url ELSE mt_videos.url END,
-                       thumbnail_url = CASE WHEN excluded.thumbnail_url != '' THEN excluded.thumbnail_url ELSE mt_videos.thumbnail_url END,
-                       duration_seconds = COALESCE(excluded.duration_seconds, mt_videos.duration_seconds)""",
+                   ) VALUES(?, ?, ?, ?, NULL, ?, ?, '', '', '', '', '', '', ?, NULL, ?)
+                   ON CONFLICT(video_id) DO NOTHING""",
                 (
-                    item.video_id, item.platform, item.external_id, item.creator_id, published, observed, observed,
-                    item.title, item.caption, item.description, item.language, item.url, item.thumbnail_url,
-                    item.media_type, item.duration_seconds, run_id,
+                    item.video_id, item.platform, item.external_id,
+                    item.creator_id, observed, observed, item.media_type, run_id,
                 ),
             )
             cursor = connection.execute(
@@ -1257,16 +2144,200 @@ class MarketTapeStore:
                     item.creator_id, item.platform, item.source_id, age_seconds, bucket, item.metrics.views,
                     item.metrics.likes, item.metrics.comments, item.metrics.shares, item.metrics.saves,
                     item.creator_followers, motion.velocity, motion.acceleration, motion.jerk, relative_strength,
-                    raw_sha, 1.0,
+                    raw_sha, 0.0 if regresses_prior_counter else 1.0,
                 ),
             )
             added = cursor.rowcount == 1
+            observation_row = connection.execute(
+                """SELECT observation_id, observation_key, observed_at,
+                          video_id, creator_id, platform, source_id, views,
+                          likes, comments, shares, saves, raw_sha256,
+                          source_confidence
+                   FROM mt_market_observations
+                   WHERE observation_key = ?""",
+                (item.observation_key,),
+            ).fetchone()
+            if observation_row is None:
+                raise RuntimeError("observation insert did not persist")
+            observation_id = int(observation_row["observation_id"])
             if added:
+                self._flag_counter_regressions(
+                    connection,
+                    detected_at=isoformat(utc_now()),
+                    migration_backfill=False,
+                    video_id=item.video_id,
+                )
+            flagged = connection.execute(
+                """SELECT quality.observation_id, quality.views,
+                          quality.prior_observation_id, quality.prior_views
+                   FROM mt_observation_quality_flags quality
+                   WHERE quality.observation_id = ?
+                     AND quality.error_code = 'counter_regression'""",
+                (observation_id,),
+            ).fetchone()
+            exact_replay = bool(
+                str(observation_row["observation_key"]) == item.observation_key
+                and str(observation_row["observed_at"]) == observed
+                and str(observation_row["video_id"]) == item.video_id
+                and str(observation_row["creator_id"]) == item.creator_id
+                and str(observation_row["platform"]) == item.platform
+                and str(observation_row["source_id"]) == item.source_id
+                and int(observation_row["views"]) == item.metrics.views
+                and int(observation_row["likes"]) == item.metrics.likes
+                and int(observation_row["comments"]) == item.metrics.comments
+                and int(observation_row["shares"]) == item.metrics.shares
+                and int(observation_row["saves"]) == item.metrics.saves
+                and str(observation_row["raw_sha256"]) == raw_sha
+                and float(observation_row["source_confidence"]) > 0
+            )
+            full_evidence_exists = connection.execute(
+                """SELECT 1 FROM mt_accepted_observation_evidence
+                   WHERE observation_id = ?
+                     AND evidence_scope = 'full'
+                     AND contract = ?""",
+                (observation_id, ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT),
+            ).fetchone()
+            promote_full_evidence = bool(
+                flagged is None
+                and exact_replay
+                and full_evidence_exists is None
+            )
+            if promote_full_evidence:
+                self._update_descriptive_state(
+                    connection, item, observed, published
+                )
+                self._record_accepted_observation_evidence(
+                    connection, item, observation_id, observed, published
+                )
                 self._record_discovery_attributions(connection, item, run_id, observed)
                 self._upsert_genome(connection, item, observed)
-                self._map_trends(connection, item, observed)
-                self._schedule_next(connection, item, age_seconds or 0.0, motion.acceleration > 0.1 or relative_strength >= 2.0)
-            return added, not bool(exists)
+                self._map_trends(
+                    connection, item, observed, observation_id
+                )
+                self._schedule_next(
+                    connection,
+                    item,
+                    age_seconds or 0.0,
+                    motion.acceleration > 0.1 or relative_strength >= 2.0,
+                )
+            if flagged is not None:
+                regression = dict(flagged)
+            result = (added, not bool(exists))
+
+        if regression is not None:
+            raise CounterRegressionError(
+                video_id=item.video_id,
+                observation_id=int(regression["observation_id"]),
+                views=int(regression["views"]),
+                prior_observation_id=int(regression["prior_observation_id"]),
+                prior_views=int(regression["prior_views"]),
+            )
+        return result
+
+    @staticmethod
+    def _update_descriptive_state(
+        connection: sqlite3.Connection,
+        item: MarketContent,
+        observed: str,
+        published: Optional[str],
+    ) -> None:
+        """Apply mutable descriptive state only after the row is accepted."""
+
+        connection.execute(
+            """UPDATE mt_creators
+               SET handle = ?, display_name = ?, followers = ?, last_seen_at = ?
+               WHERE creator_id = ?""",
+            (
+                item.creator_handle,
+                item.creator_name,
+                item.creator_followers,
+                observed,
+                item.creator_id,
+            ),
+        )
+        connection.execute(
+            """UPDATE mt_videos
+               SET last_seen_at = ?, published_at = ?, title = ?, caption = ?,
+                   description = ?, language = ?, url = ?, thumbnail_url = ?,
+                   media_type = ?, duration_seconds = ?
+               WHERE video_id = ?""",
+            (
+                observed,
+                published,
+                item.title,
+                item.caption,
+                item.description,
+                item.language,
+                item.url,
+                item.thumbnail_url,
+                item.media_type,
+                item.duration_seconds,
+                item.video_id,
+            ),
+        )
+
+    @staticmethod
+    def _record_accepted_observation_evidence(
+        connection: sqlite3.Connection,
+        item: MarketContent,
+        observation_id: int,
+        observed: str,
+        published: Optional[str],
+    ) -> None:
+        """Persist the immutable accepted projection used by all analytics."""
+
+        context = (
+            item.discovery_context
+            if isinstance(item.discovery_context, dict)
+            else {}
+        )
+        raw_queries: List[Any] = []
+        configured_queries = context.get("queries")
+        if isinstance(configured_queries, list):
+            raw_queries.extend(configured_queries)
+        for key in ("query", "topic", "niche"):
+            if context.get(key):
+                raw_queries.append(context[key])
+        queries = list(dict.fromkeys(
+            " ".join(str(value).split())[:200]
+            for value in raw_queries
+            if str(value).strip()
+        ))
+        connection.execute(
+            """INSERT INTO mt_accepted_observation_evidence(
+                   evidence_id, observation_id, observation_key, video_id,
+                   creator_id, accepted_at, contract, evidence_scope,
+                   published_at, title, caption, description, language, url,
+                   thumbnail_url, media_type, duration_seconds, hashtags_json,
+                   discovery_queries_json, discovery_context_json
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, 'full', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(observation_id, evidence_scope) DO NOTHING""",
+            (
+                stable_hash({
+                    "contract": ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                    "observation_key": item.observation_key,
+                    "evidence_scope": "full",
+                }),
+                observation_id,
+                item.observation_key,
+                item.video_id,
+                item.creator_id,
+                observed,
+                ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                published,
+                item.title,
+                item.caption,
+                item.description,
+                item.language,
+                item.url,
+                item.thumbnail_url,
+                item.media_type,
+                item.duration_seconds,
+                json.dumps(item.hashtags, sort_keys=True),
+                json.dumps(queries, sort_keys=True),
+                json.dumps(context, sort_keys=True, default=str),
+            ),
+        )
 
     def _record_discovery_attributions(
         self,
@@ -1352,7 +2423,13 @@ class MarketTapeStore:
             ),
         )
 
-    def _map_trends(self, connection: sqlite3.Connection, item: MarketContent, observed: str) -> None:
+    def _map_trends(
+        self,
+        connection: sqlite3.Connection,
+        item: MarketContent,
+        observed: str,
+        observation_id: int,
+    ) -> None:
         text = " ".join(value for value in (item.title, item.caption) if value)
         words = [word.lower() for word in WORD_RE.findall(text) if word.lower() not in STOP_WORDS and len(word) > 2]
         candidates: List[Tuple[str, str, str, float]] = []
@@ -1395,6 +2472,19 @@ class MarketTapeStore:
                    ) VALUES(?, ?, ?, ?, ?) ON CONFLICT(trend_id, video_id) DO NOTHING""",
                 (trend_id, item.video_id, confidence, json.dumps({"type": trend_type, "value": key}), observed),
             )
+            connection.execute(
+                """INSERT INTO mt_trend_membership_lineage(
+                       trend_id, video_id, observation_id, linked_at, contract
+                   ) VALUES(?, ?, ?, ?, ?)
+                   ON CONFLICT(trend_id, video_id, observation_id) DO NOTHING""",
+                (
+                    trend_id,
+                    item.video_id,
+                    observation_id,
+                    observed,
+                    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                ),
+            )
 
     def backfill_context_trends(self) -> Dict[str, Any]:
         """Recover topic memberships from immutable discovery context without provider calls."""
@@ -1406,14 +2496,25 @@ class MarketTapeStore:
         affected_trend_ids: set[str] = set()
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT attribution_key, video_id, discovered_at, context_json
-                   FROM mt_discovery_attributions
-                   ORDER BY discovered_at, attribution_key"""
+                """SELECT evidence.observation_id, evidence.observation_key,
+                          evidence.video_id, evidence.accepted_at,
+                          evidence.discovery_context_json
+                   FROM mt_accepted_observation_evidence evidence
+                   WHERE evidence.contract = ?
+                     AND evidence.evidence_scope = 'full'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM mt_observation_quality_flags quality
+                         WHERE quality.observation_id = evidence.observation_id
+                     )
+                   ORDER BY evidence.accepted_at, evidence.observation_id""",
+                (ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,),
             ).fetchall()
             for row in rows:
                 scanned += 1
                 try:
-                    context = json.loads(str(row["context_json"] or "{}"))
+                    context = json.loads(
+                        str(row["discovery_context_json"] or "{}")
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     invalid_context += 1
                     continue
@@ -1421,7 +2522,7 @@ class MarketTapeStore:
                 if not key:
                     continue
                 eligible += 1
-                observed = str(row["discovered_at"])
+                observed = str(row["accepted_at"])
                 trend_id = f"trend:topic:{stable_hash(key)[:16]}"
                 cursor = connection.execute(
                     """INSERT INTO mt_trends(
@@ -1441,8 +2542,12 @@ class MarketTapeStore:
                         trend_id,
                         str(row["video_id"]),
                         json.dumps({
-                            "attribution_key": str(row["attribution_key"]),
-                            "contract": "discovery-context-trend-backfill-v1",
+                            "source_observation_key": str(
+                                row["observation_key"]
+                            ),
+                            "contract": (
+                                "discovery-context-trend-backfill-v2"
+                            ),
                             "type": "topic",
                             "value": key,
                         }, sort_keys=True),
@@ -1451,7 +2556,22 @@ class MarketTapeStore:
                 )
                 membership_added = int(cursor.rowcount == 1)
                 memberships_inserted += membership_added
-                if membership_added:
+                lineage_cursor = connection.execute(
+                    """INSERT INTO mt_trend_membership_lineage(
+                           trend_id, video_id, observation_id, linked_at,
+                           contract
+                       ) VALUES(?, ?, ?, ?, ?)
+                       ON CONFLICT(trend_id, video_id, observation_id)
+                       DO NOTHING""",
+                    (
+                        trend_id,
+                        str(row["video_id"]),
+                        int(row["observation_id"]),
+                        observed,
+                        ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                    ),
+                )
+                if membership_added or lineage_cursor.rowcount == 1:
                     affected_trend_ids.add(trend_id)
         return {
             "attributions_scanned": scanned,
@@ -1537,6 +2657,8 @@ class MarketTapeStore:
         *,
         as_of: Optional[datetime] = None,
         forecast_capable_platforms: Optional[Iterable[str]] = None,
+        forecast_capable_source_ids: Optional[Iterable[str]] = None,
+        claim_run_id: Optional[str] = None,
         phase: str = "all",
     ) -> Dict[str, Any]:
         """Plan rechecks needed to preserve prospective forecast labels.
@@ -1581,12 +2703,26 @@ class MarketTapeStore:
                 for platform in forecast_capable_platforms
                 if str(platform).strip()
             })
+        capable_source_ids = sorted({
+            str(source_id).strip()
+            for source_id in (forecast_capable_source_ids or ())
+            if str(source_id).strip()
+        })
 
         active_model = load_active_model(self.config) if coverage_evaluated else None
         coverage_obligations: List[Dict[str, Any]] = []
         coverage_candidates: List[Dict[str, Any]] = []
+        reserved_forecast_rows: List[Dict[str, Any]] = []
         active_model_version = ""
         active_horizon = ""
+        claim_receipt: Optional[Dict[str, Any]] = None
+        if coverage_evaluated and claim_run_id and capable_source_ids:
+            claim_receipt = self.claim_due_forecast_measurements(
+                claim_run_id,
+                as_of=selected_at,
+                capable_source_ids=capable_source_ids,
+                limit=maximum,
+            )
         with self.connect() as connection:
             normal_rows = [dict(row) for row in connection.execute(
                 """WITH ranked AS (
@@ -1618,6 +2754,20 @@ class MarketTapeStore:
             for row in normal_rows:
                 row.pop("platform_rank", None)
 
+            if coverage_evaluated:
+                (
+                    reserved_forecast_rows,
+                    reserved_obligations,
+                ) = _reserved_measurement_poll_rows(
+                    connection,
+                    selected_at_iso=selected_at_iso,
+                    capable_source_ids=capable_source_ids,
+                    capable_platforms=capable_platforms,
+                    claim_run_id=claim_run_id,
+                    limit=maximum,
+                )
+                coverage_obligations.extend(reserved_obligations)
+
             if coverage_evaluated and active_model is not None:
                 active_model_version = str(active_model["model_version"])
                 active_horizon = model_prediction_horizon(active_model)
@@ -1648,16 +2798,30 @@ class MarketTapeStore:
                     """SELECT prediction_id, subject_id AS trend_id,
                               predicted_at, model_version, horizon
                        FROM mt_predictions prediction
+                       JOIN mt_trends trend
+                         ON trend.trend_id = prediction.subject_id
                        WHERE subject_type = 'trend'
                          AND model_version = ?
                          AND horizon = ?
+                         AND lower(trend.trend_type) != 'format'
                          AND outcome_json IS NULL
+                         AND json_extract(
+                                 prediction.features_json,
+                                 '$.observation_quality_contract'
+                             ) = 'market_tape_accepted_observation_lineage_v2'
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_forecast_measurement_assignments assignment
+                             WHERE assignment.prediction_id = prediction.prediction_id
+                         )
                          AND julianday(predicted_at) > julianday(?)
                          AND julianday(predicted_at) <= julianday(?)
                          AND NOT EXISTS (
                              SELECT 1
                              FROM mt_trend_observations observation
                              WHERE observation.trend_id = prediction.subject_id
+                               AND observation.observation_quality_contract =
+                                   'market_tape_accepted_observation_lineage_v2'
                                AND julianday(observation.observed_at)
                                    > julianday(prediction.predicted_at)
                                AND julianday(observation.observed_at)
@@ -1690,16 +2854,31 @@ class MarketTapeStore:
                         f"""WITH coverage_predictions AS (
                                SELECT DISTINCT subject_id AS trend_id
                                FROM mt_predictions prediction
+                               JOIN mt_trends trend
+                                 ON trend.trend_id = prediction.subject_id
                                WHERE subject_type = 'trend'
                                  AND model_version = ?
                                  AND horizon = ?
+                                 AND lower(trend.trend_type) != 'format'
                                  AND outcome_json IS NULL
+                                 AND json_extract(
+                                         prediction.features_json,
+                                         '$.observation_quality_contract'
+                                     ) =
+                                         'market_tape_accepted_observation_lineage_v2'
+                                 AND NOT EXISTS (
+                                     SELECT 1
+                                     FROM mt_forecast_measurement_assignments assignment
+                                     WHERE assignment.prediction_id = prediction.prediction_id
+                                 )
                                  AND julianday(predicted_at) > julianday(?)
                                  AND julianday(predicted_at) <= julianday(?)
                                  AND NOT EXISTS (
                                      SELECT 1
                                      FROM mt_trend_observations observation
                                      WHERE observation.trend_id = prediction.subject_id
+                                       AND observation.observation_quality_contract =
+                                           'market_tape_accepted_observation_lineage_v2'
                                        AND julianday(observation.observed_at)
                                            > julianday(prediction.predicted_at)
                                        AND julianday(observation.observed_at)
@@ -1721,7 +2900,7 @@ class MarketTapeStore:
                                   c.display_name AS creator_name,
                                   c.followers AS creator_followers
                            FROM coverage_predictions forecast
-                           JOIN mt_trend_memberships membership
+                           JOIN mt_accepted_trend_memberships_v1 membership
                              ON membership.trend_id = forecast.trend_id
                            JOIN mt_poll_queue q
                              ON q.video_id = membership.video_id
@@ -1743,15 +2922,83 @@ class MarketTapeStore:
             obligations_by_trend.setdefault(
                 str(obligation["trend_id"]), []
             ).append(obligation)
-        forecast_rows, covered_trend_ids = (
+        reserved_prediction_ids = {
+            int(obligation["prediction_id"])
+            for row in reserved_forecast_rows
+            for obligation in row.get("forecast_coverage", [])
+        }
+        reserved_trend_ids = {
+            str(obligation["trend_id"])
+            for row in reserved_forecast_rows
+            for obligation in row.get("forecast_coverage", [])
+        }
+        legacy_obligations_by_trend: Dict[str, List[Dict[str, Any]]] = {}
+        for trend_id, obligations in obligations_by_trend.items():
+            legacy = [
+                obligation for obligation in obligations
+                if int(obligation["prediction_id"]) not in reserved_prediction_ids
+            ]
+            if legacy:
+                legacy_obligations_by_trend[trend_id] = legacy
+
+        # An exact reservation and a pre-reservation (legacy) forecast can point
+        # at the same trend member.  Keep the reservation's immutable source
+        # assignment, but let that one provider observation cover both sets of
+        # forecast obligations instead of spending a second queue slot/request.
+        # ``coverage_candidates`` is deterministic, as is the reservation query,
+        # so a legacy trend shared by several reserved videos is attached once.
+        reserved_row_by_video: Dict[str, Dict[str, Any]] = {}
+        for row in reserved_forecast_rows:
+            reserved_row_by_video.setdefault(str(row["video_id"]), row)
+        legacy_trends_covered_by_reserved: set[str] = set()
+        for candidate in coverage_candidates:
+            trend_id = str(candidate["trend_id"])
+            if (
+                trend_id in legacy_trends_covered_by_reserved
+                or trend_id not in legacy_obligations_by_trend
+            ):
+                continue
+            reserved_row = reserved_row_by_video.get(str(candidate["video_id"]))
+            if reserved_row is None:
+                continue
+            existing_prediction_ids = {
+                int(obligation["prediction_id"])
+                for obligation in reserved_row.get("forecast_coverage", [])
+            }
+            reserved_row.setdefault("forecast_coverage", []).extend(
+                obligation
+                for obligation in legacy_obligations_by_trend[trend_id]
+                if int(obligation["prediction_id"])
+                not in existing_prediction_ids
+            )
+            reserved_row["forecast_coverage"].sort(
+                key=lambda obligation: (
+                    str(obligation["coverage_deadline_at"]),
+                    int(obligation["prediction_id"]),
+                )
+            )
+            legacy_trends_covered_by_reserved.add(trend_id)
+        for trend_id in legacy_trends_covered_by_reserved:
+            legacy_obligations_by_trend.pop(trend_id, None)
+
+        legacy_forecast_rows, legacy_covered_trend_ids = (
             _select_forecast_rechecks(
                 coverage_candidates,
-                obligations_by_trend,
-                maximum,
+                legacy_obligations_by_trend,
+                max(0, maximum - len(reserved_forecast_rows)),
                 selected_at_iso,
             )
             if coverage_evaluated
             else ([], set())
+        )
+        forecast_rows = [
+            *reserved_forecast_rows,
+            *legacy_forecast_rows,
+        ]
+        covered_trend_ids = (
+            reserved_trend_ids
+            | legacy_trends_covered_by_reserved
+            | legacy_covered_trend_ids
         )
         selected: List[Dict[str, Any]] = list(forecast_rows)
         selected_video_ids = {str(row["video_id"]) for row in selected}
@@ -1808,12 +3055,12 @@ class MarketTapeStore:
         }
         candidate_trend_ids = {
             str(row["trend_id"]) for row in coverage_candidates
-        }
+        } | reserved_trend_ids
         due_trend_ids = set(obligations_by_trend)
         selected_assignments = [_poll_assignment_receipt(row) for row in selected]
         if not coverage_evaluated:
             coverage_state = "not_evaluated_in_scheduled_phase"
-        elif active_model is None:
+        elif active_model is None and not coverage_obligations:
             coverage_state = "no_active_model"
         elif not coverage_obligations:
             coverage_state = "no_open_coverage_window"
@@ -1867,6 +3114,14 @@ class MarketTapeStore:
             "forecast_capable_platforms": (
                 capable_platforms if coverage_evaluated else []
             ),
+            "forecast_capable_source_ids": (
+                capable_source_ids if coverage_evaluated else []
+            ),
+            "measurement_claim": claim_receipt,
+            "reserved_assignments_selected": len(reserved_prediction_ids),
+            "legacy_assignments_selected": (
+                len(selected_prediction_ids) - len(reserved_prediction_ids)
+            ),
             "active_model_version": active_model_version,
             "active_horizon": active_horizon,
             "coverage_state": coverage_state,
@@ -1904,13 +3159,507 @@ class MarketTapeStore:
             "receipt": receipt,
         }
 
-    def remaining_request_budget(self, source_id: str, daily_limit: int) -> int:
+    def remaining_request_budget(
+        self,
+        source_id: str,
+        daily_limit: int,
+        *,
+        purpose: str = "legacy",
+        as_of: Optional[datetime] = None,
+        validation_floor: Optional[int] = None,
+    ) -> int:
+        """Return operation-aware provider capacity without spending it.
+
+        Existing callers retain the historical ``legacy`` behavior until they
+        explicitly identify their lane. Discovery and ordinary scheduled work
+        protect the larger of durable outstanding reservations or the unused
+        validation floor. Reservation formation can consume that protected
+        floor, while a terminal claim sees real unused provider capacity; the
+        exact claimed assignments remain its separate upper bound.
+        """
+
+        measured_at = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
+        floor = (
+            self.config.prediction_validation_request_floor
+            if validation_floor is None
+            else validation_floor
+        )
+        normalized_purpose = str(purpose or "legacy").strip().casefold()
+        if (
+            normalized_purpose in {"general", "discovery", "scheduled"}
+            and load_active_model(self.config) is None
+        ):
+            # Preserve cold-start discovery capacity until a promoted model
+            # creates a real validation obligation. Durable reservations, when
+            # present, remain protected independently by the budget helper.
+            floor = 0
         with self.connect() as connection:
-            row = connection.execute(
-                "SELECT requests FROM mt_daily_usage WHERE usage_date = ? AND source_id = ?",
-                (datetime.now(timezone.utc).date().isoformat(), source_id),
-            ).fetchone()
-        return max(0, daily_limit - (int(row[0]) if row else 0))
+            return _remaining_request_budget_with_connection(
+                connection,
+                source_id=str(source_id),
+                daily_limit=max(0, int(daily_limit)),
+                purpose=purpose,
+                usage_date=measured_at.date().isoformat(),
+                validation_floor=max(0, int(floor)),
+                as_of_iso=isoformat(measured_at),
+            )
+
+    def claim_due_forecast_measurements(
+        self,
+        run_id: str,
+        *,
+        as_of: Optional[datetime] = None,
+        capable_source_ids: Iterable[str],
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """Atomically lease exact terminal-measurement reservations."""
+
+        claimed_at = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
+        claimed_at_iso = isoformat(claimed_at)
+        source_ids = sorted({
+            str(value).strip() for value in capable_source_ids
+            if str(value).strip()
+        })
+        maximum = max(1, int(limit))
+        if not source_ids:
+            return {
+                "contract": "market_tape_forecast_measurement_claim_v1",
+                "state": "no_capable_source",
+                "run_id": run_id,
+                "claimed_at": claimed_at_iso,
+                "reservations_claimed": 0,
+                "assignments_claimed": 0,
+                "reserved_request_units": 0,
+                "reservation_ids": [],
+                "assignments": [],
+                "selection_sha256": stable_hash([]),
+            }
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM mt_collection_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone() is None:
+                raise ValueError(f"collection run does not exist: {run_id}")
+
+            expired_ids = [str(row[0]) for row in connection.execute(
+                """SELECT reservation_id
+                   FROM mt_forecast_measurement_reservations
+                   WHERE state IN ('reserved', 'claimed')
+                     AND deadline_at <= ?""",
+                (claimed_at_iso,),
+            ).fetchall()]
+            if expired_ids:
+                _update_measurement_assignments_state(
+                    connection,
+                    expired_ids,
+                    state="expired",
+                    completed_at=claimed_at_iso,
+                    error_code="measurement_deadline_closed",
+                )
+                _update_measurement_reservations_state(
+                    connection,
+                    expired_ids,
+                    state="expired",
+                    completed_at=claimed_at_iso,
+                    error_code="measurement_deadline_closed",
+                )
+
+            reclaimable_ids = [str(row[0]) for row in connection.execute(
+                """SELECT reservation_id
+                   FROM mt_forecast_measurement_reservations
+                   WHERE state = 'claimed'
+                     AND claim_expires_at <= ?
+                     AND deadline_at > ?""",
+                (claimed_at_iso, claimed_at_iso),
+            ).fetchall()]
+            if reclaimable_ids:
+                _update_measurement_assignments_state(
+                    connection,
+                    reclaimable_ids,
+                    state="reserved",
+                    completed_at=None,
+                    error_code="",
+                )
+                placeholders = ",".join("?" for _ in reclaimable_ids)
+                connection.execute(
+                    f"""UPDATE mt_forecast_measurement_reservations
+                        SET state = 'reserved', claim_run_id = NULL,
+                            claimed_at = NULL, claim_expires_at = NULL,
+                            completed_at = NULL, error_code = '',
+                            completion_json = '{{}}'
+                        WHERE reservation_id IN ({placeholders})""",
+                    reclaimable_ids,
+                )
+
+            placeholders = ",".join("?" for _ in source_ids)
+            rows = [dict(row) for row in connection.execute(
+                f"""SELECT reservation.*
+                     FROM mt_forecast_measurement_reservations reservation
+                     WHERE reservation.source_id IN ({placeholders})
+                       AND reservation.window_open_at <= ?
+                       AND reservation.deadline_at > ?
+                       AND (
+                           reservation.state = 'reserved'
+                           OR (
+                               reservation.state = 'claimed'
+                               AND reservation.claim_run_id = ?
+                           )
+                       )
+                       AND EXISTS (
+                           SELECT 1
+                           FROM mt_forecast_measurement_assignments assignment
+                           JOIN mt_predictions prediction
+                             ON prediction.prediction_id =
+                                assignment.prediction_id
+                           WHERE assignment.reservation_id = reservation.reservation_id
+                             AND assignment.state IN ('reserved', 'claimed')
+                             AND json_extract(
+                                     prediction.features_json,
+                                     '$.observation_quality_contract'
+                                 ) =
+                                     'market_tape_accepted_observation_lineage_v2'
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM mt_accepted_trend_memberships_v1 membership
+                                 WHERE membership.trend_id = assignment.trend_id
+                                   AND membership.video_id = assignment.video_id
+                             )
+                       )
+                     ORDER BY CASE reservation.state
+                                  WHEN 'claimed' THEN 0 ELSE 1 END,
+                              reservation.deadline_at,
+                              reservation.created_at,
+                              reservation.reservation_id""",
+                (*source_ids, claimed_at_iso, claimed_at_iso, run_id),
+            ).fetchall()]
+            selected: List[Dict[str, Any]] = []
+            selected_videos = 0
+            ttl_seconds = max(
+                60, int(self.config.prediction_measurement_claim_ttl_seconds)
+            )
+            for row in rows:
+                remaining_video_capacity = maximum - selected_videos
+                if remaining_video_capacity <= 0:
+                    break
+                reservation_id = str(row["reservation_id"])
+                pending = [dict(assignment) for assignment in connection.execute(
+                    """SELECT assignment.prediction_id, assignment.video_id,
+                              assignment.state
+                       FROM mt_forecast_measurement_assignments assignment
+                       JOIN mt_predictions prediction
+                         ON prediction.prediction_id = assignment.prediction_id
+                       WHERE assignment.reservation_id = ?
+                         AND assignment.state IN ('reserved', 'claimed')
+                         AND json_extract(
+                                 prediction.features_json,
+                                 '$.observation_quality_contract'
+                             ) = 'market_tape_accepted_observation_lineage_v2'
+                         AND EXISTS (
+                             SELECT 1
+                             FROM mt_accepted_trend_memberships_v1 membership
+                             WHERE membership.trend_id = assignment.trend_id
+                               AND membership.video_id = assignment.video_id
+                         )
+                       ORDER BY CASE assignment.state
+                                    WHEN 'claimed' THEN 0 ELSE 1 END,
+                                assignment.video_id,
+                                assignment.prediction_id""",
+                    (reservation_id,),
+                ).fetchall()]
+                already_claimed_videos = list(dict.fromkeys(
+                    str(assignment["video_id"])
+                    for assignment in pending
+                    if assignment["state"] == "claimed"
+                ))
+                if len(already_claimed_videos) > remaining_video_capacity:
+                    # A prior lease was formed with a larger limit. Do not
+                    # silently return only part of that existing lease.
+                    continue
+                selected_video_ids = list(already_claimed_videos)
+                for video_id in dict.fromkeys(
+                    str(assignment["video_id"])
+                    for assignment in pending
+                    if assignment["state"] == "reserved"
+                ):
+                    if len(selected_video_ids) >= remaining_video_capacity:
+                        break
+                    if video_id not in selected_video_ids:
+                        selected_video_ids.append(video_id)
+                if not selected_video_ids:
+                    continue
+                video_placeholders = ",".join("?" for _ in selected_video_ids)
+                connection.execute(
+                    f"""UPDATE mt_forecast_measurement_assignments
+                        SET state = 'claimed', completed_at = NULL,
+                            error_code = ''
+                        WHERE reservation_id = ? AND state = 'reserved'
+                          AND video_id IN ({video_placeholders})""",
+                    (reservation_id, *selected_video_ids),
+                )
+                selected_assignments = [
+                    assignment for assignment in pending
+                    if str(assignment["video_id"]) in selected_video_ids
+                ]
+                deadline_at = _as_datetime(row["deadline_at"])
+                claim_expires_at = min(
+                    deadline_at,
+                    claimed_at + timedelta(seconds=ttl_seconds),
+                )
+                connection.execute(
+                    """UPDATE mt_forecast_measurement_reservations
+                       SET state = 'claimed', claim_run_id = ?, claimed_at = ?,
+                           claim_expires_at = ?, completed_at = NULL,
+                           error_code = ''
+                       WHERE reservation_id = ?
+                         AND (
+                             state = 'reserved'
+                             OR (state = 'claimed' AND claim_run_id = ?)
+                         )""",
+                    (
+                        run_id,
+                        claimed_at_iso,
+                        isoformat(claim_expires_at),
+                        reservation_id,
+                        run_id,
+                    ),
+                )
+                try:
+                    capability = json.loads(row.get("capability_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    capability = {}
+                units_per_batch = max(
+                    1, int(capability.get("request_units_per_batch") or 1)
+                )
+                claim_units = (
+                    math.ceil(
+                        len(selected_video_ids)
+                        / max(1, int(row["refresh_batch_size"]))
+                    )
+                    * units_per_batch
+                )
+                selected.append({
+                    **row,
+                    "video_count": len(selected_video_ids),
+                    "assignment_count": len(selected_assignments),
+                    "claim_request_units": claim_units,
+                    "claimed_video_ids": selected_video_ids,
+                    "claimed_prediction_ids": [
+                        int(assignment["prediction_id"])
+                        for assignment in selected_assignments
+                    ],
+                })
+                selected_videos += len(selected_video_ids)
+
+            reservation_ids = [
+                str(row["reservation_id"]) for row in selected
+            ]
+            assignments_claimed = sum(
+                int(row.get("assignment_count") or 0) for row in selected
+            )
+            reserved_units = sum(
+                int(row.get("claim_request_units") or 0)
+                for row in selected
+            )
+            claimed_selection = [{
+                "reservation_id": str(row["reservation_id"]),
+                "video_ids": list(row["claimed_video_ids"]),
+                "prediction_ids": list(row["claimed_prediction_ids"]),
+            } for row in selected]
+        return {
+            "contract": "market_tape_forecast_measurement_claim_v1",
+            "state": "claimed" if reservation_ids else "nothing_due",
+            "run_id": run_id,
+            "claimed_at": claimed_at_iso,
+            "claim_ttl_seconds": max(
+                60, int(self.config.prediction_measurement_claim_ttl_seconds)
+            ),
+            "reservations_claimed": len(reservation_ids),
+            "assignments_claimed": assignments_claimed,
+            "reserved_request_units": reserved_units,
+            "reservation_ids": reservation_ids,
+            "assignments": claimed_selection,
+            "selection_sha256": stable_hash(claimed_selection),
+        }
+
+    def complete_forecast_measurements(
+        self,
+        run_id: str,
+        source_id: str,
+        accepted_video_ids: Iterable[str],
+        *,
+        error_code: str = "",
+        failure_codes_by_video: Optional[Dict[str, str]] = None,
+        completed_at: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Close one source's claimed assignments from factual ingest results."""
+
+        completed = _as_datetime(completed_at or utc_now()).astimezone(
+            timezone.utc
+        )
+        completed_iso = isoformat(completed)
+        accepted = {
+            str(value) for value in accepted_video_ids if str(value)
+        }
+        item_failure_codes = {
+            str(video_id): str(code or "provider_item_missing")[:100]
+            for video_id, code in (failure_codes_by_video or {}).items()
+            if str(video_id)
+        }
+        completed_reservations: List[Dict[str, Any]] = []
+        assignments_fulfilled = 0
+        assignments_failed = 0
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reservations = [dict(row) for row in connection.execute(
+                """SELECT * FROM mt_forecast_measurement_reservations
+                   WHERE state = 'claimed' AND claim_run_id = ?
+                     AND source_id = ?
+                   ORDER BY deadline_at, reservation_id""",
+                (run_id, source_id),
+            ).fetchall()]
+            for reservation in reservations:
+                reservation_id = str(reservation["reservation_id"])
+                assignments = [dict(row) for row in connection.execute(
+                    """SELECT * FROM mt_forecast_measurement_assignments
+                       WHERE reservation_id = ? AND state = 'claimed'
+                       ORDER BY prediction_id""",
+                    (reservation_id,),
+                ).fetchall()]
+                fulfilled = 0
+                failed = 0
+                for assignment in assignments:
+                    measured = str(assignment["video_id"]) in accepted
+                    assignment_error = "" if measured else (
+                        item_failure_codes.get(
+                            str(assignment["video_id"]),
+                            str(error_code or "provider_item_missing")[:100],
+                        )
+                    )
+                    connection.execute(
+                        """UPDATE mt_forecast_measurement_assignments
+                           SET state = ?, completed_at = ?, error_code = ?
+                           WHERE reservation_id = ? AND prediction_id = ?
+                             AND state = 'claimed'""",
+                        (
+                            "fulfilled" if measured else "failed",
+                            completed_iso,
+                            assignment_error,
+                            reservation_id,
+                            int(assignment["prediction_id"]),
+                        ),
+                    )
+                    fulfilled += int(measured)
+                    failed += int(not measured)
+                state_counts = {
+                    str(row["state"]): int(row["assignment_count"])
+                    for row in connection.execute(
+                        """SELECT state, COUNT(*) AS assignment_count
+                           FROM mt_forecast_measurement_assignments
+                           WHERE reservation_id = ? GROUP BY state""",
+                        (reservation_id,),
+                    ).fetchall()
+                }
+                remaining_assignments = sum(
+                    state_counts.get(state_name, 0)
+                    for state_name in ("reserved", "claimed")
+                )
+                remaining_videos = int(connection.execute(
+                    """SELECT COUNT(DISTINCT video_id)
+                       FROM mt_forecast_measurement_assignments
+                       WHERE reservation_id = ?
+                         AND state IN ('reserved', 'claimed')""",
+                    (reservation_id,),
+                ).fetchone()[0] or 0)
+                total_fulfilled = state_counts.get("fulfilled", 0)
+                total_failed = state_counts.get("failed", 0)
+                if remaining_assignments:
+                    state = "reserved"
+                    reservation_completed_at = None
+                    reservation_error = ""
+                    try:
+                        capability = json.loads(
+                            reservation.get("capability_json") or "{}"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        capability = {}
+                    units_per_batch = max(
+                        1,
+                        int(capability.get("request_units_per_batch") or 1),
+                    )
+                    remaining_request_units = (
+                        math.ceil(
+                            remaining_videos
+                            / max(1, int(reservation["refresh_batch_size"]))
+                        )
+                        * units_per_batch
+                    )
+                else:
+                    reservation_completed_at = completed_iso
+                    remaining_request_units = int(
+                        reservation["reserved_request_units"]
+                    )
+                    if total_fulfilled and total_failed:
+                        state = "partial"
+                    elif total_fulfilled:
+                        state = "fulfilled"
+                    else:
+                        state = "failed"
+                    reservation_error = str(error_code or (
+                        "provider_item_missing" if total_failed else ""
+                    ))[:100]
+                completion = {
+                    "contract": "market_tape_forecast_measurement_completion_v1",
+                    "run_id": run_id,
+                    "source_id": source_id,
+                    "completed_at": completed_iso,
+                    "assignments_fulfilled": fulfilled,
+                    "assignments_failed": failed,
+                    "cumulative_assignments_fulfilled": total_fulfilled,
+                    "cumulative_assignments_failed": total_failed,
+                    "assignments_remaining": remaining_assignments,
+                    "videos_remaining": remaining_videos,
+                    "error_code": str(error_code or "")[:100],
+                    "failure_codes_by_video": item_failure_codes,
+                }
+                connection.execute(
+                    """UPDATE mt_forecast_measurement_reservations
+                       SET state = ?, completed_at = ?, error_code = ?,
+                           completion_json = ?, claim_run_id = NULL,
+                           claimed_at = NULL, claim_expires_at = NULL,
+                           reserved_request_units = ?
+                       WHERE reservation_id = ? AND state = 'claimed'
+                         AND claim_run_id = ?""",
+                    (
+                        state,
+                        reservation_completed_at,
+                        reservation_error,
+                        json.dumps(completion, sort_keys=True),
+                        remaining_request_units,
+                        reservation_id,
+                        run_id,
+                    ),
+                )
+                assignments_fulfilled += fulfilled
+                assignments_failed += failed
+                completed_reservations.append({
+                    "reservation_id": reservation_id,
+                    "state": state,
+                    "assignments_fulfilled": fulfilled,
+                    "assignments_failed": failed,
+                    "assignments_remaining": remaining_assignments,
+                })
+        return {
+            "contract": "market_tape_forecast_measurement_completion_v1",
+            "state": "completed" if completed_reservations else "nothing_claimed",
+            "run_id": run_id,
+            "source_id": source_id,
+            "completed_at": completed_iso,
+            "reservations_completed": len(completed_reservations),
+            "assignments_fulfilled": assignments_fulfilled,
+            "assignments_failed": assignments_failed,
+            "reservations": completed_reservations,
+        }
 
     def reserve_adaptive_query_admissions(
         self,
@@ -2329,9 +4078,15 @@ class MarketTapeStore:
             elif run_id:
                 trends = connection.execute(
                     """SELECT DISTINCT m.trend_id
-                       FROM mt_trend_memberships m
-                       JOIN mt_market_observations o ON o.video_id = m.video_id
-                       WHERE o.run_id = ?""",
+                       FROM mt_accepted_trend_memberships_v1 m
+                       JOIN mt_accepted_metric_observations_v1 o
+                         ON o.video_id = m.video_id
+                       WHERE o.run_id = ?
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id = o.observation_id
+                         )""",
                     (run_id,),
                 ).fetchall()
                 trend_ids = [str(row["trend_id"]) for row in trends]
@@ -2351,20 +4106,32 @@ class MarketTapeStore:
                             prior.views AS prior_views, prior.likes AS prior_likes,
                             prior.comments AS prior_comments,
                             prior.shares AS prior_shares
-                     FROM mt_trend_memberships m
+                     FROM mt_accepted_trend_memberships_v1 m
                      JOIN mt_videos v ON v.video_id = m.video_id
-                     JOIN mt_market_observations o ON o.observation_id = (
-                         SELECT observation_id FROM mt_market_observations latest
+                     JOIN mt_accepted_metric_observations_v1 o
+                       ON o.observation_id = (
+                         SELECT observation_id
+                         FROM mt_accepted_metric_observations_v1 latest
                          WHERE latest.video_id = v.video_id
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM mt_observation_quality_flags quality
+                               WHERE quality.observation_id = latest.observation_id
+                           )
                          ORDER BY latest.observed_at DESC, latest.observation_id DESC LIMIT 1
                      )
-                     LEFT JOIN mt_market_observations prior
+                     LEFT JOIN mt_accepted_metric_observations_v1 prior
                        ON prior.observation_id = (
                            SELECT previous.observation_id
-                           FROM mt_market_observations previous
+                           FROM mt_accepted_metric_observations_v1 previous
                            WHERE previous.video_id = v.video_id
                              AND previous.observation_id != o.observation_id
                              AND previous.observed_at <= o.observed_at
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM mt_observation_quality_flags quality
+                                 WHERE quality.observation_id = previous.observation_id
+                             )
                            ORDER BY previous.observed_at DESC,
                                     previous.observation_id DESC LIMIT 1
                        )
@@ -2383,6 +4150,8 @@ class MarketTapeStore:
                          FROM mt_trend_observations
                          WHERE trend_id IN ({placeholders})
                            AND index_version = 'trend-strength-v2'
+                           AND observation_quality_contract =
+                               'market_tape_accepted_observation_lineage_v2'
                      )
                      SELECT trend_id, observed_at, momentum, acceleration FROM ranked
                      WHERE row_number <= 3 ORDER BY trend_id, observed_at""",
@@ -2397,6 +4166,8 @@ class MarketTapeStore:
             cohort = [float(row[0]) for row in connection.execute(
                 """SELECT momentum FROM mt_trend_observations
                    WHERE observed_at >= ? AND index_version = 'trend-strength-v2'
+                     AND observation_quality_contract =
+                         'market_tape_accepted_observation_lineage_v2'
                    ORDER BY observed_at DESC LIMIT 5000""",
                 (isoformat(observed_at - timedelta(days=30)),),
             ).fetchall()]
@@ -2467,11 +4238,12 @@ class MarketTapeStore:
                            counter_delta_videos, activity_coverage,
                            median_video_velocity, p90_video_velocity, creator_breadth, platform_breadth,
                            top1_concentration, top10_concentration, momentum, acceleration, relative_strength,
-                           saturation, trend_strength, index_version, state
+                           saturation, trend_strength, index_version,
+                           observation_quality_contract, state
                        ) VALUES(
                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                        )""",
                     (
                         trend_id, observed, len(latest), new_videos, len(creators), len(new_creator_ids),
@@ -2482,7 +4254,7 @@ class MarketTapeStore:
                         median_velocity, p90_velocity, breadth, platform_breadth,
                         concentration(creator_views.values(), 1), concentration(creator_views.values(), 10),
                         p90_velocity, p90_acceleration, relative, saturation, strength,
-                        TREND_INDEX_VERSION, state,
+                        TREND_INDEX_VERSION, OBSERVATION_QUALITY_CONTRACT, state,
                     ),
                 )
                 connection.execute(
@@ -2527,19 +4299,34 @@ class MarketTapeStore:
         return result
 
     def create_predictions(self, run_id: str, predicted_at: Optional[datetime] = None) -> int:
-        """Persist transparent baseline forecasts; later model versions append new rows."""
+        """Persist transparent baselines without writing the promoted model.
+
+        Promoted-model forecasts have stricter freshness, lineage, and outcome
+        coverage requirements.  ``forecast_active_trends`` is their exclusive
+        writer; keeping this run-local helper baseline-only prevents collection
+        cycles from silently creating an unbounded, unmeasured validation set.
+        """
         predicted_at = predicted_at or utc_now()
         predicted = isoformat(predicted_at)
-        active_trend_model = load_active_model(self.config)
         inserted = 0
         with self.connect() as connection:
             video_rows = connection.execute(
                 """SELECT o.*, v.published_at
-                   FROM mt_market_observations o
+                   FROM mt_accepted_metric_observations_v1 o
                    JOIN mt_videos v ON v.video_id = o.video_id
-                   WHERE o.run_id = ? AND o.observation_id = (
-                       SELECT MAX(current.observation_id) FROM mt_market_observations current
+                   WHERE o.run_id = ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM mt_observation_quality_flags quality
+                         WHERE quality.observation_id = o.observation_id
+                     )
+                     AND o.observation_id = (
+                       SELECT MAX(current.observation_id)
+                       FROM mt_accepted_metric_observations_v1 current
                        WHERE current.run_id = o.run_id AND current.video_id = o.video_id
+                         AND NOT EXISTS (
+                             SELECT 1 FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id = current.observation_id
+                         )
                    )""",
                 (run_id,),
             ).fetchall()
@@ -2551,6 +4338,9 @@ class MarketTapeStore:
                 creator_lift = views / max(1, int(row["creator_followers"]))
                 features = {
                     "run_id": run_id,
+                    "observation_quality_contract": (
+                        OBSERVATION_QUALITY_CONTRACT
+                    ),
                     "relative_strength": float(row["relative_strength"]),
                     "view_velocity": float(row["view_velocity"]),
                     "view_acceleration": float(row["view_acceleration"]),
@@ -2585,19 +4375,30 @@ class MarketTapeStore:
                 """SELECT trend.* FROM mt_trend_observations trend
                    WHERE trend.trend_id IN (
                        SELECT DISTINCT membership.trend_id
-                       FROM mt_trend_memberships membership
-                       JOIN mt_market_observations observation
+                       FROM mt_accepted_trend_memberships_v1 membership
+                       JOIN mt_accepted_metric_observations_v1 observation
                          ON observation.video_id = membership.video_id
                        WHERE observation.run_id = ?
-                   ) AND trend.trend_observation_id = (
+                         AND NOT EXISTS (
+                             SELECT 1 FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id = observation.observation_id
+                         )
+                   ) AND trend.observation_quality_contract =
+                       'market_tape_accepted_observation_lineage_v2'
+                     AND trend.trend_observation_id = (
                        SELECT MAX(current.trend_observation_id) FROM mt_trend_observations current
                        WHERE current.trend_id = trend.trend_id
+                         AND current.observation_quality_contract =
+                             'market_tape_accepted_observation_lineage_v2'
                    )""",
                 (run_id,),
             ).fetchall()
             for row in trend_rows:
                 features = {
                     "run_id": run_id,
+                    "observation_quality_contract": row[
+                        "observation_quality_contract"
+                    ],
                     "trend_strength": float(row["trend_strength"]),
                     "relative_strength": float(row["relative_strength"]),
                     "momentum": float(row["momentum"]),
@@ -2637,45 +4438,6 @@ class MarketTapeStore:
                         ),
                     )
                     inserted += 1
-                if (
-                    active_trend_model is not None
-                    and model_accepts_features(active_trend_model, features)
-                ):
-                    inference = predict_trend_snapshot(
-                        active_trend_model,
-                        features,
-                    )
-                    if inference["state"] == "abstained":
-                        continue
-                    model_probability = float(inference["probability"])
-                    model_peak_hours = max(0.5, 6.0 * (1.0 - model_probability))
-                    model_horizon = model_prediction_horizon(active_trend_model)
-                    model_features = {
-                        **features,
-                        "model_purpose": model_purpose(active_trend_model),
-                        "training_dataset_sha256": active_trend_model[
-                            "training_dataset_sha256"
-                        ],
-                        "inference_diagnostics": inference["diagnostics"],
-                    }
-                    connection.execute(
-                        """INSERT INTO mt_predictions(
-                               subject_type, subject_id, model_version, predicted_at,
-                               horizon, probability, expected_peak_at,
-                               expected_remaining_life_hours, features_json
-                           ) VALUES('trend', ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            row["trend_id"],
-                            active_trend_model["model_version"],
-                            predicted,
-                            model_horizon,
-                            model_probability,
-                            isoformat(predicted_at + timedelta(hours=model_peak_hours)),
-                            round(6.0 + 42.0 * model_probability, 3),
-                            json.dumps(model_features, sort_keys=True),
-                        ),
-                    )
-                    inserted += 1
         return inserted
 
     def forecast_baseline_trends(
@@ -2696,11 +4458,15 @@ class MarketTapeStore:
                    FROM mt_trend_observations observation
                    WHERE observation.observed_at >= ?
                      AND observation.index_version = ?
+                     AND observation.observation_quality_contract =
+                         'market_tape_accepted_observation_lineage_v2'
                      AND observation.state != 'dead'
                      AND observation.trend_observation_id = (
                          SELECT MAX(current.trend_observation_id)
                          FROM mt_trend_observations current
                          WHERE current.trend_id = observation.trend_id
+                           AND current.observation_quality_contract =
+                               'market_tape_accepted_observation_lineage_v2'
                      )
                    ORDER BY observation.trend_strength DESC,
                             observation.observed_at DESC
@@ -2715,6 +4481,9 @@ class MarketTapeStore:
                 features = {
                     "forecast_source": "transparent_trend_snapshot",
                     "run_id": run_id,
+                    "observation_quality_contract": row[
+                        "observation_quality_contract"
+                    ],
                     "trend_strength": float(row["trend_strength"]),
                     "relative_strength": float(row["relative_strength"]),
                     "momentum": float(row["momentum"]),
@@ -2776,13 +4545,17 @@ class MarketTapeStore:
         self,
         predicted_at: Optional[datetime] = None,
         limit: int = 5000,
+        *,
+        run_id: str = "",
+        measurement_sources: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Apply the promoted model only to fresh, previously unused snapshots.
+        """Atomically admit a bounded, measurable promoted-model cohort.
 
-        The source snapshot must be within the same 30-minute tolerance used to
-        prove outcome coverage (and never older than its prediction horizon).
-        The exact observation id and timestamp are durable feature lineage, so
-        another invocation cannot forecast the same evidence again.
+        Every written prediction receives one exact provider/video measurement
+        assignment in the same ``BEGIN IMMEDIATE`` transaction. Calls without
+        an existing collection run and explicit refresh-capability receipts fail
+        closed with zero predictions. This is intentionally the sole writer for
+        the promoted model.
         """
         predicted_at = _as_datetime(predicted_at or utc_now()).astimezone(
             timezone.utc
@@ -2796,12 +4569,34 @@ class MarketTapeStore:
                 "skipped_stale": 0,
                 "skipped_duplicate": 0,
             }
+        capabilities = _normalize_measurement_capabilities(
+            measurement_sources or ()
+        )
+        if not str(run_id).strip() or not capabilities:
+            return {
+                "state": "blocked_measurement_capacity",
+                "reason": (
+                    "missing_run_id"
+                    if not str(run_id).strip()
+                    else "no_refresh_capable_measurement_source"
+                ),
+                "model_version": active_model["model_version"],
+                "horizon": model_prediction_horizon(active_model),
+                "predictions_added": 0,
+                "reservations_added": 0,
+                "assignments_added": 0,
+                "skipped_no_measurement_capacity": 0,
+                "outbox_records": 0,
+            }
         predicted = isoformat(predicted_at)
         inserted_ids: List[int] = []
         skipped_ineligible = 0
         skipped_insufficient_support = 0
         skipped_stale = 0
         skipped_duplicate = 0
+        skipped_subject_cooldown = 0
+        skipped_no_refreshable_member = 0
+        skipped_no_measurement_capacity = 0
         abstentions: List[Dict[str, Any]] = []
         abstention_reasons: Dict[str, int] = {}
         model_horizon = model_prediction_horizon(active_model)
@@ -2810,21 +4605,135 @@ class MarketTapeStore:
             TREND_OUTCOME_COVERAGE_TOLERANCE,
             timedelta(hours=max(0.0, horizon_hours)),
         )
+        cohort_limit = min(
+            100,
+            max(1, int(self.config.prediction_validation_cohort_limit)),
+            max(1, int(self.config.max_due_rechecks_per_cycle)),
+            max(1, int(limit)),
+        )
+        cohort_interval_seconds = max(
+            60,
+            int(self.config.prediction_validation_interval_seconds),
+        )
+        target_at = predicted_at + timedelta(hours=horizon_hours)
+        window_open_at = target_at - source_max_age
+        usage_date = window_open_at.date().isoformat()
+        cohort_key = "mt-cohort-" + stable_hash({
+            "model_version": active_model["model_version"],
+            "horizon": model_horizon,
+            "predicted_at": predicted,
+        })
+        reservation_receipts: List[Dict[str, Any]] = []
         with self.connect() as connection:
-            # Serialise the lineage check and inserts. Without this lock, two
-            # CLI callers could both observe no prediction and write the same
-            # source snapshot.
+            # Serialise cohort cooldown, daily capacity, prediction, reservation,
+            # and assignment writes across daemon/manual processes.
             connection.execute("BEGIN IMMEDIATE")
+            run = connection.execute(
+                "SELECT run_id FROM mt_collection_runs WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if run is None:
+                return {
+                    "state": "blocked_measurement_capacity",
+                    "reason": "collection_run_not_found",
+                    "model_version": active_model["model_version"],
+                    "horizon": model_horizon,
+                    "predictions_added": 0,
+                    "reservations_added": 0,
+                    "assignments_added": 0,
+                    "skipped_no_measurement_capacity": 0,
+                    "outbox_records": 0,
+                }
+            latest_cohort = connection.execute(
+                """SELECT created_at
+                   FROM mt_forecast_measurement_reservations
+                   WHERE model_version = ? AND horizon = ?
+                   ORDER BY created_at DESC, reservation_id DESC LIMIT 1""",
+                (active_model["model_version"], model_horizon),
+            ).fetchone()
+            if latest_cohort is not None:
+                latest_created_at = _as_datetime(latest_cohort["created_at"])
+                next_cohort_at = latest_created_at + timedelta(
+                    seconds=cohort_interval_seconds
+                )
+                if predicted_at < next_cohort_at:
+                    return {
+                        "state": "cohort_interval_active",
+                        "reason": "validation_cohort_once_per_interval",
+                        "model_version": active_model["model_version"],
+                        "horizon": model_horizon,
+                        "predictions_added": 0,
+                        "reservations_added": 0,
+                        "assignments_added": 0,
+                        "next_cohort_at": isoformat(next_cohort_at),
+                        "cohort_interval_seconds": cohort_interval_seconds,
+                        "outbox_records": 0,
+                    }
+
+            available_capabilities: Dict[str, Dict[str, Any]] = {}
+            for source_id, capability in capabilities.items():
+                available_units = _remaining_request_budget_with_connection(
+                    connection,
+                    source_id=source_id,
+                    daily_limit=int(capability["daily_request_limit"]),
+                    purpose="reservation",
+                    usage_date=usage_date,
+                    validation_floor=max(
+                        0, int(self.config.prediction_validation_request_floor)
+                    ),
+                    as_of_iso=predicted,
+                )
+                declared_remaining = capability.get("request_budget_remaining")
+                declared_budget_date = str(
+                    capability.get("request_budget_date") or ""
+                )
+                if declared_remaining is not None and (
+                    declared_budget_date == usage_date
+                    or (
+                        not declared_budget_date
+                        and usage_date == predicted_at.date().isoformat()
+                    )
+                ):
+                    available_units = min(
+                        available_units,
+                        max(0, int(declared_remaining)),
+                    )
+                if available_units < int(capability["request_units_per_batch"]):
+                    continue
+                available_capabilities[source_id] = {
+                    **capability,
+                    "available_request_units": available_units,
+                }
+            if not available_capabilities:
+                return {
+                    "state": "blocked_measurement_capacity",
+                    "reason": "daily_measurement_capacity_unavailable",
+                    "model_version": active_model["model_version"],
+                    "horizon": model_horizon,
+                    "predictions_added": 0,
+                    "reservations_added": 0,
+                    "assignments_added": 0,
+                    "skipped_no_measurement_capacity": 0,
+                    "outbox_records": 0,
+                }
+
             rows = connection.execute(
                 """SELECT observation.*
                    FROM mt_trend_observations observation
+                   JOIN mt_trends trend
+                     ON trend.trend_id = observation.trend_id
                    WHERE observation.observed_at <= ?
                      AND observation.state != 'dead'
+                     AND observation.observation_quality_contract =
+                         'market_tape_accepted_observation_lineage_v2'
+                     AND lower(trend.trend_type) != 'format'
                      AND observation.trend_observation_id = (
                          SELECT current.trend_observation_id
                          FROM mt_trend_observations current
                          WHERE current.trend_id = observation.trend_id
                            AND current.observed_at <= ?
+                           AND current.observation_quality_contract =
+                               'market_tape_accepted_observation_lineage_v2'
                          ORDER BY current.observed_at DESC,
                                   current.trend_observation_id DESC
                          LIMIT 1
@@ -2835,7 +4744,7 @@ class MarketTapeStore:
                 (
                     predicted,
                     predicted,
-                    min(20000, max(1, int(limit))),
+                    min(20000, max(cohort_limit, cohort_limit * 20)),
                 ),
             ).fetchall()
             existing_by_subject: Dict[str, List[Dict[str, Any]]] = {}
@@ -2843,13 +4752,29 @@ class MarketTapeStore:
                 """SELECT subject_id, predicted_at, features_json
                    FROM mt_predictions
                    WHERE subject_type = 'trend'
-                     AND model_version = ?
-                     AND horizon = ?""",
-                (active_model["model_version"], model_horizon),
+                     AND horizon = ?
+                     AND json_extract(
+                             features_json,
+                             '$.observation_quality_contract'
+                         ) = 'market_tape_accepted_observation_lineage_v2'
+                     AND (
+                         model_version = ?
+                         OR json_extract(
+                             features_json, '$.forecast_source'
+                         ) = 'active_trend_snapshot'
+                         OR EXISTS (
+                             SELECT 1
+                             FROM mt_forecast_measurement_assignments assignment
+                             WHERE assignment.prediction_id = mt_predictions.prediction_id
+                               AND assignment.state IN ('reserved', 'claimed')
+                         )
+                     )""",
+                (model_horizon, active_model["model_version"]),
             ).fetchall():
                 existing_by_subject.setdefault(
                     str(prediction["subject_id"]), []
                 ).append(dict(prediction))
+            candidates: List[Dict[str, Any]] = []
             for row in rows:
                 source_observed_at = _as_datetime(row["observed_at"])
                 source_age = predicted_at - source_observed_at
@@ -2870,8 +4795,21 @@ class MarketTapeStore:
                 ):
                     skipped_duplicate += 1
                     continue
+                prior_subject_predictions = existing_by_subject.get(
+                    str(row["trend_id"]), []
+                )
+                if _subject_on_forecast_cooldown(
+                    prior_subject_predictions,
+                    predicted_at,
+                    timedelta(hours=max(0.0, horizon_hours)),
+                ):
+                    skipped_subject_cooldown += 1
+                    continue
                 features = {
                     "forecast_source": "active_trend_snapshot",
+                    "observation_quality_contract": row[
+                        "observation_quality_contract"
+                    ],
                     "source_observation_type": "trend_observation",
                     "source_observation_id": source_observation_id,
                     "source_observed_at": row["observed_at"],
@@ -2922,42 +4860,207 @@ class MarketTapeStore:
                     continue
                 probability = float(inference["probability"])
                 features["inference_diagnostics"] = inference["diagnostics"]
-                peak_hours = max(0.5, 6.0 * (1.0 - probability))
-                cursor = connection.execute(
-                    """INSERT INTO mt_predictions(
-                           subject_type, subject_id, model_version, predicted_at,
-                           horizon, probability, expected_peak_at,
-                           expected_remaining_life_hours, features_json
-                       ) VALUES('trend', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                candidates.append({
+                    "trend_id": str(row["trend_id"]),
+                    "probability": probability,
+                    "features": features,
+                    "trend_strength": float(row["trend_strength"]),
+                    "previously_forecast": bool(prior_subject_predictions),
+                })
+
+            membership_by_trend: Dict[str, List[Dict[str, Any]]] = {}
+            candidate_ids = [candidate["trend_id"] for candidate in candidates]
+            for offset in range(0, len(candidate_ids), 400):
+                chunk = candidate_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                for membership in connection.execute(
+                    f"""SELECT membership.trend_id, q.video_id, q.platform,
+                               q.external_id, q.preferred_source_id, q.hot_mode,
+                               q.due_at, q.failure_count, q.last_observed_at,
+                               q.last_error_code, v.published_at, v.title,
+                               v.caption, v.description, v.language, v.url,
+                               v.thumbnail_url, v.duration_seconds,
+                               c.external_id AS creator_external_id,
+                               c.handle AS creator_handle,
+                               c.display_name AS creator_name,
+                               c.followers AS creator_followers
+                        FROM mt_accepted_trend_memberships_v1 membership
+                        JOIN mt_poll_queue q ON q.video_id = membership.video_id
+                        JOIN mt_videos v ON v.video_id = q.video_id
+                        JOIN mt_creators c ON c.creator_id = v.creator_id
+                        WHERE membership.trend_id IN ({placeholders})
+                        ORDER BY q.failure_count, q.due_at, q.video_id""",
+                    chunk,
+                ).fetchall():
+                    payload = dict(membership)
+                    membership_by_trend.setdefault(
+                        str(payload["trend_id"]), []
+                    ).append(payload)
+
+            selected, selection_diagnostics = _select_measurement_cohort(
+                candidates,
+                membership_by_trend,
+                available_capabilities,
+                cohort_limit,
+            )
+            skipped_no_refreshable_member = int(
+                selection_diagnostics["no_refreshable_member"]
+            )
+            skipped_no_measurement_capacity = int(
+                selection_diagnostics["no_measurement_capacity"]
+            )
+            selected_by_source: Dict[str, List[Dict[str, Any]]] = {}
+            for selection in selected:
+                selected_by_source.setdefault(
+                    str(selection["source_id"]), []
+                ).append(selection)
+
+            for source_id, selections in sorted(selected_by_source.items()):
+                capability = available_capabilities[source_id]
+                unique_videos = sorted({
+                    str(selection["video_id"]) for selection in selections
+                })
+                batch_size = int(capability["refresh_batch_size"])
+                request_units = (
+                    math.ceil(len(unique_videos) / batch_size)
+                    * int(capability["request_units_per_batch"])
+                )
+                canonical_selection = [{
+                    "trend_id": str(selection["trend_id"]),
+                    "video_id": str(selection["video_id"]),
+                } for selection in sorted(
+                    selections,
+                    key=lambda value: (value["trend_id"], value["video_id"]),
+                )]
+                selection_sha256 = stable_hash(canonical_selection)
+                reservation_id = "mt-reservation-" + stable_hash({
+                    "cohort_key": cohort_key,
+                    "source_id": source_id,
+                    "selection_sha256": selection_sha256,
+                })
+                safe_capability = {
+                    key: capability[key]
+                    for key in (
+                        "source_id", "platform", "daily_request_limit",
+                        "refresh_batch_size", "request_units_per_batch",
+                        "credential_fingerprint", "available_request_units",
+                        "request_budget_date",
+                    )
+                }
+                connection.execute(
+                    """INSERT INTO mt_forecast_measurement_reservations(
+                           reservation_id, cohort_key, created_run_id, created_at,
+                           model_version, horizon, source_id, platform,
+                           window_open_at, deadline_at, usage_date,
+                           reserved_request_units, refresh_batch_size,
+                           credential_fingerprint, state, selection_sha256,
+                           capability_json
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                'reserved', ?, ?)""",
                     (
-                        row["trend_id"],
-                        active_model["model_version"],
+                        reservation_id,
+                        cohort_key,
+                        str(run_id),
                         predicted,
+                        active_model["model_version"],
                         model_horizon,
-                        probability,
-                        isoformat(predicted_at + timedelta(hours=peak_hours)),
-                        round(6.0 + 42.0 * probability, 3),
-                        json.dumps(features, sort_keys=True),
+                        source_id,
+                        capability["platform"],
+                        isoformat(window_open_at),
+                        isoformat(target_at),
+                        usage_date,
+                        request_units,
+                        batch_size,
+                        capability["credential_fingerprint"],
+                        selection_sha256,
+                        json.dumps(safe_capability, sort_keys=True),
                     ),
                 )
-                prediction_id = int(cursor.lastrowid)
-                inserted_ids.append(prediction_id)
-                existing_by_subject.setdefault(str(row["trend_id"]), []).append({
-                    "predicted_at": predicted,
-                    "features_json": json.dumps(features, sort_keys=True),
+                for selection in selections:
+                    probability = float(selection["probability"])
+                    peak_hours = max(0.5, 6.0 * (1.0 - probability))
+                    features = {
+                        **selection["features"],
+                        "forecast_cohort_key": cohort_key,
+                        "measurement_reservation_id": reservation_id,
+                        "measurement_source_id": source_id,
+                        "measurement_video_id": selection["video_id"],
+                        "measurement_window_open_at": isoformat(window_open_at),
+                        "measurement_deadline_at": isoformat(target_at),
+                    }
+                    cursor = connection.execute(
+                        """INSERT INTO mt_predictions(
+                               subject_type, subject_id, model_version,
+                               predicted_at, horizon, probability,
+                               expected_peak_at, expected_remaining_life_hours,
+                               features_json
+                           ) VALUES('trend', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            selection["trend_id"],
+                            active_model["model_version"],
+                            predicted,
+                            model_horizon,
+                            probability,
+                            isoformat(
+                                predicted_at + timedelta(hours=peak_hours)
+                            ),
+                            round(6.0 + 42.0 * probability, 3),
+                            json.dumps(features, sort_keys=True),
+                        ),
+                    )
+                    prediction_id = int(cursor.lastrowid)
+                    inserted_ids.append(prediction_id)
+                    connection.execute(
+                        """INSERT INTO mt_forecast_measurement_assignments(
+                               reservation_id, prediction_id, trend_id,
+                               video_id, state
+                           ) VALUES(?, ?, ?, ?, 'reserved')""",
+                        (
+                            reservation_id,
+                            prediction_id,
+                            selection["trend_id"],
+                            selection["video_id"],
+                        ),
+                    )
+                reservation_receipts.append({
+                    "reservation_id": reservation_id,
+                    "source_id": source_id,
+                    "platform": capability["platform"],
+                    "prediction_count": len(selections),
+                    "unique_video_count": len(unique_videos),
+                    "reserved_request_units": request_units,
+                    "selection_sha256": selection_sha256,
                 })
         queued = self.enqueue_prediction_updates(inserted_ids)
+        if candidates and not inserted_ids:
+            state = "blocked_measurement_capacity"
+            reason = "no_refreshable_member_or_request_capacity"
+        else:
+            state = "completed"
+            reason = ""
         return {
-            "state": "completed",
+            "state": state,
+            "reason": reason,
             "model_version": active_model["model_version"],
             "model_purpose": model_purpose(active_model),
             "horizon": model_horizon,
             "predicted_at": predicted,
             "predictions_added": len(inserted_ids),
+            "reservations_added": len(reservation_receipts),
+            "assignments_added": len(inserted_ids),
+            "cohort_key": cohort_key,
+            "cohort_limit": cohort_limit,
+            "cohort_interval_seconds": cohort_interval_seconds,
+            "measurement_window_open_at": isoformat(window_open_at),
+            "measurement_deadline_at": isoformat(target_at),
+            "reservations": reservation_receipts,
             "skipped_ineligible": skipped_ineligible,
             "skipped_insufficient_support": skipped_insufficient_support,
             "skipped_stale": skipped_stale,
             "skipped_duplicate": skipped_duplicate,
+            "skipped_subject_cooldown": skipped_subject_cooldown,
+            "skipped_no_refreshable_member": skipped_no_refreshable_member,
+            "skipped_no_measurement_capacity": skipped_no_measurement_capacity,
             "source_freshness_policy": {
                 "maximum_age_seconds": round(
                     source_max_age.total_seconds(), 3
@@ -2969,6 +5072,15 @@ class MarketTapeStore:
                 "future_observations_allowed": False,
                 "minimum_videos": 2,
                 "minimum_creators": 2,
+            },
+            "measurement_policy": {
+                "contract": "market_tape_forecast_measurement_reservation_v1",
+                "active_model_writer": "forecast_active_trends",
+                "prediction_without_assignment_allowed": False,
+                "maximum_cohort_size": 100,
+                "subject_cooldown_seconds": round(
+                    max(0.0, horizon_hours) * 3600.0, 3
+                ),
             },
             "abstained_out_of_distribution": len(abstentions),
             "abstention_reasons": abstention_reasons,
@@ -2990,6 +5102,10 @@ class MarketTapeStore:
             pending = [dict(row) for row in connection.execute(
                 """SELECT * FROM mt_predictions
                    WHERE outcome_json IS NULL AND predicted_at <= ?
+                     AND json_extract(
+                             features_json,
+                             '$.observation_quality_contract'
+                         ) = 'market_tape_accepted_observation_lineage_v2'
                    ORDER BY predicted_at, prediction_id""",
                 (isoformat(as_of),),
             ).fetchall()]
@@ -3006,14 +5122,22 @@ class MarketTapeStore:
             video_observations = _grouped_rows(
                 connection,
                 """SELECT video_id AS subject_id, observed_at, views, creator_followers
-                   FROM mt_market_observations WHERE video_id IN ({placeholders})
+                   FROM mt_accepted_metric_observations_v1 observation
+                   WHERE video_id IN ({placeholders})
+                     AND NOT EXISTS (
+                         SELECT 1 FROM mt_observation_quality_flags quality
+                         WHERE quality.observation_id = observation.observation_id
+                     )
                    ORDER BY video_id, observed_at, observation_id""",
                 video_ids,
             )
             trend_observations = _grouped_rows(
                 connection,
                 """SELECT trend_id AS subject_id, observed_at, state, trend_strength
-                   FROM mt_trend_observations WHERE trend_id IN ({placeholders})
+                   FROM mt_trend_observations
+                   WHERE trend_id IN ({placeholders})
+                     AND observation_quality_contract =
+                         'market_tape_accepted_observation_lineage_v2'
                    ORDER BY trend_id, observed_at, trend_observation_id""",
                 trend_ids,
             )
@@ -3222,11 +5346,22 @@ class MarketTapeStore:
     def prediction_backtest(self) -> Dict[str, Any]:
         with self.connect() as connection:
             rows = [dict(row) for row in connection.execute(
-                """SELECT subject_type, model_version, horizon, probability, outcome_json
-                   FROM mt_predictions WHERE outcome_json IS NOT NULL"""
+                """SELECT subject_type, model_version, horizon, probability,
+                          outcome_json
+                   FROM mt_predictions
+                   WHERE outcome_json IS NOT NULL
+                     AND json_extract(
+                             features_json,
+                             '$.observation_quality_contract'
+                         ) = 'market_tape_accepted_observation_lineage_v2'"""
             ).fetchall()]
             pending = int(connection.execute(
-                "SELECT COUNT(*) FROM mt_predictions WHERE outcome_json IS NULL"
+                """SELECT COUNT(*) FROM mt_predictions
+                   WHERE outcome_json IS NULL
+                     AND json_extract(
+                             features_json,
+                             '$.observation_quality_contract'
+                         ) = 'market_tape_accepted_observation_lineage_v2'"""
             ).fetchone()[0])
         grouped: Dict[Tuple[str, str, str], List[Tuple[float, int]]] = {}
         unscorable = 0
@@ -3330,13 +5465,15 @@ class MarketTapeStore:
             for model in backtest["models"]:
                 connection.execute(
                     """INSERT INTO mt_prediction_calibration(
-                           computed_at, subject_type, model_version, horizon, state,
+                           computed_at, subject_type, model_version, horizon,
+                           observation_quality_contract, state,
                            labels, positives, brier_score, brier_skill_score, log_loss,
                            expected_calibration_error, roc_auc, calibration_bins_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         computed_at, model["subject_type"], model["model_version"],
-                        model["horizon"], model["state"], model["labels"],
+                        model["horizon"], OBSERVATION_QUALITY_CONTRACT,
+                        model["state"], model["labels"],
                         model["positives"], model["brier_score"],
                         model["brier_skill_score"], model["log_loss"],
                         model["expected_calibration_error"], model["roc_auc"],
@@ -3352,8 +5489,9 @@ class MarketTapeStore:
         with self.connect() as connection:
             rows = connection.execute(
                 """SELECT * FROM mt_prediction_calibration
+                   WHERE observation_quality_contract = ?
                    ORDER BY computed_at DESC, calibration_id DESC LIMIT ?""",
-                (limit,),
+                (OBSERVATION_QUALITY_CONTRACT, limit),
             ).fetchall()
         history = []
         for row in rows:
@@ -3362,25 +5500,629 @@ class MarketTapeStore:
             history.append(item)
         return history
 
+    def enqueue_script_language_demand(
+        self,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Append one deterministic script-language demand request.
+
+        A demand's identity is deliberately narrower than its provenance. The
+        contract, normalized topic/audience/objective, immutable evidence
+        snapshot, and normalized output targets form ``demand_id``. Source
+        receipts, trend ids, and run ids remain lineage, so replaying the same
+        evidence snapshot cannot create duplicate work.
+        """
+
+        if not isinstance(payload, dict):
+            raise TypeError("script language demand payload must be an object")
+        contract = _required_script_demand_text(
+            payload.get("contract") or SCRIPT_LANGUAGE_DEMAND_CONTRACT,
+            "contract",
+            200,
+        )
+        if contract != SCRIPT_LANGUAGE_DEMAND_CONTRACT:
+            raise ValueError(
+                f"contract must be {SCRIPT_LANGUAGE_DEMAND_CONTRACT}"
+            )
+        topic = _required_script_demand_text(payload.get("topic"), "topic", 500)
+        audience = _required_script_demand_text(
+            payload.get("audience"), "audience", 1000
+        )
+        objective = _required_script_demand_text(
+            payload.get("objective"), "objective", 1000
+        )
+        snapshot_id = _required_script_demand_text(
+            payload.get("snapshot_id"), "snapshot_id", 500
+        )
+        source_service = _required_script_demand_text(
+            payload.get("source_service"), "source_service", 200
+        )
+        source_receipt_id = _required_script_demand_text(
+            payload.get("source_receipt_id"), "source_receipt_id", 500
+        )
+        targets = _normalize_script_demand_targets(payload.get("targets"))
+        if not isinstance(targets, dict):
+            raise ValueError("targets must be an object")
+        for field in ("verified_transcripts", "distinct_creators"):
+            try:
+                target_value = int(targets.get(field))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"targets.{field} must be a positive integer") from exc
+            if target_value < 1:
+                raise ValueError(f"targets.{field} must be a positive integer")
+            targets[field] = target_value
+        if "observed_views" in targets:
+            try:
+                observed_views = int(targets["observed_views"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "targets.observed_views must be a positive integer"
+                ) from exc
+            if observed_views < 1:
+                raise ValueError(
+                    "targets.observed_views must be a positive integer"
+                )
+            targets["observed_views"] = observed_views
+        evidence_trend_id = " ".join(
+            str(payload.get("evidence_trend_id") or "").split()
+        )[:500]
+        collection_run_id = " ".join(
+            str(payload.get("collection_run_id") or "").split()
+        )[:500]
+        transcript_run_id = " ".join(
+            str(payload.get("transcript_run_id") or "").split()
+        )[:500]
+        requested_at = _script_demand_timestamp(
+            payload.get("requested_at") or payload.get("created_at") or utc_now()
+        )
+        identity = {
+            "contract": contract,
+            "topic": _normalize_script_demand_identity_text(topic),
+            "audience": _normalize_script_demand_identity_text(audience),
+            "objective": _normalize_script_demand_identity_text(objective),
+            "snapshot_id": snapshot_id,
+            "targets": targets,
+        }
+        demand_id = f"script-language-demand:{stable_hash(identity)}"
+        request_payload = dict(payload)
+        request_payload.update({
+            "contract": contract,
+            "topic": topic,
+            "audience": audience,
+            "objective": objective,
+            "snapshot_id": snapshot_id,
+            "targets": targets,
+            "source_service": source_service,
+            "source_receipt_id": source_receipt_id,
+            "evidence_trend_id": evidence_trend_id,
+            "collection_run_id": collection_run_id,
+            "transcript_run_id": transcript_run_id,
+        })
+        request_hash_payload = dict(request_payload)
+        request_hash_payload.pop("requested_at", None)
+        request_hash_payload.pop("created_at", None)
+        request_sha256 = stable_hash(request_hash_payload)
+        event_id = _script_language_demand_event_id(
+            demand_id, "requested", 0
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO mt_script_language_demand_events(
+                       event_id, demand_id, event_type, attempt_no,
+                       request_sha256, source_service, source_receipt_id,
+                       topic, audience, objective, evidence_trend_id,
+                       snapshot_id, lease_until, collection_run_id,
+                       transcript_run_id, payload_json, created_at
+                   ) VALUES(?, ?, 'requested', 0, ?, ?, ?, ?, ?, ?, ?, ?,
+                            NULL, ?, ?, ?, ?)
+                   ON CONFLICT(demand_id, event_type, attempt_no) DO NOTHING""",
+                (
+                    event_id,
+                    demand_id,
+                    request_sha256,
+                    source_service,
+                    source_receipt_id,
+                    topic,
+                    audience,
+                    objective,
+                    evidence_trend_id,
+                    snapshot_id,
+                    collection_run_id,
+                    transcript_run_id,
+                    json.dumps(request_payload, sort_keys=True, default=str),
+                    requested_at,
+                ),
+            )
+            result = _script_language_demand_from_connection(
+                connection, demand_id, requested_at
+            )
+            inserted = bool(cursor.rowcount == 1)
+        if result is None:
+            raise RuntimeError("script language demand enqueue was not durable")
+        result["enqueued"] = inserted
+        result["deduplicated"] = not result["enqueued"]
+        result["idempotent"] = result["deduplicated"]
+        return result
+
+    def script_language_demand(
+        self,
+        demand_id: str,
+        *,
+        as_of: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one demand and its complete append-only event lineage."""
+
+        canonical_id = str(demand_id or "").strip()
+        if not canonical_id:
+            raise ValueError("demand_id is required")
+        measured_at = _script_demand_timestamp(as_of or utc_now())
+        with self.connect() as connection:
+            return _script_language_demand_from_connection(
+                connection, canonical_id, measured_at
+            )
+
+    def list_script_language_demands(
+        self,
+        limit: int = 100,
+        state: Optional[str] = None,
+        *,
+        as_of: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """List bounded demand summaries with full event lineage."""
+
+        normalized_state = str(state or "").strip().casefold()
+        allowed_states = SCRIPT_LANGUAGE_DEMAND_EVENT_TYPES
+        if normalized_state and normalized_state not in allowed_states:
+            raise ValueError(
+                "state must be requested, claimed, completed, partial, "
+                "blocked, or failed"
+            )
+        maximum = min(500, max(1, int(limit)))
+        measured_at = _script_demand_timestamp(as_of or utc_now())
+        with self.connect() as connection:
+            demand_ids = [str(row["demand_id"]) for row in connection.execute(
+                """WITH terminal AS (
+                       SELECT demand_id, event_type,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY demand_id
+                                  ORDER BY attempt_no DESC, created_at DESC,
+                                           event_id DESC
+                              ) AS row_number
+                       FROM mt_script_language_demand_events
+                       WHERE event_type IN (
+                           'completed', 'partial', 'blocked', 'failed'
+                       )
+                   ), latest_claim AS (
+                       SELECT demand_id, lease_until,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY demand_id
+                                  ORDER BY attempt_no DESC, created_at DESC,
+                                           event_id DESC
+                              ) AS row_number
+                       FROM mt_script_language_demand_events
+                       WHERE event_type = 'claimed'
+                   ), current AS (
+                       SELECT request.demand_id, request.created_at,
+                              CASE
+                                  WHEN terminal.event_type IS NOT NULL
+                                      THEN terminal.event_type
+                                  WHEN latest_claim.lease_until > ?
+                                      THEN 'claimed'
+                                  ELSE 'requested'
+                              END AS state
+                       FROM mt_script_language_demand_events request
+                       LEFT JOIN terminal
+                         ON terminal.demand_id = request.demand_id
+                        AND terminal.row_number = 1
+                       LEFT JOIN latest_claim
+                         ON latest_claim.demand_id = request.demand_id
+                        AND latest_claim.row_number = 1
+                       WHERE request.event_type = 'requested'
+                   )
+                   SELECT demand_id
+                   FROM current
+                   WHERE (? = '' OR state = ?)
+                   ORDER BY created_at DESC, demand_id DESC
+                   LIMIT ?""",
+                (
+                    measured_at,
+                    normalized_state,
+                    normalized_state,
+                    maximum,
+                ),
+            ).fetchall()]
+            return [
+                demand
+                for demand_id in demand_ids
+                if (
+                    demand := _script_language_demand_from_connection(
+                        connection, demand_id, measured_at
+                    )
+                ) is not None
+            ]
+
+    def claim_next_script_language_demand(
+        self,
+        lease_seconds: int = 300,
+        *,
+        as_of: Optional[datetime] = None,
+        source_service: str = "script-language-demand-worker",
+        source_receipt_id: str = "",
+        collection_run_id: str = "",
+        transcript_run_id: str = "",
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim the oldest available demand.
+
+        An expired claim is never mutated. It becomes historical lineage and
+        the reclaim is appended with the next attempt number.
+        """
+
+        ttl = max(1, min(86400, int(lease_seconds)))
+        claimed_at = _as_datetime(as_of or utc_now()).astimezone(timezone.utc)
+        claimed_at_iso = isoformat(claimed_at)
+        lease_until = isoformat(claimed_at + timedelta(seconds=ttl))
+        claim_context = dict(payload or {})
+        claim_source_service = " ".join(str(
+            source_service
+            or claim_context.get("source_service")
+            or "script-language-demand-worker"
+        ).split())[:200]
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            request = connection.execute(
+                """SELECT request.*
+                   FROM mt_script_language_demand_events request
+                   WHERE request.event_type = 'requested'
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM mt_script_language_demand_events terminal
+                         WHERE terminal.demand_id = request.demand_id
+                           AND terminal.event_type IN (
+                               'completed', 'partial', 'blocked', 'failed'
+                           )
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM mt_script_language_demand_events active_claim
+                         WHERE active_claim.demand_id = request.demand_id
+                           AND active_claim.event_type = 'claimed'
+                           AND active_claim.lease_until > ?
+                     )
+                   ORDER BY request.created_at, request.demand_id
+                   LIMIT 1""",
+                (claimed_at_iso,),
+            ).fetchone()
+            if request is None:
+                return None
+            demand_id = str(request["demand_id"])
+            prior_claim = connection.execute(
+                """SELECT *
+                   FROM mt_script_language_demand_events
+                   WHERE demand_id = ? AND event_type = 'claimed'
+                   ORDER BY attempt_no DESC, created_at DESC, event_id DESC
+                   LIMIT 1""",
+                (demand_id,),
+            ).fetchone()
+            attempt_no = (
+                int(prior_claim["attempt_no"]) + 1 if prior_claim else 1
+            )
+            claim_source_receipt = " ".join(str(
+                source_receipt_id
+                or claim_context.get("source_receipt_id")
+                or f"claim:{demand_id}:{attempt_no}"
+            ).split())[:500]
+            event_payload = {
+                "contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
+                "event_type": "claimed",
+                "lease_seconds": ttl,
+                "reclaimed_expired_lease": bool(prior_claim),
+                "prior_attempt_no": (
+                    int(prior_claim["attempt_no"]) if prior_claim else None
+                ),
+                "claim": claim_context,
+            }
+            event_id = _script_language_demand_event_id(
+                demand_id, "claimed", attempt_no
+            )
+            connection.execute(
+                """INSERT INTO mt_script_language_demand_events(
+                       event_id, demand_id, event_type, attempt_no,
+                       request_sha256, source_service, source_receipt_id,
+                       topic, audience, objective, evidence_trend_id,
+                       snapshot_id, lease_until, collection_run_id,
+                       transcript_run_id, payload_json, created_at
+                   ) VALUES(?, ?, 'claimed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?)""",
+                (
+                    event_id,
+                    demand_id,
+                    attempt_no,
+                    request["request_sha256"],
+                    claim_source_service,
+                    claim_source_receipt,
+                    request["topic"],
+                    request["audience"],
+                    request["objective"],
+                    request["evidence_trend_id"],
+                    request["snapshot_id"],
+                    lease_until,
+                    str(collection_run_id or request["collection_run_id"] or "")[:500],
+                    str(transcript_run_id or request["transcript_run_id"] or "")[:500],
+                    json.dumps(event_payload, sort_keys=True, default=str),
+                    claimed_at_iso,
+                ),
+            )
+            return _script_language_demand_from_connection(
+                connection, demand_id, claimed_at_iso
+            )
+
+    def finish_script_language_demand(
+        self,
+        demand_id: str,
+        attempt_no: int,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        as_of: Optional[datetime] = None,
+        source_service: str = "",
+        source_receipt_id: str = "",
+        collection_run_id: str = "",
+        transcript_run_id: str = "",
+    ) -> Dict[str, Any]:
+        """Append one idempotent terminal event for the active lease."""
+
+        canonical_id = str(demand_id or "").strip()
+        if not canonical_id:
+            raise ValueError("demand_id is required")
+        canonical_event_type = str(event_type or "").strip().casefold()
+        if canonical_event_type not in SCRIPT_LANGUAGE_DEMAND_TERMINAL_EVENTS:
+            raise ValueError(
+                "event_type must be completed, partial, blocked, or failed"
+            )
+        canonical_attempt = int(attempt_no)
+        if canonical_attempt < 1:
+            raise ValueError("attempt_no must be at least 1")
+        finished_at = _script_demand_timestamp(as_of or utc_now())
+        terminal_payload = dict(payload or {})
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT *
+                   FROM mt_script_language_demand_events
+                   WHERE demand_id = ?
+                     AND event_type IN (
+                         'completed', 'partial', 'blocked', 'failed'
+                     )
+                   ORDER BY attempt_no DESC, created_at DESC, event_id DESC
+                   LIMIT 1""",
+                (canonical_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["event_type"]) == canonical_event_type
+                    and int(existing["attempt_no"]) == canonical_attempt
+                ):
+                    result = _script_language_demand_from_connection(
+                        connection, canonical_id, finished_at
+                    )
+                    if result is None:
+                        raise RuntimeError(
+                            "terminal script language demand lost its request"
+                        )
+                    result["appended"] = False
+                    result["deduplicated"] = True
+                    return result
+                raise ValueError("script language demand is already terminal")
+            claim = connection.execute(
+                """SELECT *
+                   FROM mt_script_language_demand_events
+                   WHERE demand_id = ? AND event_type = 'claimed'
+                   ORDER BY attempt_no DESC, created_at DESC, event_id DESC
+                   LIMIT 1""",
+                (canonical_id,),
+            ).fetchone()
+            if claim is None:
+                raise ValueError("script language demand has not been claimed")
+            if int(claim["attempt_no"]) != canonical_attempt:
+                raise ValueError("attempt_no does not own the latest claim")
+            if not claim["lease_until"] or claim["lease_until"] <= finished_at:
+                raise ValueError("script language demand claim lease has expired")
+            event_payload = {
+                "contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
+                "event_type": canonical_event_type,
+                "result": terminal_payload,
+            }
+            event_id = _script_language_demand_event_id(
+                canonical_id, canonical_event_type, canonical_attempt
+            )
+            terminal_source_service = " ".join(str(
+                source_service or claim["source_service"]
+            ).split())[:200]
+            terminal_source_receipt = " ".join(str(
+                source_receipt_id
+                or f"terminal:{canonical_id}:{canonical_attempt}:"
+                   f"{canonical_event_type}"
+            ).split())[:500]
+            cursor = connection.execute(
+                """INSERT INTO mt_script_language_demand_events(
+                       event_id, demand_id, event_type, attempt_no,
+                       request_sha256, source_service, source_receipt_id,
+                       topic, audience, objective, evidence_trend_id,
+                       snapshot_id, lease_until, collection_run_id,
+                       transcript_run_id, payload_json, created_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?,
+                            ?, ?)
+                   ON CONFLICT(demand_id, event_type, attempt_no) DO NOTHING""",
+                (
+                    event_id,
+                    canonical_id,
+                    canonical_event_type,
+                    canonical_attempt,
+                    claim["request_sha256"],
+                    terminal_source_service,
+                    terminal_source_receipt,
+                    claim["topic"],
+                    claim["audience"],
+                    claim["objective"],
+                    claim["evidence_trend_id"],
+                    claim["snapshot_id"],
+                    str(collection_run_id or claim["collection_run_id"] or "")[:500],
+                    str(transcript_run_id or claim["transcript_run_id"] or "")[:500],
+                    json.dumps(event_payload, sort_keys=True, default=str),
+                    finished_at,
+                ),
+            )
+            result = _script_language_demand_from_connection(
+                connection, canonical_id, finished_at
+            )
+            appended = bool(cursor.rowcount == 1)
+        if result is None:
+            raise RuntimeError("script language demand terminal event was not durable")
+        result["appended"] = appended
+        result["deduplicated"] = not result["appended"]
+        return result
+
     def status(self) -> Dict[str, Any]:
         today = datetime.now(timezone.utc).date().isoformat()
         with self.connect() as connection:
+            schema_row = connection.execute(
+                "SELECT value FROM mt_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            database_schema_version = int(schema_row[0]) if schema_row else 0
             totals = {
                 "creators": connection.execute("SELECT COUNT(*) FROM mt_creators").fetchone()[0],
                 "videos": connection.execute("SELECT COUNT(*) FROM mt_videos").fetchone()[0],
                 "observations": connection.execute("SELECT COUNT(*) FROM mt_market_observations").fetchone()[0],
+                "observation_quality_flags": connection.execute(
+                    "SELECT COUNT(*) FROM mt_observation_quality_flags"
+                ).fetchone()[0],
+                "analytics_eligible_observations": connection.execute(
+                    "SELECT COUNT(*) FROM mt_accepted_metric_observations_v1"
+                ).fetchone()[0],
+                "accepted_full_observations": connection.execute(
+                    "SELECT COUNT(*) FROM mt_accepted_full_evidence_v1"
+                ).fetchone()[0],
+                "accepted_metric_scope_evidence_rows": connection.execute(
+                    """SELECT COUNT(*)
+                       FROM mt_accepted_observation_evidence evidence
+                       WHERE evidence.contract = ?
+                         AND evidence.evidence_scope = 'metric_only'
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM mt_observation_quality_flags quality
+                             WHERE quality.observation_id =
+                                   evidence.observation_id
+                         )""",
+                    (ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,),
+                ).fetchone()[0],
+                "metric_observations_without_full_projection": connection.execute(
+                    """SELECT COUNT(*)
+                       FROM mt_accepted_metric_observations_v1 observation
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM mt_accepted_full_evidence_v1 evidence
+                           WHERE evidence.observation_id =
+                                 observation.observation_id
+                       )"""
+                ).fetchone()[0],
+                "metric_videos_without_full_projection": connection.execute(
+                    """SELECT COUNT(*) FROM (
+                           SELECT DISTINCT observation.video_id
+                           FROM mt_accepted_metric_observations_v1 observation
+                           WHERE NOT EXISTS (
+                               SELECT 1
+                               FROM mt_accepted_full_evidence_v1 evidence
+                               WHERE evidence.video_id = observation.video_id
+                           )
+                       )"""
+                ).fetchone()[0],
                 "trends": connection.execute("SELECT COUNT(*) FROM mt_trends").fetchone()[0],
                 "trend_observations": connection.execute("SELECT COUNT(*) FROM mt_trend_observations").fetchone()[0],
+                "quality_gated_trend_observations": connection.execute(
+                    """SELECT COUNT(*) FROM mt_trend_observations
+                       WHERE observation_quality_contract =
+                           'market_tape_accepted_observation_lineage_v2'"""
+                ).fetchone()[0],
+                "trend_memberships": connection.execute(
+                    "SELECT COUNT(*) FROM mt_trend_memberships"
+                ).fetchone()[0],
+                "accepted_trend_memberships": connection.execute(
+                    "SELECT COUNT(*) FROM mt_accepted_trend_memberships_v1"
+                ).fetchone()[0],
+                "trend_membership_lineage_gap": connection.execute(
+                    """SELECT
+                           (SELECT COUNT(*) FROM mt_trend_memberships) -
+                           (SELECT COUNT(*)
+                            FROM mt_accepted_trend_memberships_v1)"""
+                ).fetchone()[0],
                 "predictions": connection.execute("SELECT COUNT(*) FROM mt_predictions").fetchone()[0],
+                "quality_gated_predictions": connection.execute(
+                    """SELECT COUNT(*) FROM mt_predictions
+                       WHERE json_extract(
+                               features_json,
+                               '$.observation_quality_contract'
+                           ) = 'market_tape_accepted_observation_lineage_v2'"""
+                ).fetchone()[0],
                 "query_attempts": connection.execute("SELECT COUNT(*) FROM mt_query_attempts").fetchone()[0],
                 "adaptive_query_admissions": connection.execute(
                     "SELECT COUNT(*) FROM mt_adaptive_query_admissions"
                 ).fetchone()[0],
+                "script_language_demand_events": connection.execute(
+                    "SELECT COUNT(*) FROM mt_script_language_demand_events"
+                ).fetchone()[0],
                 "due_polls": connection.execute("SELECT COUNT(*) FROM mt_poll_queue WHERE due_at <= ?", (isoformat(utc_now()),)).fetchone()[0],
             }
+            demand_state_rows = connection.execute(
+                """WITH terminal AS (
+                       SELECT demand_id, event_type,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY demand_id
+                                  ORDER BY attempt_no DESC, created_at DESC,
+                                           event_id DESC
+                              ) AS row_number
+                       FROM mt_script_language_demand_events
+                       WHERE event_type IN (
+                           'completed', 'partial', 'blocked', 'failed'
+                       )
+                   ), latest_claim AS (
+                       SELECT demand_id, lease_until,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY demand_id
+                                  ORDER BY attempt_no DESC, created_at DESC,
+                                           event_id DESC
+                              ) AS row_number
+                       FROM mt_script_language_demand_events
+                       WHERE event_type = 'claimed'
+                   ), current AS (
+                       SELECT request.demand_id,
+                              CASE
+                                  WHEN terminal.event_type IS NOT NULL
+                                      THEN terminal.event_type
+                                  WHEN latest_claim.lease_until > ?
+                                      THEN 'claimed'
+                                  ELSE 'requested'
+                              END AS state
+                       FROM mt_script_language_demand_events request
+                       LEFT JOIN terminal
+                         ON terminal.demand_id = request.demand_id
+                        AND terminal.row_number = 1
+                       LEFT JOIN latest_claim
+                         ON latest_claim.demand_id = request.demand_id
+                        AND latest_claim.row_number = 1
+                       WHERE request.event_type = 'requested'
+                   )
+                   SELECT state, COUNT(*) AS count
+                   FROM current GROUP BY state ORDER BY state""",
+                (isoformat(utc_now()),),
+            ).fetchall()
             platform_rows = connection.execute(
-                """SELECT platform, COUNT(*) AS count FROM mt_videos
-                   WHERE substr(first_seen_at, 1, 10) = ? GROUP BY platform""",
+                """SELECT observation.platform,
+                          COUNT(DISTINCT observation.video_id) AS count
+                   FROM mt_accepted_full_evidence_v1 evidence
+                   JOIN mt_accepted_metric_observations_v1 observation
+                     ON observation.observation_id = evidence.observation_id
+                   WHERE substr(evidence.accepted_at, 1, 10) = ?
+                   GROUP BY observation.platform""",
                 (today,),
             ).fetchall()
             run = connection.execute(
@@ -3413,6 +6155,12 @@ class MarketTapeStore:
                 "archive_readable",
                 "latest_artifact_at",
                 "latest_observed_at",
+                "archive_age_seconds",
+                "artifact_age_seconds",
+                "archive_freshness_basis",
+                "archive_fresh",
+                "archive_stale_after_seconds",
+                "scheduler",
                 "watermark_advanced",
                 "new_unique_count",
                 "new_observation_count",
@@ -3427,13 +6175,30 @@ class MarketTapeStore:
             for platform in self.config.platforms
         }
         acquired = sum(by_platform.values())
+        schema_parity = database_schema_version == SCHEMA_VERSION
+        demand_by_state = {
+            str(row["state"]): int(row["count"]) for row in demand_state_rows
+        }
         return {
             "schema_version": SCHEMA_VERSION,
+            "code_schema_version": SCHEMA_VERSION,
+            "database_schema_version": database_schema_version,
+            "schema_parity": schema_parity,
             "service": "social-market-tape",
-            "state": "running" if run and run["state"] == "running" else "ready",
+            "state": (
+                "degraded_schema_mismatch"
+                if not schema_parity
+                else "running" if run and run["state"] == "running" else "ready"
+            ),
             "checked_at": isoformat(utc_now()),
             "daemon": self.daemon_health(),
             "database_path": str(self.config.db_path),
+            "script_language_demands": {
+                "contract": SCRIPT_LANGUAGE_DEMAND_CONTRACT,
+                "append_only": True,
+                "total": sum(demand_by_state.values()),
+                "by_state": demand_by_state,
+            },
             "daily": {
                 "date": today,
                 "target": self.config.daily_unique_target,
@@ -3484,31 +6249,54 @@ class MarketTapeStore:
         }
 
     def list_videos(self, limit: int = 100, platform: Optional[str] = None) -> List[Dict[str, Any]]:
-        query = """SELECT v.*, o.views, o.likes, o.comments, o.shares, o.saves,
-                          o.view_velocity, o.view_acceleration, o.relative_strength, o.observed_at
-                   FROM mt_videos v
-                   LEFT JOIN mt_market_observations o ON o.observation_id = (
-                       SELECT observation_id FROM mt_market_observations
-                       WHERE video_id = v.video_id ORDER BY observed_at DESC LIMIT 1
-                   )"""
+        query = """WITH ranked AS (
+                       SELECT observation.*,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY observation.video_id
+                                  ORDER BY observation.observed_at DESC,
+                                           observation.observation_id DESC
+                              ) AS row_number
+                       FROM mt_accepted_metric_observations_v1 observation
+                       JOIN mt_accepted_full_evidence_v1 evidence
+                         ON evidence.observation_id = observation.observation_id
+                   )
+                   SELECT video.video_id, video.platform, video.external_id,
+                          video.creator_id, evidence.published_at,
+                          video.first_seen_at, video.last_seen_at,
+                          evidence.title, evidence.caption,
+                          evidence.description, evidence.language, evidence.url,
+                          evidence.thumbnail_url, evidence.media_type,
+                          evidence.duration_seconds, video.source_first_seen,
+                          latest.views, latest.likes, latest.comments,
+                          latest.shares, latest.saves, latest.view_velocity,
+                          latest.view_acceleration, latest.relative_strength,
+                          latest.observed_at
+                   FROM ranked latest
+                   JOIN mt_videos video ON video.video_id = latest.video_id
+                   JOIN mt_accepted_full_evidence_v1 evidence
+                     ON evidence.observation_id = latest.observation_id
+                   WHERE latest.row_number = 1"""
         params: List[Any] = []
         if platform:
-            query += " WHERE v.platform = ?"
+            query += " AND video.platform = ?"
             params.append(platform)
-        query += " ORDER BY v.last_seen_at DESC LIMIT ?"
+        query += " ORDER BY latest.observed_at DESC LIMIT ?"
         params.append(min(max(1, limit), 1000))
         with self.connect() as connection:
             return [dict(row) for row in connection.execute(query, params).fetchall()]
 
     def list_trends(self, limit: int = 100, state: Optional[str] = None) -> List[Dict[str, Any]]:
         query = """SELECT t.*, o.* FROM mt_trends t
-                   LEFT JOIN mt_trend_observations o ON o.trend_observation_id = (
+                   JOIN mt_trend_observations o ON o.trend_observation_id = (
                        SELECT trend_observation_id FROM mt_trend_observations
-                       WHERE trend_id = t.trend_id ORDER BY observed_at DESC LIMIT 1
+                       WHERE trend_id = t.trend_id
+                         AND observation_quality_contract =
+                             'market_tape_accepted_observation_lineage_v2'
+                       ORDER BY observed_at DESC, trend_observation_id DESC LIMIT 1
                    )"""
         params: List[Any] = []
         if state:
-            query += " WHERE t.status = ?"
+            query += " WHERE o.state = ?"
             params.append(state)
         query += " ORDER BY COALESCE(o.trend_strength, 0) DESC, t.last_seen_at DESC LIMIT ?"
         params.append(min(max(1, limit), 1000))
@@ -3555,29 +6343,28 @@ class MarketTapeStore:
                                   PARTITION BY observation.video_id
                                   ORDER BY observation.observed_at DESC, observation.observation_id DESC
                               ) AS row_number
-                       FROM mt_market_observations observation
+                       FROM mt_accepted_metric_observations_v1 observation
+                       JOIN mt_accepted_full_evidence_v1 accepted
+                         ON accepted.observation_id = observation.observation_id
                    ), observation_counts AS (
                        SELECT video_id, COUNT(*) AS observation_count
-                       FROM mt_market_observations GROUP BY video_id
+                       FROM mt_accepted_metric_observations_v1 observation
+                       GROUP BY video_id
                    )
-                   SELECT video.video_id, video.creator_id, video.platform, video.published_at,
-                          video.title, video.caption, video.description, video.url,
+                   SELECT latest.video_id, latest.creator_id, latest.platform,
+                          accepted.published_at, accepted.title,
+                          accepted.caption, accepted.description, accepted.url,
                           latest.observed_at, latest.views, latest.likes, latest.comments,
                           latest.shares, latest.view_velocity,
-                          genome.hashtags_json, observation_counts.observation_count,
-                          COALESCE((
-                              SELECT json_group_array(attribution.query)
-                              FROM (
-                                  SELECT DISTINCT query
-                                  FROM mt_discovery_attributions
-                                  WHERE video_id = video.video_id AND query != ''
-                              ) attribution
-                          ), '[]') AS discovery_queries_json
+                          accepted.hashtags_json,
+                          observation_counts.observation_count,
+                          accepted.discovery_queries_json
                    FROM latest
-                   JOIN mt_videos video ON video.video_id = latest.video_id
                    JOIN observation_counts ON observation_counts.video_id = latest.video_id
-                   LEFT JOIN mt_content_genomes genome ON genome.video_id = video.video_id
-                   WHERE latest.row_number = 1 AND video.published_at IS NOT NULL
+                   JOIN mt_accepted_full_evidence_v1 accepted
+                     ON accepted.observation_id = latest.observation_id
+                   WHERE latest.row_number = 1
+                     AND accepted.published_at IS NOT NULL
                    ORDER BY latest.observed_at DESC LIMIT 50000"""
             ).fetchall()]
 
@@ -3609,10 +6396,14 @@ class MarketTapeStore:
     def list_predictions(
         self, limit: int = 100, subject_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        query = "SELECT * FROM mt_predictions"
+        query = """SELECT * FROM mt_predictions
+                   WHERE json_extract(
+                           features_json,
+                           '$.observation_quality_contract'
+                       ) = 'market_tape_accepted_observation_lineage_v2'"""
         params: List[Any] = []
         if subject_type:
-            query += " WHERE subject_type = ?"
+            query += " AND subject_type = ?"
             params.append(subject_type)
         query += " ORDER BY predicted_at DESC, prediction_id DESC LIMIT ?"
         params.append(min(max(1, limit), 1000))
@@ -3724,6 +6515,8 @@ class MarketTapeStore:
                          FROM mt_trend_observations current
                          WHERE current.trend_id = trend.trend_id
                            AND current.observed_at >= :cutoff
+                           AND current.observation_quality_contract =
+                               'market_tape_accepted_observation_lineage_v2'
                          ORDER BY current.observed_at DESC,
                                   current.trend_observation_id DESC
                          LIMIT 1
@@ -3777,6 +6570,8 @@ class MarketTapeStore:
                          FROM mt_trend_observations current
                          WHERE current.trend_id = trend.trend_id
                            AND current.observed_at >= ?
+                           AND current.observation_quality_contract =
+                               'market_tape_accepted_observation_lineage_v2'
                          ORDER BY current.observed_at DESC,
                                   current.trend_observation_id DESC
                          LIMIT 1
@@ -3789,6 +6584,11 @@ class MarketTapeStore:
                            AND current.subject_id = trend.trend_id
                            AND current.model_version = ?
                            AND current.horizon = ?
+                           AND json_extract(
+                                   current.features_json,
+                                   '$.observation_quality_contract'
+                               ) =
+                                   'market_tape_accepted_observation_lineage_v2'
                            AND current.predicted_at >= ?
                            AND current.predicted_at <= ?
                          ORDER BY current.predicted_at DESC,
@@ -3796,6 +6596,8 @@ class MarketTapeStore:
                          LIMIT 1
                      )
                    WHERE observation.index_version = ?
+                     AND observation.observation_quality_contract =
+                         'market_tape_accepted_observation_lineage_v2'
                      AND lower(trend.trend_type) != 'format'
                      AND lower(observation.state) IN (
                          'discovering', 'emerging', 'breakout', 'recurring'
@@ -4033,9 +6835,30 @@ class MarketTapeStore:
                 placeholders = ",".join("?" for _ in chunk)
                 for row in connection.execute(
                     f"""SELECT membership.trend_id, membership.video_id,
-                                video.title, video.caption, video.description
-                         FROM mt_trend_memberships membership
-                         JOIN mt_videos video ON video.video_id = membership.video_id
+                                evidence.title, evidence.caption,
+                                evidence.description
+                         FROM mt_accepted_trend_memberships_v1 membership
+                         JOIN mt_trend_membership_lineage lineage
+                           ON lineage.trend_id = membership.trend_id
+                          AND lineage.video_id = membership.video_id
+                          AND lineage.observation_id = (
+                              SELECT current_lineage.observation_id
+                              FROM mt_trend_membership_lineage current_lineage
+                              JOIN mt_accepted_full_evidence_v1 current_evidence
+                                ON current_evidence.observation_id =
+                                   current_lineage.observation_id
+                              WHERE current_lineage.trend_id =
+                                    membership.trend_id
+                                AND current_lineage.video_id =
+                                    membership.video_id
+                                AND current_lineage.contract =
+                                    'market_tape_accepted_observation_evidence_v1'
+                              ORDER BY current_lineage.linked_at DESC,
+                                       current_lineage.observation_id DESC
+                              LIMIT 1
+                          )
+                         JOIN mt_accepted_full_evidence_v1 evidence
+                           ON evidence.observation_id = lineage.observation_id
                          WHERE membership.trend_id IN ({placeholders})
                          ORDER BY membership.trend_id, membership.video_id""",
                     chunk,
@@ -4211,22 +7034,49 @@ class MarketTapeStore:
                 placeholders = ",".join("?" for _ in chunk)
                 rows = connection.execute(
                     f"""SELECT membership.trend_id, video.video_id,
-                                video.platform, video.external_id, video.title,
-                                video.caption, video.url, video.published_at,
+                                video.platform, video.external_id,
+                                evidence.title, evidence.caption, evidence.url,
+                                evidence.published_at,
                                 creator.handle AS creator_handle,
                                 observation.observed_at, observation.views,
                                 observation.likes, observation.comments,
                                 observation.shares, observation.view_velocity,
                                 observation.view_acceleration,
                                 observation.relative_strength
-                         FROM mt_trend_memberships membership
+                         FROM mt_accepted_trend_memberships_v1 membership
+                         JOIN mt_trend_membership_lineage lineage
+                           ON lineage.trend_id = membership.trend_id
+                          AND lineage.video_id = membership.video_id
+                          AND lineage.observation_id = (
+                              SELECT current_lineage.observation_id
+                              FROM mt_trend_membership_lineage current_lineage
+                              JOIN mt_accepted_full_evidence_v1 current_evidence
+                                ON current_evidence.observation_id =
+                                   current_lineage.observation_id
+                              WHERE current_lineage.trend_id =
+                                    membership.trend_id
+                                AND current_lineage.video_id =
+                                    membership.video_id
+                                AND current_lineage.contract =
+                                    'market_tape_accepted_observation_evidence_v1'
+                              ORDER BY current_lineage.linked_at DESC,
+                                       current_lineage.observation_id DESC
+                              LIMIT 1
+                          )
                          JOIN mt_videos video ON video.video_id = membership.video_id
                          JOIN mt_creators creator ON creator.creator_id = video.creator_id
-                         LEFT JOIN mt_market_observations observation
+                         JOIN mt_accepted_full_evidence_v1 evidence
+                           ON evidence.observation_id = lineage.observation_id
+                         LEFT JOIN mt_accepted_metric_observations_v1 observation
                            ON observation.observation_id = (
                                SELECT current.observation_id
-                               FROM mt_market_observations current
+                               FROM mt_accepted_metric_observations_v1 current
                                WHERE current.video_id = video.video_id
+                                 AND NOT EXISTS (
+                                     SELECT 1
+                                     FROM mt_observation_quality_flags quality
+                                     WHERE quality.observation_id = current.observation_id
+                                 )
                                ORDER BY current.observed_at DESC,
                                         current.observation_id DESC
                                LIMIT 1
@@ -4279,7 +7129,8 @@ class MarketTapeStore:
         query = """SELECT observation_id, observed_at, video_id, creator_id, platform,
                           views, likes, comments, shares, view_velocity, view_acceleration,
                           relative_strength
-                   FROM mt_market_observations WHERE observed_at >= ?"""
+                   FROM mt_accepted_metric_observations_v1 observation
+                   WHERE observed_at >= ?"""
         params: List[Any] = [start]
         if platform:
             query += " AND platform = ?"
@@ -4356,6 +7207,199 @@ class MarketTapeStore:
         if "?" in opening:
             return "question"
         return "statement"
+
+
+def _required_script_demand_text(
+    value: Any,
+    field: str,
+    maximum_length: int,
+) -> str:
+    normalized = " ".join(str(value or "").split())
+    if not normalized:
+        raise ValueError(f"{field} is required")
+    return normalized[:maximum_length]
+
+
+def _normalize_script_demand_identity_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _normalize_script_demand_targets(value: Any) -> Any:
+    """Canonicalize targets as a set while retaining structured settings."""
+
+    if value in (None, ""):
+        return []
+    if isinstance(value, dict):
+        return _normalize_script_demand_target_value(value)
+    raw_targets = value if isinstance(value, (list, tuple, set)) else [value]
+    canonical: List[Any] = []
+    for target in raw_targets:
+        normalized = _normalize_script_demand_target_value(target)
+        if normalized in (None, "", [], {}):
+            continue
+        canonical.append(normalized)
+    unique = {
+        json.dumps(item, sort_keys=True, separators=(",", ":"), default=str): item
+        for item in canonical
+    }
+    return [unique[key] for key in sorted(unique)]
+
+
+def _normalize_script_demand_target_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key).strip().casefold(): _normalize_script_demand_target_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, set)):
+        normalized = [
+            _normalize_script_demand_target_value(item) for item in value
+        ]
+        unique = {
+            json.dumps(item, sort_keys=True, separators=(",", ":"), default=str): item
+            for item in normalized
+            if item not in (None, "", [], {})
+        }
+        return [unique[key] for key in sorted(unique)]
+    if isinstance(value, str):
+        return _normalize_script_demand_identity_text(value)
+    return value
+
+
+def _script_demand_timestamp(value: Any) -> str:
+    return isoformat(_as_datetime(value).astimezone(timezone.utc))
+
+
+def _script_language_demand_event_id(
+    demand_id: str,
+    event_type: str,
+    attempt_no: int,
+) -> str:
+    return "script-language-demand-event:" + stable_hash({
+        "contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
+        "demand_id": demand_id,
+        "event_type": event_type,
+        "attempt_no": int(attempt_no),
+    })
+
+
+def _script_language_demand_from_connection(
+    connection: sqlite3.Connection,
+    demand_id: str,
+    as_of: Any,
+) -> Optional[Dict[str, Any]]:
+    rows = [dict(row) for row in connection.execute(
+        """SELECT *
+           FROM mt_script_language_demand_events
+           WHERE demand_id = ?
+           ORDER BY attempt_no,
+                    CASE event_type
+                        WHEN 'requested' THEN 0
+                        WHEN 'claimed' THEN 1
+                        ELSE 2
+                    END,
+                    created_at, event_id""",
+        (demand_id,),
+    ).fetchall()]
+    if not rows:
+        return None
+    events: List[Dict[str, Any]] = []
+    for row in rows:
+        event = dict(row)
+        raw_payload = event.pop("payload_json", "{}")
+        try:
+            parsed_payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_payload = {"invalid_payload_json": True}
+        event["payload"] = parsed_payload
+        events.append(event)
+    request = next(
+        event for event in events if event["event_type"] == "requested"
+    )
+    claims = [event for event in events if event["event_type"] == "claimed"]
+    terminal_events = [
+        event
+        for event in events
+        if event["event_type"] in SCRIPT_LANGUAGE_DEMAND_TERMINAL_EVENTS
+    ]
+    latest_claim = max(
+        claims,
+        key=lambda event: (
+            int(event["attempt_no"]),
+            str(event["created_at"]),
+            str(event["event_id"]),
+        ),
+        default=None,
+    )
+    latest_terminal = max(
+        terminal_events,
+        key=lambda event: (
+            int(event["attempt_no"]),
+            str(event["created_at"]),
+            str(event["event_id"]),
+        ),
+        default=None,
+    )
+    measured_at = _script_demand_timestamp(as_of)
+    lease_active = bool(
+        latest_claim
+        and latest_claim.get("lease_until")
+        and str(latest_claim["lease_until"]) > measured_at
+        and latest_terminal is None
+    )
+    lease_expired = bool(
+        latest_claim
+        and not lease_active
+        and latest_terminal is None
+    )
+    if latest_terminal is not None:
+        state = str(latest_terminal["event_type"])
+    elif lease_active:
+        state = "claimed"
+    else:
+        state = "requested"
+    request_payload = request.get("payload")
+    targets = request_payload.get("targets", []) if isinstance(
+        request_payload, dict
+    ) else []
+    latest_lineage = latest_terminal or latest_claim or request
+    return {
+        "contract": SCRIPT_LANGUAGE_DEMAND_CONTRACT,
+        "event_contract": SCRIPT_LANGUAGE_DEMAND_EVENT_CONTRACT,
+        "demand_id": demand_id,
+        "state": state,
+        "request_sha256": str(request["request_sha256"]),
+        "source_service": str(request["source_service"]),
+        "source_receipt_id": str(request["source_receipt_id"]),
+        "topic": str(request["topic"]),
+        "audience": str(request["audience"]),
+        "objective": str(request["objective"]),
+        "evidence_trend_id": str(request["evidence_trend_id"]),
+        "snapshot_id": str(request["snapshot_id"]),
+        "targets": targets,
+        "collection_run_id": str(
+            latest_lineage.get("collection_run_id")
+            or request["collection_run_id"]
+        ),
+        "transcript_run_id": str(
+            latest_lineage.get("transcript_run_id")
+            or request["transcript_run_id"]
+        ),
+        "requested_at": str(request["created_at"]),
+        "attempt_count": len(claims),
+        "attempt_no": (
+            int(latest_claim["attempt_no"]) if latest_claim else 0
+        ),
+        "lease_until": (
+            str(latest_claim["lease_until"]) if latest_claim else None
+        ),
+        "lease_active": lease_active,
+        "lease_expired": lease_expired,
+        "terminal_at": (
+            str(latest_terminal["created_at"]) if latest_terminal else None
+        ),
+        "events": events,
+    }
 
 
 def _recent_counter_activity(row: Any, observed_at: datetime) -> Dict[str, Any]:
@@ -4460,6 +7504,414 @@ def _prediction_is_unexpired(
     )
 
 
+def _normalize_measurement_capabilities(
+    values: Sequence[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Validate and secret-strip collector-provided refresh capabilities."""
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        state = str(raw.get("state") or "").strip().casefold()
+        if state not in {"ready", "refresh_capable"}:
+            continue
+        source_id = str(raw.get("source_id") or "").strip()
+        platform = str(raw.get("platform") or "").strip().casefold()
+        try:
+            daily_limit = int(
+                raw.get("daily_request_limit", raw.get("daily_limit", 0))
+            )
+            batch_size = int(raw.get("refresh_batch_size", 1))
+            units_per_batch = int(
+                raw.get(
+                    "request_units_per_batch",
+                    raw.get("max_request_units_per_batch", 1),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            not source_id
+            or not platform
+            or daily_limit <= 0
+            or batch_size <= 0
+            or units_per_batch <= 0
+        ):
+            continue
+        remaining = raw.get("request_budget_remaining")
+        try:
+            request_budget_remaining = (
+                max(0, int(remaining)) if remaining is not None else None
+            )
+        except (TypeError, ValueError):
+            continue
+        normalized[source_id] = {
+            "source_id": source_id,
+            "platform": platform,
+            "daily_request_limit": daily_limit,
+            "refresh_batch_size": batch_size,
+            "request_units_per_batch": units_per_batch,
+            "request_budget_remaining": request_budget_remaining,
+            "request_budget_date": str(
+                raw.get("request_budget_date") or ""
+            )[:10],
+            "credential_fingerprint": str(
+                raw.get("credential_fingerprint") or ""
+            )[:128],
+        }
+    return normalized
+
+
+def _subject_on_forecast_cooldown(
+    predictions: Sequence[Dict[str, Any]],
+    predicted_at: datetime,
+    cooldown: timedelta,
+) -> bool:
+    cutoff = predicted_at - max(timedelta(0), cooldown)
+    for prediction in predictions:
+        try:
+            prior = _as_datetime(prediction["predicted_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if cutoff < prior <= predicted_at:
+            return True
+    return False
+
+
+def _reserved_measurement_poll_rows(
+    connection: sqlite3.Connection,
+    *,
+    selected_at_iso: str,
+    capable_source_ids: Sequence[str],
+    capable_platforms: Sequence[str],
+    claim_run_id: Optional[str],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load exact durable assignments without depending on today's model."""
+
+    filter_params: List[Any] = []
+    if capable_source_ids:
+        placeholders = ",".join("?" for _ in capable_source_ids)
+        capability_sql = f"reservation.source_id IN ({placeholders})"
+        filter_params.extend(capable_source_ids)
+    elif capable_platforms:
+        placeholders = ",".join("?" for _ in capable_platforms)
+        capability_sql = f"reservation.platform IN ({placeholders})"
+        filter_params.extend(capable_platforms)
+    else:
+        return [], []
+    if claim_run_id:
+        reservation_state_sql = (
+            "reservation.state = 'claimed' "
+            "AND reservation.claim_run_id = ?"
+        )
+        state_params: List[Any] = [claim_run_id]
+        assignment_state = "claimed"
+    else:
+        reservation_state_sql = "reservation.state = 'reserved'"
+        state_params = []
+        assignment_state = "reserved"
+    exact_rows = [dict(row) for row in connection.execute(
+        f"""SELECT reservation.reservation_id,
+                   reservation.source_id AS reserved_source_id,
+                   reservation.window_open_at, reservation.deadline_at,
+                   assignment.prediction_id, assignment.trend_id,
+                   q.video_id, q.platform, q.external_id,
+                   q.preferred_source_id, q.hot_mode, q.due_at,
+                   q.failure_count, q.last_observed_at, q.last_error_code,
+                   v.published_at, v.title, v.caption, v.description,
+                   v.language, v.url, v.thumbnail_url, v.duration_seconds,
+                   c.external_id AS creator_external_id,
+                   c.handle AS creator_handle,
+                   c.display_name AS creator_name,
+                   c.followers AS creator_followers,
+                   prediction.predicted_at, prediction.model_version,
+                   prediction.horizon
+            FROM mt_forecast_measurement_reservations reservation
+            JOIN mt_forecast_measurement_assignments assignment
+              ON assignment.reservation_id = reservation.reservation_id
+            JOIN mt_predictions prediction
+              ON prediction.prediction_id = assignment.prediction_id
+            JOIN mt_poll_queue q ON q.video_id = assignment.video_id
+            JOIN mt_videos v ON v.video_id = q.video_id
+            JOIN mt_creators c ON c.creator_id = v.creator_id
+            WHERE reservation.window_open_at <= ?
+              AND reservation.deadline_at > ?
+              AND {reservation_state_sql}
+              AND assignment.state = ?
+              AND prediction.outcome_json IS NULL
+              AND json_extract(
+                      prediction.features_json,
+                      '$.observation_quality_contract'
+                  ) = 'market_tape_accepted_observation_lineage_v2'
+              AND EXISTS (
+                  SELECT 1
+                  FROM mt_accepted_trend_memberships_v1 membership
+                  WHERE membership.trend_id = assignment.trend_id
+                    AND membership.video_id = assignment.video_id
+              )
+              AND {capability_sql}
+            ORDER BY reservation.deadline_at, reservation.reservation_id,
+                     q.video_id, assignment.prediction_id""",
+        (
+            selected_at_iso,
+            selected_at_iso,
+            *state_params,
+            assignment_state,
+            *filter_params,
+        ),
+    ).fetchall()]
+    exact_by_video: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    obligations: List[Dict[str, Any]] = []
+    for exact in exact_rows:
+        key = (str(exact["reserved_source_id"]), str(exact["video_id"]))
+        payload = exact_by_video.get(key)
+        if payload is None:
+            payload = dict(exact)
+            payload["preferred_source_id"] = str(exact["reserved_source_id"])
+            payload.update({
+                "queue_contract": "market_tape_recheck_queue_v3",
+                "queue_selected_at": selected_at_iso,
+                "recheck_priority": 0,
+                "recheck_reason": (
+                    "reserved_active_model_forecast_terminal_coverage"
+                ),
+                "forecast_coverage": [],
+                "measurement_reservation_ids": [],
+            })
+            exact_by_video[key] = payload
+        obligation = {
+            "prediction_id": int(exact["prediction_id"]),
+            "trend_id": str(exact["trend_id"]),
+            "model_version": str(exact["model_version"]),
+            "horizon": str(exact["horizon"]),
+            "predicted_at": str(exact["predicted_at"]),
+            "coverage_window_open_at": str(exact["window_open_at"]),
+            "coverage_deadline_at": str(exact["deadline_at"]),
+            "measurement_reservation_id": str(exact["reservation_id"]),
+        }
+        payload["forecast_coverage"].append(obligation)
+        reservation_id = str(exact["reservation_id"])
+        if reservation_id not in payload["measurement_reservation_ids"]:
+            payload["measurement_reservation_ids"].append(reservation_id)
+        obligations.append(obligation)
+    return list(exact_by_video.values())[:max(0, int(limit))], obligations
+
+
+def _select_measurement_cohort(
+    candidates: Sequence[Dict[str, Any]],
+    membership_by_trend: Dict[str, List[Dict[str, Any]]],
+    capabilities: Dict[str, Dict[str, Any]],
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Choose unique subjects and exact provider members within held capacity."""
+
+    sources_by_platform: Dict[str, List[str]] = {}
+    source_usage: Dict[str, Dict[str, Any]] = {}
+    for source_id, capability in capabilities.items():
+        sources_by_platform.setdefault(
+            str(capability["platform"]), []
+        ).append(source_id)
+        source_usage[source_id] = {
+            "videos": set(),
+            "request_units": 0,
+        }
+    for source_ids in sources_by_platform.values():
+        source_ids.sort()
+
+    ordered = sorted(
+        candidates,
+        key=lambda candidate: (
+            bool(candidate.get("previously_forecast")),
+            -float(candidate.get("trend_strength") or 0.0),
+            str(candidate.get("trend_id") or ""),
+        ),
+    )
+    selected: List[Dict[str, Any]] = []
+    selected_trends: set[str] = set()
+    no_refreshable_member = 0
+    no_measurement_capacity = 0
+    for candidate in ordered:
+        if len(selected) >= max(0, int(limit)):
+            break
+        trend_id = str(candidate.get("trend_id") or "")
+        if not trend_id or trend_id in selected_trends:
+            continue
+        members = membership_by_trend.get(trend_id, [])
+        refreshable_options = 0
+        options: List[Tuple[Any, ...]] = []
+        for member in members:
+            platform = str(member.get("platform") or "").casefold()
+            for source_id in sources_by_platform.get(platform, []):
+                refreshable_options += 1
+                capability = capabilities[source_id]
+                usage = source_usage[source_id]
+                video_id = str(member.get("video_id") or "")
+                if not video_id:
+                    continue
+                new_video = video_id not in usage["videos"]
+                incremental_units = 0
+                if new_video and len(usage["videos"]) % int(
+                    capability["refresh_batch_size"]
+                ) == 0:
+                    incremental_units = int(
+                        capability["request_units_per_batch"]
+                    )
+                if (
+                    int(usage["request_units"]) + incremental_units
+                    > int(capability["available_request_units"])
+                ):
+                    continue
+                preferred_penalty = int(
+                    str(member.get("preferred_source_id") or "") != source_id
+                )
+                options.append((
+                    incremental_units,
+                    preferred_penalty,
+                    max(0, int(member.get("failure_count") or 0)),
+                    str(member.get("due_at") or ""),
+                    source_id,
+                    video_id,
+                    member,
+                ))
+        if not options:
+            if refreshable_options:
+                no_measurement_capacity += 1
+            else:
+                no_refreshable_member += 1
+            continue
+        (
+            incremental_units,
+            _preferred_penalty,
+            _failure_count,
+            _due_at,
+            source_id,
+            video_id,
+            member,
+        ) = min(options, key=lambda option: option[:-1])
+        usage = source_usage[source_id]
+        usage["request_units"] = int(usage["request_units"]) + int(
+            incremental_units
+        )
+        usage["videos"].add(video_id)
+        selected_trends.add(trend_id)
+        selected.append({
+            **candidate,
+            "source_id": source_id,
+            "platform": str(member.get("platform") or ""),
+            "video_id": video_id,
+        })
+    return selected, {
+        "no_refreshable_member": no_refreshable_member,
+        "no_measurement_capacity": no_measurement_capacity,
+    }
+
+
+def _remaining_request_budget_with_connection(
+    connection: sqlite3.Connection,
+    *,
+    source_id: str,
+    daily_limit: int,
+    purpose: str,
+    usage_date: str,
+    validation_floor: int,
+    as_of_iso: Optional[str] = None,
+) -> int:
+    normalized_purpose = str(purpose or "legacy").strip().casefold()
+    if normalized_purpose not in {
+        "legacy",
+        "general",
+        "discovery",
+        "scheduled",
+        "reservation",
+        "forecast_terminal",
+    }:
+        raise ValueError(
+            "purpose must be legacy, general, discovery, scheduled, "
+            "reservation, or forecast_terminal"
+        )
+    actual_row = connection.execute(
+        """SELECT requests FROM mt_daily_usage
+           WHERE usage_date = ? AND source_id = ?""",
+        (usage_date, source_id),
+    ).fetchone()
+    actual = int(actual_row[0] or 0) if actual_row else 0
+    if normalized_purpose in {"legacy", "forecast_terminal"}:
+        return max(0, daily_limit - actual)
+
+    outstanding_row = connection.execute(
+        """SELECT COALESCE(SUM(reserved_request_units), 0)
+           FROM mt_forecast_measurement_reservations
+           WHERE source_id = ? AND usage_date = ?
+             AND state IN ('reserved', 'claimed')
+             AND (? IS NULL OR deadline_at > ?)""",
+        (source_id, usage_date, as_of_iso, as_of_iso),
+    ).fetchone()
+    outstanding = int(outstanding_row[0] or 0) if outstanding_row else 0
+    if normalized_purpose == "reservation":
+        return max(0, daily_limit - actual - outstanding)
+
+    measured_row = connection.execute(
+        """SELECT COALESCE(SUM(request_count), 0)
+           FROM mt_source_receipts
+           WHERE source_id = ?
+             AND substr(finished_at, 1, 10) = ?
+             AND (
+                 json_extract(metadata_json, '$.recheck_queue.selection_lane')
+                     = 'forecast_terminal'
+                 OR json_extract(metadata_json, '$.measurement_lane')
+                     = 'forecast_terminal'
+             )""",
+        (source_id, usage_date),
+    ).fetchone()
+    validation_used = int(measured_row[0] or 0) if measured_row else 0
+    floor_remaining = max(0, validation_floor - validation_used)
+    protected = max(outstanding, floor_remaining)
+    return max(0, daily_limit - actual - protected)
+
+
+def _update_measurement_assignments_state(
+    connection: sqlite3.Connection,
+    reservation_ids: Sequence[str],
+    *,
+    state: str,
+    completed_at: Optional[str],
+    error_code: str,
+) -> None:
+    for offset in range(0, len(reservation_ids), 400):
+        chunk = list(reservation_ids[offset:offset + 400])
+        placeholders = ",".join("?" for _ in chunk)
+        connection.execute(
+            f"""UPDATE mt_forecast_measurement_assignments
+                SET state = ?, completed_at = ?, error_code = ?
+                WHERE reservation_id IN ({placeholders})
+                  AND state IN ('reserved', 'claimed')""",
+            (state, completed_at, error_code[:100], *chunk),
+        )
+
+
+def _update_measurement_reservations_state(
+    connection: sqlite3.Connection,
+    reservation_ids: Sequence[str],
+    *,
+    state: str,
+    completed_at: Optional[str],
+    error_code: str,
+) -> None:
+    for offset in range(0, len(reservation_ids), 400):
+        chunk = list(reservation_ids[offset:offset + 400])
+        placeholders = ",".join("?" for _ in chunk)
+        connection.execute(
+            f"""UPDATE mt_forecast_measurement_reservations
+                SET state = ?, completed_at = ?, error_code = ?,
+                    claim_expires_at = NULL
+                WHERE reservation_id IN ({placeholders})
+                  AND state IN ('reserved', 'claimed')""",
+            (state, completed_at, error_code[:100], *chunk),
+        )
+
+
 def _prospective_model_admission(
     connection: sqlite3.Connection,
     *,
@@ -4495,11 +7947,19 @@ def _prospective_model_admission(
     if active_model is None:
         return receipt
     rows = [dict(row) for row in connection.execute(
-        """SELECT subject_id, predicted_at, probability, outcome_json
-           FROM mt_predictions
-           WHERE subject_type = 'trend'
-             AND model_version = ?
-             AND horizon = ?""",
+        """SELECT prediction.subject_id, prediction.predicted_at,
+                  prediction.probability, prediction.outcome_json
+           FROM mt_predictions prediction
+           LEFT JOIN mt_trends trend
+             ON trend.trend_id = prediction.subject_id
+           WHERE prediction.subject_type = 'trend'
+             AND prediction.model_version = ?
+             AND prediction.horizon = ?
+             AND json_extract(
+                     prediction.features_json,
+                     '$.observation_quality_contract'
+                 ) = 'market_tape_accepted_observation_lineage_v2'
+             AND COALESCE(lower(trend.trend_type), '') != 'format'""",
         (str(active_model["model_version"]), horizon),
     ).fetchall()]
     measured: List[Tuple[float, int, str, str]] = []
@@ -4952,6 +8412,11 @@ def _poll_assignment_receipt(row: Dict[str, Any]) -> Dict[str, Any]:
         }),
         "coverage_deadlines": sorted({
             str(obligation["coverage_deadline_at"]) for obligation in coverage
+        }),
+        "measurement_reservation_ids": sorted({
+            str(obligation.get("measurement_reservation_id") or "")
+            for obligation in coverage
+            if obligation.get("measurement_reservation_id")
         }),
     }
 

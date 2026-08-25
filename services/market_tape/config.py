@@ -19,7 +19,6 @@ def load_runtime_environment() -> None:
     paths = [Path(value).expanduser() for value in configured.split(":") if value]
     paths.extend(
         [
-            REPO_ROOT.parent / "actp-worker" / ".env",
             REPO_ROOT / ".env",
             REPO_ROOT / ".env.production",
             REPO_ROOT / ".env.market-tape",
@@ -110,6 +109,18 @@ class MarketTapeConfig:
     ))
     prediction_min_positive_labels: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_PREDICTION_MIN_POSITIVE_LABELS", 10
+    ))
+    prediction_validation_cohort_limit: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_PREDICTION_VALIDATION_COHORT_LIMIT", 100
+    ))
+    prediction_validation_interval_seconds: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_PREDICTION_VALIDATION_INTERVAL_SECONDS", 3600
+    ))
+    prediction_measurement_claim_ttl_seconds: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_PREDICTION_MEASUREMENT_CLAIM_TTL_SECONDS", 900
+    ))
+    prediction_validation_request_floor: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_PREDICTION_VALIDATION_REQUEST_FLOOR", 6
     ))
     prediction_model_dir: Path = field(default_factory=lambda: Path(os.getenv(
         "MARKET_TAPE_PREDICTION_MODEL_DIR",

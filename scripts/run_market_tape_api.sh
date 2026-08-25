@@ -5,7 +5,6 @@ ROOT="${0:A:h:h}"
 set -a
 for env_file in \
   "${MARKET_TAPE_ENV_FILE:-}" \
-  "$ROOT/../actp-worker/.env" \
   "$ROOT/.env" \
   "$ROOT/.env.market-tape"; do
   if [[ -n "$env_file" && -f "$env_file" ]]; then

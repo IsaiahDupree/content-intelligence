@@ -58,10 +58,21 @@ PY
   fi
 fi
 
-headers=(-H "Content-Type: application/json")
-if [[ -n "${MARKET_TAPE_CONTROL_TOKEN:-}" ]]; then
-  headers+=(-H "Authorization: Bearer $MARKET_TAPE_CONTROL_TOKEN")
+typeset MARKET_TAPE_CERTIFIER_CONTROL_TOKEN="${MARKET_TAPE_CONTROL_TOKEN:-}"
+unset MARKET_TAPE_CONTROL_TOKEN
+if [[ "$MARKET_TAPE_CERTIFIER_CONTROL_TOKEN" == *$'\n'* \
+   || "$MARKET_TAPE_CERTIFIER_CONTROL_TOKEN" == *'"'* \
+   || "$MARKET_TAPE_CERTIFIER_CONTROL_TOKEN" == *'\\'* ]]; then
+  print -u2 -- "refusing unsafe MARKET_TAPE_CONTROL_TOKEN characters"
+  exit 1
 fi
+
+curl_auth_config() {
+  if [[ -n "$MARKET_TAPE_CERTIFIER_CONTROL_TOKEN" ]]; then
+    print -r -- \
+      "header = \"Authorization: Bearer $MARKET_TAPE_CERTIFIER_CONTROL_TOKEN\""
+  fi
+}
 
 for attempt in 1 2 3 4 5 6; do
   if /usr/bin/curl \
@@ -70,7 +81,8 @@ for attempt in 1 2 3 4 5 6; do
     --show-error \
     --max-time "$REQUEST_TIMEOUT_SECONDS" \
     --request POST \
-    "${headers[@]}" \
+    --config <(curl_auth_config) \
+    -H "Content-Type: application/json" \
     --data '{}' \
     --output "$RECEIPT_PATH" \
     "$API_BASE_URL/api/market-tape/datasets/certify"; then

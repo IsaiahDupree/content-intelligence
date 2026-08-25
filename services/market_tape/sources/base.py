@@ -104,6 +104,30 @@ class MarketSource(ABC):
             digest.update(encoded)
         return digest.hexdigest()
 
+    def terminal_metrics_capable(self) -> bool:
+        """Whether refreshes can produce authoritative engagement counters.
+
+        Discovery-only and metadata-only adapters override this so they can
+        never be admitted as terminal forecast measurement sources.
+        """
+
+        return True
+
+    def adaptive_query_execution_capable(self) -> bool:
+        """Whether this cycle can execute the supplied query against a provider."""
+
+        return True
+
+    def measurement_refresh_batch_size(self) -> int:
+        """Maximum tracked items covered by one terminal refresh request."""
+
+        return 1
+
+    def measurement_request_units_per_batch(self) -> int:
+        """Conservative request units reserved for one terminal batch."""
+
+        return 1
+
     def preflight(self) -> None:
         if self.platform not in self.config.platforms:
             raise SourceError(f"platform {self.platform} is disabled")
@@ -203,7 +227,11 @@ class MarketSource(ABC):
             finished_at=utc_now(),
             request_count=operation_requests,
             estimated_cost_usd=operation_requests * self.config.request_cost_for(self.platform),
-            discovered_count=len(items) if operation == "discover" else 0,
+            discovered_count=(
+                len(items)
+                if operation in {"discover", "discover_performance"}
+                else 0
+            ),
             refreshed_count=len(items) if operation == "refresh" else 0,
             quota_remaining=max(0, self.request_budget - self.request_count),
             cursor=cursor,

@@ -367,3 +367,68 @@ CIOS orchestrates these 6 external systems:
 - ✅ Launch script template created
 - ✅ Developer guide with patterns and examples
 - 🟡 Awaiting autonomous agent implementation (CIOS-01 onwards)
+
+## Content Quality API (port 6010)
+
+Loopback-only Flask app (`services/content_quality/`), launchd
+`com.isaiah.content-quality.api`. Evidence-first script generation and the
+four render gates. Full agent-facing reference, including the
+narrative-coherence gate (owner directive 2026-08-22) and the complete
+receipt → generate → gates → handoff pathway with reject codes:
+**[docs/NARRATIVE-COHERENCE.md](docs/NARRATIVE-COHERENCE.md)**
+
+| Endpoint | Implementation | Source |
+|----------|---------------|--------|
+| `/api/viral-transcripts/discover` | ✅ ViralTranscriptService | `services/content_quality/engine.py` |
+| `/api/audience/human-moments` | ✅ AudienceIntelligenceService | `services/content_quality/engine.py` |
+| `/api/scripts/generate` | ✅ ScriptService + coherence enforce loop | `services/content_quality/engine.py` |
+| `/api/narrative-coherence/audit` | ✅ NarrativeCoherenceService | `services/content_quality/narrative_coherence.py` |
+| `/api/relatability/script-audit` | ✅ RelatabilityService | `services/content_quality/engine.py` |
+| `/api/attention/script-audit`, `/video-preflight` | ✅ AttentionService | `services/content_quality/engine.py` |
+| `/api/scripts/{id}` | ✅ gates summary (`ready_for_render` needs 4 PASSes) | `services/content_quality/engine.py` |
+| `/api/script-intelligence/briefs` | ✅ Immutable Market Tape → verified-language brief | `services/content_quality/script_intelligence.py` |
+| `/api/script-intelligence/generate-and-audit` | ✅ Brief-bound script + all pre-render gates | `services/content_quality/script_intelligence.py` |
+| `/api/script-intelligence/run` | ✅ One-call brief → script → audit, or evidence demand | `services/content_quality/api.py` |
+| `/api/agent/catalog` | ✅ Authenticated bounded agent operations; no raw SQL | `services/content_quality/api.py` |
+
+## Market Tape → Script Intelligence product boundary
+
+Market Tape on port 6006 is the canonical queryable store for observations,
+trend/keyword signals, quality-gated lineage, Whisper artifacts, and
+append-only script-language demand events. Content Quality on port 6010 stores
+immutable briefs, scripts, qualitative/deterministic audits, workflow receipts,
+and hash-only agent-query receipts. Large media and transcript files stay on
+the Passport volume; runtime state is never read from Markdown.
+
+| Endpoint | Contract |
+|----------|----------|
+| `GET /api/market-tape/agent/catalog` | Authenticated typed agent capability discovery |
+| `POST /api/market-tape/script-language-demands` | Idempotently enqueue a missing-language cohort request |
+| `GET /api/market-tape/script-language-demands` | Bounded demand status/lineage list |
+| `GET /api/market-tape/script-language-demands/{id}` | One demand and its append-only event history |
+| `POST /api/market-tape/script-language-demands/run-next` | Claim and execute one bounded acquisition cycle; never loops |
+
+The script brief keeps evidence roles separate: current trend evidence says
+what is timely; verified transcripts show how successful creators phrase it;
+source-bound human moments identify who/what feels relatable; observed hook and
+proof structure informs pacing. Forecast scores are not treated as calibrated
+probabilities, and no script is generated when the language cohort is below its
+minimum evidence gates.
+
+### Runtime data and AI boundary
+
+| Stage | Canonical runtime evidence | Works without an AI API | Production AI role |
+|-------|----------------------------|-------------------------|--------------------|
+| Trend and keyword measurement | Market Tape SQLite observations, trend memberships, forecasts, query/provider receipts | Yes | None required; forecasts remain explicitly non-probabilistic until calibrated |
+| Language acquisition | Hash-bound audio and Whisper transcript artifacts on Passport plus SQLite lineage | Yes, after the local Whisper model is installed | Local Whisper performs transcription; no generative model may invent source language |
+| Script brief selection | Immutable trend snapshot, accepted transcript cohort, creator diversity, views, human moments, hooks, and pacing | Yes | None required; insufficient evidence creates a typed acquisition demand instead of a script |
+| Script drafting | Brief-bound recurring vocabulary and abstract structures | Yes | Optional qualitative refinement must remain inside the immutable evidence and originality constraints |
+| Narrative coherence | Script plus evidence receipts and deterministic findings | Yes, with deterministic checks | `gpt-5-nano` supplies the production qualitative judgment when configured; failures are classified and audited |
+| Human relatability | Source-bound moments, cross-creator human terms, and transcript-cohort comparison | Yes | Benefits from qualitative review; today the shared narrative AI gate complements, but does not replace, the deterministic relatability gates |
+| Attention and preflight | Hook/proof deadlines, semantic beats, payoff/CTA ordering, and media checks | Yes | AI is optional; observed owned outcomes must outrank model opinion |
+| Retention learning | Owned post/content attribution and measured retention outcomes | No inference is fabricated when absent | AI may interpret measured curves later, but cannot manufacture millisecond drop reasons without provider evidence |
+
+Agent access is through the two authenticated catalogs and typed bounded
+operations above. Agents never receive arbitrary SQL execution, and databases—not
+Markdown files—hold operational state, lineage, briefs, scripts, audits, workflow
+runs, demands, and query receipts.

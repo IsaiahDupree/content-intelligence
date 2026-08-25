@@ -13,10 +13,21 @@ CYCLE_SECONDS="${MARKET_TAPE_CYCLE_SECONDS:-900}"
 REQUEST_TIMEOUT_SECONDS="${MARKET_TAPE_SCHEDULER_TIMEOUT_SECONDS:-7200}"
 RECEIPT_PATH="${MARKET_TAPE_SCHEDULER_RECEIPT_PATH:-/tmp/content-intelligence-market-tape-last-tick.json}"
 
-headers=(-H "Content-Type: application/json")
-if [[ -n "${MARKET_TAPE_CONTROL_TOKEN:-}" ]]; then
-  headers+=(-H "Authorization: Bearer $MARKET_TAPE_CONTROL_TOKEN")
+typeset MARKET_TAPE_SCHEDULER_CONTROL_TOKEN="${MARKET_TAPE_CONTROL_TOKEN:-}"
+unset MARKET_TAPE_CONTROL_TOKEN
+if [[ "$MARKET_TAPE_SCHEDULER_CONTROL_TOKEN" == *$'\n'* \
+   || "$MARKET_TAPE_SCHEDULER_CONTROL_TOKEN" == *'"'* \
+   || "$MARKET_TAPE_SCHEDULER_CONTROL_TOKEN" == *'\\'* ]]; then
+  print -u2 -- "refusing unsafe MARKET_TAPE_CONTROL_TOKEN characters"
+  exit 1
 fi
+
+curl_auth_config() {
+  if [[ -n "$MARKET_TAPE_SCHEDULER_CONTROL_TOKEN" ]]; then
+    print -r -- \
+      "header = \"Authorization: Bearer $MARKET_TAPE_SCHEDULER_CONTROL_TOKEN\""
+  fi
+}
 
 while true; do
   started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -26,7 +37,8 @@ while true; do
     --show-error \
     --max-time "$REQUEST_TIMEOUT_SECONDS" \
     --request POST \
-    "${headers[@]}" \
+    --config <(curl_auth_config) \
+    -H "Content-Type: application/json" \
     --data '{}' \
     --output "$RECEIPT_PATH" \
     "$API_BASE_URL/api/market-tape/tick"; then

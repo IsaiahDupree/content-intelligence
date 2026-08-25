@@ -16,11 +16,15 @@ from .dataset import MarketTapeDatasetManager
 from .full_pipeline import run_full_pipeline
 from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
+from .script_demand import ScriptLanguageDemandWorker
 from .store import MarketTapeStore
 from .sinks import SupabaseSink
 
 
-def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = None) -> None:
+def register_market_tape_routes(
+    app: Flask,
+    config: MarketTapeConfig | None = None,
+) -> MarketTapeStore:
     resolved = config or MarketTapeConfig.from_environment()
     store = MarketTapeStore(resolved)
     operation_lock = threading.Lock()
@@ -155,6 +159,111 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             "candles": store.social_candles(window, limit, request.args.get("platform")),
         })
 
+    @app.get("/api/market-tape/agent/catalog")
+    def market_tape_agent_catalog():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        return jsonify({
+            "status": "ok",
+            "contract": "market_tape_agent_catalog_v1",
+            "database_access": "typed_bounded_api_only",
+            "arbitrary_sql_allowed": False,
+            "markdown_runtime_state": False,
+            "operations": {
+                "status": {
+                    "method": "GET", "path": "/api/market-tape/status",
+                },
+                "trend_intelligence": {
+                    "method": "GET", "path": "/api/market-tape/intelligence",
+                    "bounds": {"limit": [1, 100]},
+                },
+                "keyword_intelligence": {
+                    "method": "GET", "path": "/api/market-tape/keywords",
+                    "bounds": {"limit": [1, 1000]},
+                },
+                "enqueue_script_language_demand": {
+                    "method": "POST",
+                    "path": "/api/market-tape/script-language-demands",
+                    "required": [
+                        "source_service", "source_receipt_id", "topic",
+                        "audience", "objective", "snapshot_id", "targets",
+                    ],
+                },
+                "list_script_language_demands": {
+                    "method": "GET",
+                    "path": "/api/market-tape/script-language-demands",
+                    "bounds": {"limit": [1, 500]},
+                },
+                "get_script_language_demand": {
+                    "method": "GET",
+                    "path": "/api/market-tape/script-language-demands/{demand_id}",
+                },
+                "run_next_script_language_demand": {
+                    "method": "POST",
+                    "path": "/api/market-tape/script-language-demands/run-next",
+                    "effect": "one_claim_one_bounded_cycle_no_same_call_retry",
+                },
+            },
+        })
+
+    @app.post("/api/market-tape/script-language-demands")
+    def market_tape_enqueue_script_language_demand():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"error": "JSON object body required"}), 400
+        try:
+            result = store.enqueue_script_language_demand(body)
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("enqueued") else 200
+
+    @app.get("/api/market-tape/script-language-demands")
+    def market_tape_list_script_language_demands():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        limit = _limit(request.args.get("limit"), 100, maximum=500)
+        try:
+            demands = store.list_script_language_demands(
+                limit=limit, state=request.args.get("state")
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({
+            "status": "ok", "demands": demands,
+            "count": len(demands), "limit": limit,
+        })
+
+    @app.get("/api/market-tape/script-language-demands/<path:demand_id>")
+    def market_tape_get_script_language_demand(demand_id: str):
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            demand = store.script_language_demand(demand_id)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        if demand is None:
+            return jsonify({
+                "status": "error", "code": "SCRIPT_LANGUAGE_DEMAND_NOT_FOUND",
+                "demand_id": demand_id,
+            }), 404
+        return jsonify({"status": "ok", "demand": demand})
+
+    @app.post("/api/market-tape/script-language-demands/run-next")
+    def market_tape_run_next_script_language_demand():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        lease_seconds = _limit(
+            body.get("lease_seconds"), 7200, maximum=86400
+        )
+        return run_exclusive(
+            lambda: ScriptLanguageDemandWorker(resolved, store).run_next(
+                lease_seconds=lease_seconds
+            )
+        )
+
     @app.post("/api/market-tape/cycles")
     def market_tape_cycle():
         if not _authorized():
@@ -192,6 +301,9 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
         limit = _limit(body.get("limit"), 5, maximum=200)
         topic = str(body.get("topic", ""))
         model = str(body.get("model", "base"))
+        performance_discovery = body.get("performance_discovery", False)
+        if not isinstance(performance_discovery, bool):
+            return jsonify({"error": "performance_discovery must be boolean"}), 400
         trend_ids = body.get("trend_ids") or []
         if not isinstance(trend_ids, list) or any(
             not isinstance(value, str) or not value.strip()
@@ -208,6 +320,7 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             transcript_model=model,
             topic=topic,
             transcript_trend_ids=trend_ids,
+            performance_discovery=performance_discovery,
         ))
 
     @app.post("/api/market-tape/bootstrap-local")
@@ -281,7 +394,10 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             return jsonify({"error": "local control token required"}), 401
         body: Any = request.get_json(silent=True) or {}
         limit = _limit(body.get("limit"), 5000, maximum=20000)
-        return run_exclusive(lambda: store.forecast_active_trends(limit=limit))
+        return run_exclusive(lambda: MarketTapeCollector(
+            resolved,
+            store,
+        ).reserve_validation_forecasts(limit=limit))
 
     @app.post("/api/market-tape/datasets/certify")
     def market_tape_certify_dataset():
@@ -294,6 +410,8 @@ def register_market_tape_routes(app: Flask, config: MarketTapeConfig | None = No
             operation_lock=operation_lock,
         )
         return jsonify(result), (409 if result.get("state") == "busy" else 200)
+
+    return store
 
 
 def _authorized() -> bool:

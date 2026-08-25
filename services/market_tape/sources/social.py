@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .base import MarketSource, SourceCredentialError
+from .counters import first_counter, missing_counter_metadata
 from ..models import MarketContent, MetricCounters, ProviderBatch, QueryAttempt, parse_datetime, utc_now
 from ..source_urls import normalize_tiktok_handle, normalize_tiktok_source_url
 
@@ -58,6 +59,18 @@ class TikTokResearchSource(MarketSource):
         if self._configured_access_token:
             return (self._configured_access_token,)
         return (self.client_key, self.client_secret)
+
+    def terminal_metrics_capable(self) -> bool:
+        # Research queries intentionally stop two days behind the live edge, so
+        # they cannot certify the active six-hour forecast terminal window.
+        return False
+
+    def measurement_refresh_batch_size(self) -> int:
+        return 100
+
+    def measurement_request_units_per_batch(self) -> int:
+        # Client-credential mode may spend one OAuth request before the batch.
+        return 1 if self._configured_access_token else 2
 
     def _token(self) -> str:
         if self.access_token:
@@ -127,6 +140,7 @@ class TikTokResearchSource(MarketSource):
             token = self._token()
             observed = utc_now()
             output: List[MarketContent] = []
+            missing_counter_count = 0
             for offset in range(0, len(tracked), 100):
                 rows = tracked[offset:offset + 100]
                 data = self.request_json(
@@ -144,8 +158,22 @@ class TikTokResearchSource(MarketSource):
                 prior = {str(row["external_id"]): row for row in rows}
                 for raw in _first_dict(data.get("data")).get("videos", []):
                     if isinstance(raw, dict) and raw.get("id"):
+                        if first_counter(raw.get("view_count")) is None:
+                            missing_counter_count += 1
+                            continue
                         output.append(self._normalize(raw, observed, prior.get(str(raw["id"]), {})))
-            return self.success_batch(started, output, operation="refresh")
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata={
+                    "data_lag_days": 2,
+                    **missing_counter_metadata(
+                        missing_counter_count,
+                        "view_count",
+                    ),
+                },
+            )
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -163,8 +191,11 @@ class TikTokResearchSource(MarketSource):
             creator_handle=username, published_at=parse_datetime(raw.get("create_time") or prior.get("published_at")),
             observed_at=observed, source_id=self.source_id,
             metrics=MetricCounters.from_values(
-                views=raw.get("view_count"), likes=raw.get("like_count"), comments=raw.get("comment_count"),
-                shares=raw.get("share_count"), saves=raw.get("favorites_count"),
+                views=first_counter(raw.get("view_count")),
+                likes=first_counter(raw.get("like_count")),
+                comments=first_counter(raw.get("comment_count")),
+                shares=first_counter(raw.get("share_count")),
+                saves=first_counter(raw.get("favorites_count")),
             ),
             caption=text, description=str(raw.get("voice_to_text") or ""),
             url=normalize_tiktok_source_url(
@@ -188,6 +219,11 @@ class TikTokRapidSource(MarketSource):
 
     def _headers(self) -> Dict[str, str]:
         return {"X-RapidAPI-Key": os.getenv("RAPIDAPI_KEY", ""), "X-RapidAPI-Host": self.host}
+
+    def terminal_metrics_capable(self) -> bool:
+        # Discovery payloads have been observed, but the per-video refresh edge
+        # has no successful audited provider receipt yet.
+        return False
 
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
@@ -224,14 +260,34 @@ class TikTokRapidSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: List[MarketContent] = []
+            missing_counter_count = 0
             for prior in tracked:
                 if self.request_count >= self.request_budget:
                     break
                 data = self.request_json("GET", f"{self.base_url}/video/info", headers=self._headers(), params={"video_id": prior["external_id"]})
                 raw = _first_dict(data.get("data"))
                 if raw:
+                    stats = _first_dict(raw.get("stats"))
+                    if first_counter(
+                        raw.get("play_count"),
+                        raw.get("playCount"),
+                        stats.get("playCount"),
+                    ) is None:
+                        missing_counter_count += 1
+                        continue
                     output.append(self._normalize(raw, observed, prior))
-            return self.success_batch(started, output, operation="refresh", metadata={"billing": "external_rapidapi_plan"})
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata={
+                    "billing": "external_rapidapi_plan",
+                    **missing_counter_metadata(
+                        missing_counter_count,
+                        "play_count",
+                    ),
+                },
+            )
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -270,11 +326,11 @@ class TikTokRapidSource(MarketSource):
             published_at=parse_datetime(raw.get("create_time") or raw.get("createTime") or prior.get("published_at")),
             observed_at=observed, source_id=self.source_id,
             metrics=MetricCounters.from_values(
-                views=raw.get("play_count") or raw.get("playCount") or stats.get("playCount"),
-                likes=raw.get("digg_count") or raw.get("diggCount") or stats.get("diggCount"),
-                comments=raw.get("comment_count") or raw.get("commentCount") or stats.get("commentCount"),
-                shares=raw.get("share_count") or raw.get("shareCount") or stats.get("shareCount"),
-                saves=raw.get("collect_count") or raw.get("collectCount") or stats.get("collectCount"),
+                views=first_counter(raw.get("play_count"), raw.get("playCount"), stats.get("playCount")),
+                likes=first_counter(raw.get("digg_count"), raw.get("diggCount"), stats.get("diggCount")),
+                comments=first_counter(raw.get("comment_count"), raw.get("commentCount"), stats.get("commentCount")),
+                shares=first_counter(raw.get("share_count"), raw.get("shareCount"), stats.get("shareCount")),
+                saves=first_counter(raw.get("collect_count"), raw.get("collectCount"), stats.get("collectCount")),
             ),
             caption=text, url=normalize_tiktok_source_url(
                 prior.get("url"), external_id, username,
@@ -299,6 +355,11 @@ class InstagramRapidSource(MarketSource):
 
     def _headers(self) -> Dict[str, str]:
         return {"X-RapidAPI-Key": os.getenv("RAPIDAPI_KEY", ""), "X-RapidAPI-Host": self.host}
+
+    def terminal_metrics_capable(self) -> bool:
+        # This discovery lane mixes images and videos and has no item-level
+        # forecast eligibility contract for an authoritative play counter.
+        return False
 
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
@@ -337,6 +398,7 @@ class InstagramRapidSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: List[MarketContent] = []
+            missing_counter_count = 0
             for prior in tracked:
                 if self.request_count >= self.request_budget:
                     break
@@ -346,8 +408,26 @@ class InstagramRapidSource(MarketSource):
                 data = self.request_json("GET", f"{self.base_url}/post-info", headers=self._headers(), params={"code": shortcode})
                 raw = _first_dict(data.get("item") or data.get("data") or data)
                 if raw:
+                    if first_counter(
+                        raw.get("play_count"),
+                        raw.get("view_count"),
+                        raw.get("video_view_count"),
+                    ) is None:
+                        missing_counter_count += 1
+                        continue
                     output.append(self._normalize(raw, observed, prior))
-            return self.success_batch(started, output, operation="refresh", metadata={"billing": "external_rapidapi_plan"})
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata={
+                    "billing": "external_rapidapi_plan",
+                    **missing_counter_metadata(
+                        missing_counter_count,
+                        "play_count|view_count|video_view_count",
+                    ),
+                },
+            )
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -366,10 +446,11 @@ class InstagramRapidSource(MarketSource):
             published_at=parse_datetime(raw.get("taken_at") or raw.get("taken_at_timestamp") or prior.get("published_at")),
             observed_at=observed, source_id=self.source_id,
             metrics=MetricCounters.from_values(
-                views=raw.get("play_count") or raw.get("view_count") or raw.get("video_view_count"),
-                likes=raw.get("like_count") or _first_dict(raw.get("edge_liked_by")).get("count"),
-                comments=raw.get("comment_count") or _first_dict(raw.get("edge_media_to_comment")).get("count"),
-                shares=raw.get("reshare_count"), saves=raw.get("save_count"),
+                views=first_counter(raw.get("play_count"), raw.get("view_count"), raw.get("video_view_count")),
+                likes=first_counter(raw.get("like_count"), _first_dict(raw.get("edge_liked_by")).get("count")),
+                comments=first_counter(raw.get("comment_count"), _first_dict(raw.get("edge_media_to_comment")).get("count")),
+                shares=first_counter(raw.get("reshare_count")),
+                saves=first_counter(raw.get("save_count")),
             ),
             caption=text, url=f"https://www.instagram.com/p/{shortcode}/" if shortcode else str(prior.get("url") or ""),
             thumbnail_url=str(raw.get("thumbnail_url") or raw.get("display_url") or raw.get("image_versions2", {}).get("candidates", [{}])[0].get("url", "")),
@@ -398,6 +479,9 @@ class XRecentSearchSource(MarketSource):
 
     def credential_material(self) -> Sequence[str]:
         return (self.token,)
+
+    def measurement_refresh_batch_size(self) -> int:
+        return 100
 
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
@@ -442,6 +526,7 @@ class XRecentSearchSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: List[MarketContent] = []
+            missing_counter_count = 0
             for offset in range(0, len(tracked), 100):
                 rows = tracked[offset:offset + 100]
                 data = self.request_json("GET", f"{self.base_url}/tweets", headers={"Authorization": f"Bearer {self.token}"}, params={
@@ -452,8 +537,23 @@ class XRecentSearchSource(MarketSource):
                 users = {str(user.get("id")): user for user in _first_dict(data.get("includes")).get("users", []) if isinstance(user, dict)}
                 for raw in data.get("data", []):
                     if isinstance(raw, dict):
+                        metrics = _first_dict(raw.get("public_metrics"))
+                        if first_counter(metrics.get("impression_count")) is None:
+                            missing_counter_count += 1
+                            continue
                         output.append(self._normalize(raw, users.get(str(raw.get("author_id")), {}), observed))
-            return self.success_batch(started, output, operation="refresh", metadata={"billing": "x_api_plan"})
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata={
+                    "billing": "x_api_plan",
+                    **missing_counter_metadata(
+                        missing_counter_count,
+                        "public_metrics.impression_count",
+                    ),
+                },
+            )
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -469,9 +569,14 @@ class XRecentSearchSource(MarketSource):
             creator_followers=_int(_first_dict(user.get("public_metrics")).get("followers_count")),
             published_at=parse_datetime(raw.get("created_at")), observed_at=observed, source_id=self.source_id,
             metrics=MetricCounters.from_values(
-                views=metrics.get("impression_count"), likes=metrics.get("like_count"),
-                comments=metrics.get("reply_count"), shares=_int(metrics.get("retweet_count")) + _int(metrics.get("quote_count")),
-                saves=metrics.get("bookmark_count"),
+                views=first_counter(metrics.get("impression_count")),
+                likes=first_counter(metrics.get("like_count")),
+                comments=first_counter(metrics.get("reply_count")),
+                shares=(
+                    (first_counter(metrics.get("retweet_count")) or 0)
+                    + (first_counter(metrics.get("quote_count")) or 0)
+                ),
+                saves=first_counter(metrics.get("bookmark_count")),
             ),
             caption=text, language=str(raw.get("lang") or ""), url=f"https://x.com/{username}/status/{raw.get('id')}",
             hashtags=_hashtags(text, entities.get("hashtags", [])), raw_payload={"tweet": raw, "user": user},
@@ -505,6 +610,12 @@ class ThreadsKeywordSearchSource(MarketSource):
 
     def _headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
+
+    def terminal_metrics_capable(self) -> bool:
+        # The public Threads keyword/object contract guarantees content
+        # metadata, not engagement counters. Treating absent counters as zero
+        # would manufacture negative velocity and corrupt forecast labels.
+        return False
 
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
@@ -584,6 +695,7 @@ class ThreadsKeywordSearchSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: List[MarketContent] = []
+            metadata_only_count = 0
             for prior in tracked:
                 if self.request_count >= self.request_budget:
                     break
@@ -597,7 +709,16 @@ class ThreadsKeywordSearchSource(MarketSource):
                     params={"fields": self.fields},
                 )
                 if data.get("id"):
-                    output.append(self._normalize(data, observed, prior))
+                    if first_counter(data.get("views")) is None:
+                        metadata_only_count += 1
+                        continue
+                    item = self._normalize(data, observed, prior)
+                    if item.discovery_context.get(
+                        "engagement_metrics_observed", False
+                    ):
+                        output.append(item)
+                    else:
+                        metadata_only_count += 1
             return self.success_batch(
                 started,
                 output,
@@ -606,9 +727,16 @@ class ThreadsKeywordSearchSource(MarketSource):
                     "scope": "public_object_lookup",
                     "endpoint": "thread_object",
                     "required_scope": "threads_basic",
+                    "metric_contract": (
+                        "provider_counters_required_for_observation"
+                    ),
                     "engagement_metrics_observed": any(
                         item.discovery_context.get("engagement_metrics_observed", False)
                         for item in output
+                    ),
+                    **missing_counter_metadata(
+                        metadata_only_count,
+                        "views",
                     ),
                 },
             )
@@ -631,10 +759,10 @@ class ThreadsKeywordSearchSource(MarketSource):
         ).strip() or "unknown"
         text = str(raw.get("text") or prior.get("caption") or "")
         metric_values = {
-            "views": raw.get("views"),
-            "likes": raw.get("like_count"),
-            "comments": raw.get("reply_count"),
-            "shares": raw.get("repost_count"),
+            "views": first_counter(raw.get("views")),
+            "likes": first_counter(raw.get("like_count")),
+            "comments": first_counter(raw.get("reply_count")),
+            "shares": first_counter(raw.get("repost_count")),
         }
         engagement_metrics_observed = any(
             key in raw and value is not None
@@ -724,6 +852,16 @@ class MetaGraphSource(MarketSource):
     def credential_material(self) -> Sequence[str]:
         return (self.account_id, self.token)
 
+    def terminal_metrics_capable(self) -> bool:
+        requested_fields = {
+            value.strip().split(".", 1)[0]
+            for value in self.fields.split(",")
+            if value.strip()
+        }
+        return self.platform == "facebook" and bool(
+            {"views", "view_count"} & requested_fields
+        )
+
     def discover(self, max_items: int) -> ProviderBatch:
         started = utc_now()
         try:
@@ -743,13 +881,31 @@ class MetaGraphSource(MarketSource):
             self.preflight()
             observed = utc_now()
             output: List[MarketContent] = []
+            missing_counter_count = 0
             for prior in tracked:
                 if self.request_count >= self.request_budget:
                     break
                 data = self.request_json("GET", f"{self.base_url}/{prior['external_id']}", headers={"Authorization": f"Bearer {self.token}"}, params={"fields": self.fields})
                 if data.get("id"):
+                    if first_counter(
+                        data.get("views"),
+                        data.get("view_count"),
+                    ) is None:
+                        missing_counter_count += 1
+                        continue
                     output.append(self._normalize(data, observed, prior))
-            return self.success_batch(started, output, operation="refresh", metadata={"scope": "authorized_account"})
+            return self.success_batch(
+                started,
+                output,
+                operation="refresh",
+                metadata={
+                    "scope": "authorized_account",
+                    **missing_counter_metadata(
+                        missing_counter_count,
+                        "views|view_count",
+                    ),
+                },
+            )
         except Exception as error:
             return self.blocked_batch(started, error)
 
@@ -769,8 +925,11 @@ class MetaGraphSource(MarketSource):
             creator_handle=username, published_at=parse_datetime(raw.get("timestamp") or raw.get("created_time") or prior.get("published_at")),
             observed_at=observed, source_id=self.source_id,
             metrics=MetricCounters.from_values(
-                views=raw.get("views") or raw.get("view_count"), likes=likes, comments=comments,
-                shares=_first_dict(raw.get("shares")).get("count"), saves=0,
+                views=first_counter(raw.get("views"), raw.get("view_count")),
+                likes=first_counter(likes),
+                comments=first_counter(comments),
+                shares=first_counter(_first_dict(raw.get("shares")).get("count")),
+                saves=0,
             ),
             caption=text, url=str(raw.get("permalink") or raw.get("permalink_url") or prior.get("url") or ""),
             thumbnail_url=str(raw.get("thumbnail_url") or ""), media_type=str(raw.get("media_type") or "video").lower(),

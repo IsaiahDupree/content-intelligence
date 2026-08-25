@@ -22,6 +22,9 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
     ),
     "query_attempt": ("actp_market_query_attempts", "attempt_key", False),
     "observation": ("actp_market_observations", "observation_key", False),
+    "observation_quality_flag": (
+        "actp_market_observation_quality_flags", "observation_key", False,
+    ),
     "genome": ("actp_content_genomes", "video_id", True),
     "trend": ("actp_trends", "trend_id", True),
     "membership": ("actp_trend_memberships", "trend_id,video_id", True),
@@ -42,6 +45,7 @@ ENTITY_SYNC_ORDER = (
     "query_attempt",
     "discovery_attribution",
     "observation",
+    "observation_quality_flag",
     "genome",
     "membership",
     "trend_observation",
@@ -113,29 +117,46 @@ class SupabaseSink:
             if not group:
                 continue
             table, conflict, merge = ENTITY_TABLES[entity_type]
-            ids = [int(row["outbox_id"]) for row in group]
-            payload = [_normalize_payload(row["payload"]) for row in group]
-            try:
-                response = self.client.post(
-                    f"{self.rest_base_url}/{table}",
-                    params={"on_conflict": conflict},
-                    headers={
-                        "apikey": self.key,
-                        "Authorization": f"Bearer {self.key}",
-                        "Content-Type": "application/json",
-                        "Prefer": f"resolution={'merge-duplicates' if merge else 'ignore-duplicates'},return=minimal",
-                    },
-                    json=payload,
+            shaped: Dict[Tuple[str, ...], List[Tuple[int, Dict[str, Any]]]] = (
+                defaultdict(list)
+            )
+            for row in group:
+                payload = _normalize_payload(row["payload"])
+                shaped[tuple(sorted(payload))].append(
+                    (int(row["outbox_id"]), payload)
                 )
-                if response.status_code not in {200, 201, 204}:
-                    raise RuntimeError(f"{table} returned HTTP {response.status_code}: {sanitize(response.text)[:300]}")
-                self.store.mark_outbox_synced(ids)
-                synced += len(ids)
-            except (httpx.HTTPError, RuntimeError) as error:
-                detail = sanitize(error)
-                self.store.mark_outbox_failed(ids, detail)
-                failed += len(ids)
-                errors.append(detail)
+            for signature in sorted(shaped):
+                records = shaped[signature]
+                ids = [outbox_id for outbox_id, _ in records]
+                payload = [record for _, record in records]
+                try:
+                    response = self.client.post(
+                        f"{self.rest_base_url}/{table}",
+                        params={"on_conflict": conflict},
+                        headers={
+                            "apikey": self.key,
+                            "Authorization": f"Bearer {self.key}",
+                            "Content-Type": "application/json",
+                            "Prefer": (
+                                "resolution="
+                                f"{'merge-duplicates' if merge else 'ignore-duplicates'},"
+                                "return=minimal"
+                            ),
+                        },
+                        json=payload,
+                    )
+                    if response.status_code not in {200, 201, 204}:
+                        raise RuntimeError(
+                            f"{table} returned HTTP {response.status_code}: "
+                            f"{sanitize(response.text)[:300]}"
+                        )
+                    self.store.mark_outbox_synced(ids)
+                    synced += len(ids)
+                except (httpx.HTTPError, RuntimeError) as error:
+                    detail = sanitize(error)
+                    self.store.mark_outbox_failed(ids, detail)
+                    failed += len(ids)
+                    errors.append(detail)
         pending = self.store.outbox_pending_count()
         state = "ready" if failed == 0 else "degraded"
         self.store.save_sink_health(state, pending, "; ".join(errors)[:1000])

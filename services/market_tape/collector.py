@@ -8,7 +8,7 @@ import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import MarketTapeConfig
 from .models import (
@@ -23,9 +23,11 @@ from .models import (
     utc_now,
 )
 from .sources import build_sources
+from .sources.base import sanitize
 from .sources.local_research import LocalResearchSource
 from .sinks import SupabaseSink
-from .store import MarketTapeStore
+from .store import CounterRegressionError, MarketTapeStore
+from .predictor import load_active_model
 
 
 AUTONOMOUS_QUERY_NOISE = {
@@ -57,36 +59,117 @@ class MarketTapeCollector:
         run_id = new_run_id()
         self.store.start_run(run_id, mode)
         receipts: List[Dict[str, Any]] = []
+        phase_sequence: List[str] = []
         state = "completed"
         error_detail = ""
+        prediction_evaluation: Dict[str, Any] = {"state": "not_started"}
+        validation_forecast: Dict[str, Any] = {"state": "not_started"}
+        deferred_terminal_noop: Optional[Dict[str, Any]] = None
         try:
-            if mode == "full":
-                # Protect narrow terminal label windows, then let discovery use
-                # the remaining provider budget before ordinary due polling.
-                # Preserve the public response's historical discovery-first
-                # receipt order; phase timestamps describe actual execution.
+            prediction_evaluation = self.store.evaluate_predictions()
+            phase_sequence.append("evaluate_predictions")
+            measurement_work_required = (
+                self._forecast_measurement_work_required()
+            )
+            if measurement_work_required:
+                initial_capabilities = self._measurement_source_capabilities(
+                    run_id
+                )
+                validation_forecast = self.store.forecast_active_trends(
+                    run_id=run_id,
+                    measurement_sources=initial_capabilities["admitted"],
+                    limit=self.config.prediction_validation_cohort_limit,
+                )
+                validation_forecast[
+                    "measurement_sources"
+                ] = initial_capabilities
+                phase_sequence.append(
+                    "reserve_validation_forecast_prior_tape"
+                )
+            else:
+                validation_forecast = {
+                    "state": "no_promoted_model_or_open_reservation",
+                    "predictions_added": 0,
+                    "reservations_added": 0,
+                }
+
+            if (
+                measurement_work_required
+                and mode in {"full", "discovery", "recheck"}
+            ):
                 terminal_receipts = self._run_rechecks(
                     run_id,
                     phase="forecast_terminal",
                 )
-                receipts.extend(self._run_discovery(run_id))
                 receipts.extend(terminal_receipts)
+                phase_sequence.append("forecast_terminal_rechecks")
+            elif mode in {"full", "discovery", "recheck"}:
+                plan = self.store.due_poll_plan(
+                    self.config.max_due_rechecks_per_cycle,
+                    forecast_capable_platforms=set(),
+                    forecast_capable_source_ids=set(),
+                    phase="forecast_terminal",
+                )
+                terminal_noop = self._save_recheck_planner_receipt(
+                    run_id,
+                    phase="forecast_terminal",
+                    queue_receipt=plan["receipt"],
+                    source_capability=[],
+                ).to_dict()
+                if (
+                    mode in {"full", "recheck"}
+                    and self._scheduled_poll_work_required()
+                ):
+                    deferred_terminal_noop = terminal_noop
+                phase_sequence.append("forecast_terminal_rechecks")
+            if mode in {"full", "discovery"}:
+                receipts.extend(self._run_discovery(run_id))
+                phase_sequence.append("discovery")
+            if mode == "recheck":
+                receipts.extend(self._run_local_ingest(run_id))
+                phase_sequence.append("local_archive_ingest")
+            if mode in {"full", "recheck"}:
+                if deferred_terminal_noop is not None:
+                    receipts.append(deferred_terminal_noop)
                 receipts.extend(self._run_rechecks(
                     run_id,
                     phase="scheduled",
                 ))
-            elif mode == "discovery":
-                receipts.extend(self._run_discovery(run_id))
-            else:
-                receipts.extend(self._run_local_ingest(run_id))
-                receipts.extend(self._run_rechecks(run_id))
+                phase_sequence.append("scheduled_rechecks")
             trend_observations = self.store.aggregate_trends(run_id=run_id)
-            predictions = self.store.create_predictions(run_id)
+            phase_sequence.append("aggregate_trends")
+            baseline_predictions = self.store.create_predictions(run_id)
+            phase_sequence.append("transparent_baselines")
+            if (
+                load_active_model(self.config) is not None
+                and int(validation_forecast.get("predictions_added") or 0) == 0
+            ):
+                post_capabilities = self._measurement_source_capabilities(
+                    run_id
+                )
+                post_forecast = self.store.forecast_active_trends(
+                    run_id=run_id,
+                    measurement_sources=post_capabilities["admitted"],
+                    limit=self.config.prediction_validation_cohort_limit,
+                )
+                post_forecast["measurement_sources"] = post_capabilities
+                validation_forecast = {
+                    **post_forecast,
+                    "initial_attempt": validation_forecast,
+                    "attempt_phase": "post_aggregate_retry",
+                }
+                phase_sequence.append("reserve_validation_forecast_post_aggregate")
+            active_predictions = int(
+                validation_forecast.get("predictions_added") or 0
+            )
+            predictions = baseline_predictions + active_predictions
         except Exception as error:
             state = "failed"
             error_detail = f"{error.__class__.__name__}: {str(error)[:500]}"
             trend_observations = 0
             predictions = 0
+            baseline_predictions = 0
+            active_predictions = 0
         finally:
             self.store.finish_run(run_id, state=state, error_detail=error_detail)
         outbox_records = self.store.enqueue_run_for_sync(run_id)
@@ -103,11 +186,167 @@ class MarketTapeCollector:
             "error_detail": error_detail,
             "trend_observations_added": trend_observations,
             "predictions_added": predictions,
+            "baseline_predictions_added": baseline_predictions,
+            "active_predictions_added": active_predictions,
+            "prediction_evaluation": prediction_evaluation,
+            "validation_forecast": validation_forecast,
+            "phase_sequence": phase_sequence,
             "receipts": receipts,
             "outbox_records": outbox_records,
             "central_sync": sync_result,
             "discovery_topics": self._last_discovery_topics,
             "status": status,
+        }
+        self._write_heartbeat(result)
+        return result
+
+    def run_topic_performance_discovery(
+        self,
+        topic: str,
+        *,
+        max_items: int = 50,
+        platform: str = "youtube",
+    ) -> Dict[str, Any]:
+        """Execute one query-only, performance-ranked discovery lane.
+
+        Script-language demand must not spend its bounded batch on unrelated
+        chart results before the requested query executes.  This path skips
+        charts, adaptive topic expansion, rechecks, forecasts, and in-call
+        retries. Provider query attempts and accepted observations still use
+        the canonical append-only receipt/ingest path.
+        """
+
+        normalized_topic = " ".join(str(topic or "").split())
+        if not normalized_topic:
+            raise ValueError("topic is required")
+        if platform != "youtube":
+            raise ValueError("performance-ranked demand discovery supports youtube")
+        bounded_items = max(1, min(50, int(max_items)))
+        run_id = new_run_id()
+        self.store.start_run(run_id, "script_language_demand_discovery")
+        sources = self._build_sources(
+            run_id, adaptive_topics=False, budget_purpose="discovery"
+        )
+        receipts: List[Dict[str, Any]] = []
+        state = "completed"
+        error_detail = ""
+        trend_observations = 0
+        try:
+            source = next(
+                (
+                    candidate for candidate in sources
+                    if candidate.platform == platform
+                    and callable(getattr(candidate, "discover_performance", None))
+                ),
+                None,
+            )
+            if source is None:
+                state = "failed"
+                error_detail = "performance_discovery_source_unavailable"
+            else:
+                batch = self._circuit_open_batch(source) or source.discover_performance(
+                    normalized_topic,
+                    max_items=bounded_items,
+                    relevance_language=(self.config.languages or ["en"])[0],
+                    region=(self.config.regions or ["US"])[0],
+                )
+                self._persist_batch(batch, run_id)
+                receipts.append(batch.receipt.to_dict())
+                if batch.receipt.state != SourceState.READY:
+                    state = "failed"
+                    error_detail = (
+                        batch.receipt.error_code
+                        or batch.receipt.state.value
+                    )
+                else:
+                    trend_observations = self.store.aggregate_trends(run_id=run_id)
+        except Exception as error:
+            state = "failed"
+            error_detail = f"{type(error).__name__}: {sanitize(str(error))[:300]}"
+        finally:
+            for source in sources:
+                source.close()
+            self.store.finish_run(run_id, state=state, error_detail=error_detail)
+        outbox_records = self.store.enqueue_run_for_sync(run_id)
+        return {
+            "run_id": run_id,
+            "mode": "script_language_demand_discovery",
+            "state": state,
+            "error_detail": error_detail,
+            "trend_observations_added": trend_observations,
+            "predictions_added": 0,
+            "phase_sequence": ["topic_performance_discovery"],
+            "receipts": receipts,
+            "outbox_records": outbox_records,
+            "central_sync": {"state": "deferred_to_scheduler"},
+            "discovery_topics": {
+                "mode": "explicit_performance_query",
+                "topics": [normalized_topic],
+                "platforms": [platform],
+                "adaptive_topics_enabled": False,
+            },
+        }
+
+    def reserve_validation_forecasts(
+        self,
+        *,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Manually form a capacity-backed cohort through the same safe path."""
+
+        run_id = new_run_id()
+        self.store.start_run(run_id, "validation_forecast")
+        state = "completed"
+        error_detail = ""
+        evaluation: Dict[str, Any] = {"state": "not_started"}
+        capabilities: Dict[str, Any] = {"sources": [], "admitted": []}
+        forecast: Dict[str, Any] = {"state": "not_started"}
+        try:
+            evaluation = self.store.evaluate_predictions()
+            if load_active_model(self.config) is None:
+                forecast = {
+                    "state": "no_promoted_model",
+                    "predictions_added": 0,
+                    "reservations_added": 0,
+                }
+            else:
+                capabilities = self._measurement_source_capabilities(run_id)
+                forecast = self.store.forecast_active_trends(
+                    run_id=run_id,
+                    measurement_sources=capabilities["admitted"],
+                    limit=(
+                        self.config.prediction_validation_cohort_limit
+                        if limit is None else max(1, int(limit))
+                    ),
+                )
+            if forecast.get("state") == "blocked_measurement_capacity":
+                state = "degraded"
+        except Exception as error:
+            state = "failed"
+            error_detail = f"{error.__class__.__name__}: {str(error)[:500]}"
+        finally:
+            self.store.finish_run(
+                run_id,
+                state=state,
+                error_detail=error_detail,
+            )
+        outbox_records = self.store.enqueue_run_for_sync(run_id)
+        sink = SupabaseSink(self.config, self.store)
+        try:
+            sync_result = sink.flush()
+        finally:
+            sink.close()
+        result = {
+            "contract": "market_tape_capacity_backed_forecast_run_v1",
+            "run_id": run_id,
+            "state": state,
+            "error_detail": error_detail,
+            "prediction_evaluation": evaluation,
+            "measurement_sources": capabilities,
+            "forecast": forecast,
+            "outbox_records": outbox_records,
+            "central_sync": sync_result,
+            "status": self.store.status(),
         }
         self._write_heartbeat(result)
         return result
@@ -491,7 +730,14 @@ class MarketTapeCollector:
             raise ValueError(
                 "phase must be all, forecast_terminal, or scheduled"
             )
-        sources = self._build_sources(run_id)
+        sources = self._build_sources(
+            run_id,
+            budget_purpose=(
+                "forecast_terminal"
+                if phase in {"all", "forecast_terminal"}
+                else "scheduled"
+            ),
+        )
         source_map = {source.source_id: source for source in sources}
         receipts: List[Dict[str, Any]] = []
         circuit_by_source: Dict[str, ProviderBatch | None] = {}
@@ -510,6 +756,8 @@ class MarketTapeCollector:
                     # forecast's terminal scoring window and must not make the
                     # coverage planner report a false refresh capability.
                     capability_state = "archive_only_no_terminal_refresh"
+                elif not source.terminal_metrics_capable():
+                    capability_state = "metadata_only_no_terminal_metrics"
                 elif source.request_budget <= 0:
                     capability_state = "request_budget_exhausted"
                 elif source.metered and not self.config.allow_metered_reads:
@@ -536,57 +784,21 @@ class MarketTapeCollector:
                     for source in sources
                     if source.source_id in capable_source_ids
                 },
+                forecast_capable_source_ids=capable_source_ids,
+                claim_run_id=(
+                    run_id
+                    if phase in {"all", "forecast_terminal"}
+                    else None
+                ),
                 phase=phase,
             )
             due = plan["polls"]
-            queue_receipt = dict(plan["receipt"])
-            queue_receipt["source_capability"] = source_capability
-            degraded_planner_states = {
-                "no_refresh_capable_platform",
-                "no_refreshable_forecast_member",
-                "refresh_capability_gap",
-                "refresh_capability_and_cycle_capacity_gap",
-                "cycle_capacity_limited",
-            }
-            planner_now = utc_now()
-            planner_source_id = {
-                "all": "market-tape-recheck-planner",
-                "forecast_terminal": (
-                    "market-tape-recheck-planner-terminal"
-                ),
-                "scheduled": "market-tape-recheck-planner-scheduled",
-            }[phase]
-            planner_receipt = SourceReceipt(
-                run_id=run_id,
-                source_id=planner_source_id,
-                platform="all",
-                state=(
-                    SourceState.DEGRADED
-                    if queue_receipt["coverage_state"] in degraded_planner_states
-                    else SourceState.READY
-                ),
-                started_at=planner_now,
-                finished_at=planner_now,
-                request_count=0,
-                discovered_count=0,
-                refreshed_count=0,
-                error_code=(
-                    str(queue_receipt["coverage_state"])
-                    if queue_receipt["coverage_state"] in degraded_planner_states
-                    else ""
-                ),
-                error_detail=(
-                    "Active-model forecast coverage could not be fully queued"
-                    if queue_receipt["coverage_state"] in degraded_planner_states
-                    else ""
-                ),
-                metadata={
-                    "recheck_phase": phase,
-                    "selection_lane": queue_receipt["selection_lane"],
-                    "recheck_plan": queue_receipt,
-                },
+            planner_receipt = self._save_recheck_planner_receipt(
+                run_id,
+                phase=phase,
+                queue_receipt=plan["receipt"],
+                source_capability=source_capability,
             )
-            self.store.save_receipt(planner_receipt)
             receipts.append(planner_receipt.to_dict())
             if not due:
                 return receipts
@@ -596,8 +808,7 @@ class MarketTapeCollector:
                 for row in rows:
                     lane = (
                         "forecast_terminal"
-                        if row.get("recheck_reason")
-                        == "active_model_forecast_terminal_coverage"
+                        if row.get("forecast_coverage")
                         else "scheduled"
                     )
                     grouped.setdefault(
@@ -606,8 +817,12 @@ class MarketTapeCollector:
                     ).append(row)
                 for (source_id, lane), tracked in grouped.items():
                     requires_terminal_refresh = lane == "forecast_terminal"
+                    requires_exact_reserved_source = any(
+                        row.get("measurement_reservation_ids")
+                        for row in tracked
+                    )
                     source = source_map.get(source_id)
-                    if source is None:
+                    if source is None and not requires_exact_reserved_source:
                         candidates = [candidate for candidate in sources if candidate.platform == platform]
                         source = (
                             next((
@@ -627,6 +842,7 @@ class MarketTapeCollector:
                         )
                     if (
                         requires_terminal_refresh
+                        and not requires_exact_reserved_source
                         and (
                             source is None
                             or source.source_id not in capable_source_ids
@@ -640,14 +856,26 @@ class MarketTapeCollector:
                         ), None)
                         source = alternative
                     if source is None:
-                        self.store.mark_poll_failure(
-                            (row["video_id"] for row in tracked),
-                            (
+                        failure_code = (
+                            "reserved_measurement_source_unavailable"
+                            if requires_exact_reserved_source
+                            else (
                                 "forecast_refresh_capability_unavailable"
                                 if requires_terminal_refresh
                                 else "source_unavailable"
-                            ),
+                            )
                         )
+                        self.store.mark_poll_failure(
+                            (row["video_id"] for row in tracked),
+                            failure_code,
+                        )
+                        if requires_exact_reserved_source:
+                            self.store.complete_forecast_measurements(
+                                run_id,
+                                source_id,
+                                (),
+                                error_code=failure_code,
+                            )
                         continue
                     circuit_batch = circuit_by_source.get(source.source_id)
                     if circuit_batch is not None:
@@ -664,7 +892,7 @@ class MarketTapeCollector:
                                 )
                             )
                         )]
-                        if alternatives:
+                        if alternatives and not requires_exact_reserved_source:
                             source = alternatives[0]
                             circuit_batch = None
                     if circuit_batch is not None:
@@ -680,6 +908,17 @@ class MarketTapeCollector:
                             )
                         )
                         self._persist_batch(circuit_batch, run_id)
+                        if requires_exact_reserved_source:
+                            completion = self.store.complete_forecast_measurements(
+                                run_id,
+                                source.source_id,
+                                (),
+                                error_code="source_circuit_open",
+                                completed_at=circuit_batch.receipt.finished_at,
+                            )
+                            circuit_batch.receipt.metadata[
+                                "measurement_completion"
+                            ] = completion
                         receipts.append(circuit_batch.receipt.to_dict())
                         continue
                     batch = source.refresh(tracked)
@@ -692,20 +931,92 @@ class MarketTapeCollector:
                     returned = {item.video_id for item in batch.items}
                     tracked_ids = {str(row["video_id"]) for row in tracked}
                     missing = sorted(tracked_ids - returned)
+                    failure_codes_by_video: Dict[str, str] = {}
                     if missing:
+                        item_failure_code = str(
+                            batch.receipt.metadata.get("item_failure_code")
+                            or batch.receipt.error_code
+                            or "provider_item_missing"
+                        )
                         batch.receipt.failed_count += len(missing)
                         batch.receipt.metadata.update({
                             "tracked_count": len(tracked_ids),
                             "returned_tracked_count": len(tracked_ids & returned),
                             "missing_tracked_count": len(missing),
-                            "item_failure_code": "provider_item_missing",
+                            "item_failure_code": item_failure_code,
                         })
                         self.store.mark_poll_failure(
                             missing,
-                            batch.receipt.error_code or "provider_item_missing",
+                            item_failure_code,
                         )
+                        failure_codes_by_video.update({
+                            video_id: item_failure_code
+                            for video_id in missing
+                        })
                     accepted_ids = self._persist_batch(batch, run_id)
-                    unchanged = returned - accepted_ids
+                    rejected_ids = {
+                        str(value)
+                        for value in batch.receipt.metadata.get(
+                            "rejected_video_ids", []
+                        )
+                        if str(value)
+                    }
+                    failure_codes_by_video.update({
+                        video_id: "counter_regression"
+                        for video_id in rejected_ids
+                    })
+                    if requires_exact_reserved_source:
+                        completion_error = str(
+                            batch.receipt.error_code
+                            or batch.receipt.metadata.get("item_failure_code")
+                            or ""
+                        )
+                        completion = self.store.complete_forecast_measurements(
+                            run_id,
+                            source.source_id,
+                            accepted_ids,
+                            error_code=completion_error,
+                            failure_codes_by_video=failure_codes_by_video,
+                            completed_at=batch.receipt.finished_at,
+                        )
+                        batch.receipt.metadata[
+                            "measurement_completion"
+                        ] = completion
+                        # _persist_batch saved the provider receipt before the
+                        # reservation transition existed. Persist an immutable
+                        # zero-request completion receipt rather than mutating
+                        # that historical row in place.
+                        completion_receipt = SourceReceipt(
+                            run_id=run_id,
+                            source_id=(
+                                f"{source.source_id}-measurement-completion"
+                            ),
+                            platform=source.platform,
+                            state=(
+                                SourceState.READY
+                                if completion["assignments_failed"] == 0
+                                else SourceState.DEGRADED
+                            ),
+                            started_at=batch.receipt.finished_at,
+                            finished_at=batch.receipt.finished_at,
+                            request_count=0,
+                            refreshed_count=completion[
+                                "assignments_fulfilled"
+                            ],
+                            failed_count=completion["assignments_failed"],
+                            error_code=(
+                                completion_error
+                                if completion["assignments_failed"]
+                                else ""
+                            ),
+                            metadata={
+                                "measurement_lane": "forecast_terminal",
+                                "completion": completion,
+                            },
+                        )
+                        self.store.save_receipt(completion_receipt)
+                        receipts.append(completion_receipt.to_dict())
+                    unchanged = returned - accepted_ids - rejected_ids
                     if unchanged:
                         self.store.defer_unchanged_polls(unchanged)
                     receipts.append(batch.receipt.to_dict())
@@ -714,11 +1025,75 @@ class MarketTapeCollector:
                 source.close()
         return receipts
 
-    def _build_sources(self, run_id: str, adaptive_topics: bool = False):
+    def _save_recheck_planner_receipt(
+        self,
+        run_id: str,
+        *,
+        phase: str,
+        queue_receipt: Dict[str, Any],
+        source_capability: Sequence[Dict[str, Any]],
+    ) -> SourceReceipt:
+        """Persist an audit receipt for every planner phase, including no-ops."""
+
+        receipt_payload = dict(queue_receipt)
+        receipt_payload["source_capability"] = list(source_capability)
+        degraded_planner_states = {
+            "no_refresh_capable_platform",
+            "no_refreshable_forecast_member",
+            "refresh_capability_gap",
+            "refresh_capability_and_cycle_capacity_gap",
+            "cycle_capacity_limited",
+        }
+        planner_now = utc_now()
+        planner_source_id = {
+            "all": "market-tape-recheck-planner",
+            "forecast_terminal": "market-tape-recheck-planner-terminal",
+            "scheduled": "market-tape-recheck-planner-scheduled",
+        }[phase]
+        degraded = (
+            receipt_payload["coverage_state"] in degraded_planner_states
+        )
+        planner_receipt = SourceReceipt(
+            run_id=run_id,
+            source_id=planner_source_id,
+            platform="all",
+            state=SourceState.DEGRADED if degraded else SourceState.READY,
+            started_at=planner_now,
+            finished_at=planner_now,
+            request_count=0,
+            discovered_count=0,
+            refreshed_count=0,
+            error_code=(
+                str(receipt_payload["coverage_state"]) if degraded else ""
+            ),
+            error_detail=(
+                "Active-model forecast coverage could not be fully queued"
+                if degraded else ""
+            ),
+            metadata={
+                "recheck_phase": phase,
+                "selection_lane": receipt_payload["selection_lane"],
+                "recheck_plan": receipt_payload,
+            },
+        )
+        self.store.save_receipt(planner_receipt)
+        return planner_receipt
+
+    def _build_sources(
+        self,
+        run_id: str,
+        adaptive_topics: bool = False,
+        *,
+        budget_purpose: str = "general",
+    ):
         def guarded_budget(source_id: str, daily_limit: int) -> int:
             if self.store.daily_provider_cost() >= self.config.max_daily_provider_cost_usd:
                 return 0
-            return self.store.remaining_request_budget(source_id, daily_limit)
+            return self.store.remaining_request_budget(
+                source_id,
+                daily_limit,
+                purpose=budget_purpose,
+            )
 
         source_config = self._adaptive_discovery_config() if adaptive_topics else self.config
         sources = self.source_builder(source_config, run_id, guarded_budget)
@@ -732,6 +1107,99 @@ class MarketTapeCollector:
                 self.store.recent_source_metadata_total(source_id, metadata_key)
             )
         return sources
+
+    def _measurement_source_capabilities(
+        self,
+        run_id: str,
+    ) -> Dict[str, Any]:
+        """Resolve secret-safe terminal capacity without making provider calls."""
+
+        sources = self._build_sources(
+            run_id,
+            budget_purpose="reservation",
+        )
+        capability_receipts: List[Dict[str, Any]] = []
+        admitted: List[Dict[str, Any]] = []
+        try:
+            for source in sources:
+                circuit = self._circuit_open_batch(source)
+                retry_status = self.store.source_retry_status(
+                    source.source_id
+                )
+                if source.platform not in self.config.platforms:
+                    state = "platform_disabled"
+                elif not source.terminal_metrics_capable():
+                    state = "metadata_only_no_terminal_metrics"
+                elif source.metered and not self.config.allow_metered_reads:
+                    state = "metered_reads_disabled"
+                elif not source.credentials_available():
+                    state = "credentials_unavailable"
+                elif circuit is not None:
+                    state = "source_circuit_open"
+                elif not retry_status.get("last_success_at"):
+                    state = "refresh_success_unproven"
+                elif source.request_budget <= 0:
+                    state = "request_budget_exhausted"
+                else:
+                    state = "refresh_capable"
+                receipt = {
+                    "source_id": source.source_id,
+                    "platform": source.platform,
+                    "state": state,
+                    "daily_request_limit": self.config.request_limit_for(
+                        source.platform
+                    ),
+                    "request_budget_remaining": max(
+                        0, int(source.request_budget)
+                    ),
+                    "refresh_batch_size": max(
+                        1, int(source.measurement_refresh_batch_size())
+                    ),
+                    "request_units_per_batch": max(
+                        1, int(source.measurement_request_units_per_batch())
+                    ),
+                    "credential_fingerprint": source.credential_fingerprint(),
+                    "metered": bool(source.metered),
+                    "last_success_at": retry_status.get("last_success_at"),
+                }
+                capability_receipts.append(receipt)
+                if state == "refresh_capable":
+                    admitted.append(receipt)
+        finally:
+            for source in sources:
+                source.close()
+        return {
+            "contract": "market_tape_measurement_source_capabilities_v1",
+            "sources": capability_receipts,
+            "admitted": admitted,
+            "selection_sha256": hashlib.sha256(json.dumps(
+                capability_receipts,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
+        }
+
+    def _forecast_measurement_work_required(self) -> bool:
+        if load_active_model(self.config) is not None:
+            return True
+        now = isoformat(utc_now())
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT 1
+                   FROM mt_forecast_measurement_reservations
+                   WHERE state IN ('reserved', 'claimed')
+                     AND deadline_at > ?
+                   LIMIT 1""",
+                (now,),
+            ).fetchone()
+        return row is not None
+
+    def _scheduled_poll_work_required(self) -> bool:
+        with self.store.connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM mt_poll_queue WHERE due_at <= ? LIMIT 1",
+                (isoformat(utc_now()),),
+            ).fetchone() is not None
 
     def _adaptive_discovery_config(self) -> MarketTapeConfig:
         selected_at = utc_now()
@@ -1031,6 +1499,7 @@ class MarketTapeCollector:
             source for source in sources
             if self.config.target_for(source.platform)
             > self.store.daily_unique_count(source.platform)
+            and source.adaptive_query_execution_capable()
             and int(source.request_budget) > 0
             and source.credentials_available()
             and (not source.metered or self.config.allow_metered_reads)
@@ -1413,6 +1882,8 @@ class MarketTapeCollector:
         ingest_failures = 0
         new_unique_count = 0
         ingest_failure_types: Dict[str, int] = {}
+        rejected_video_ids: set[str] = set()
+        counter_regressions: List[Dict[str, Any]] = []
         for item in batch.items:
             try:
                 observation_added, unique_added = self.store.ingest(item, run_id)
@@ -1423,6 +1894,24 @@ class MarketTapeCollector:
                     duplicates += 1
                 if unique_added:
                     new_unique_count += 1
+            except CounterRegressionError as error:
+                ingest_failures += 1
+                rejected_video_ids.add(error.video_id)
+                ingest_failure_types["CounterRegressionError"] = (
+                    ingest_failure_types.get("CounterRegressionError", 0) + 1
+                )
+                counter_regressions.append({
+                    "video_id": error.video_id,
+                    "observation_id": error.observation_id,
+                    "views": error.views,
+                    "prior_observation_id": error.prior_observation_id,
+                    "prior_views": error.prior_views,
+                    "error_code": "counter_regression",
+                })
+                self.store.mark_poll_failure(
+                    (error.video_id,),
+                    "counter_regression",
+                )
             except (TypeError, ValueError, KeyError) as error:
                 ingest_failures += 1
                 error_type = type(error).__name__
@@ -1436,6 +1925,32 @@ class MarketTapeCollector:
         if ingest_failures:
             batch.receipt.metadata["ingest_failure_count"] = ingest_failures
             batch.receipt.metadata["ingest_failure_types"] = ingest_failure_types
+        if counter_regressions:
+            batch.receipt.metadata.update({
+                "counter_regression_count": len(counter_regressions),
+                "counter_regressions": counter_regressions,
+                "rejected_video_ids": sorted(rejected_video_ids),
+            })
+            batch.receipt.metadata.setdefault(
+                "item_failure_code", "counter_regression"
+            )
+        only_counter_regressions = bool(
+            counter_regressions
+            and len(counter_regressions) == ingest_failures
+        )
+        if (
+            batch.receipt.state == SourceState.READY
+            and only_counter_regressions
+            and not accepted
+        ):
+            batch.receipt.state = SourceState.DEGRADED
+            batch.receipt.error_code = (
+                batch.receipt.error_code or "counter_regression"
+            )
+            batch.receipt.error_detail = (
+                batch.receipt.error_detail
+                or "Provider cumulative counters moved backwards; raw rows were quarantined"
+            )
         if batch.receipt.state == SourceState.READY and ingest_failures and not accepted:
             batch.receipt.state = SourceState.DEGRADED
             batch.receipt.error_code = batch.receipt.error_code or "normalization_failed"
@@ -1471,6 +1986,7 @@ def _recheck_batch_receipt(
     prediction_ids: set[int] = set()
     trend_ids: set[str] = set()
     deadlines: set[str] = set()
+    reservation_ids: set[str] = set()
     for row in tracked:
         reason = str(row.get("recheck_reason") or "scheduled_poll_due")
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
@@ -1487,6 +2003,12 @@ def _recheck_batch_receipt(
         prediction_ids.update(assignment_prediction_ids)
         trend_ids.update(assignment_trend_ids)
         deadlines.update(assignment_deadlines)
+        assignment_reservation_ids = sorted({
+            str(value)
+            for value in row.get("measurement_reservation_ids") or []
+            if str(value)
+        })
+        reservation_ids.update(assignment_reservation_ids)
         assignments.append({
             "video_id": str(row.get("video_id") or ""),
             "platform": str(row.get("platform") or ""),
@@ -1499,6 +2021,7 @@ def _recheck_batch_receipt(
             "coverage_prediction_ids": assignment_prediction_ids,
             "coverage_trend_ids": assignment_trend_ids,
             "coverage_deadlines": assignment_deadlines,
+            "measurement_reservation_ids": assignment_reservation_ids,
         })
     canonical = json.dumps(
         assignments,
@@ -1517,6 +2040,7 @@ def _recheck_batch_receipt(
         "coverage_prediction_ids": sorted(prediction_ids),
         "coverage_trend_ids": sorted(trend_ids),
         "coverage_deadlines": sorted(deadlines),
+        "measurement_reservation_ids": sorted(reservation_ids),
         "assignments": assignments,
         "assignments_sha256": hashlib.sha256(canonical).hexdigest(),
     }

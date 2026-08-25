@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import shlex
 from pathlib import Path
 
@@ -45,12 +46,16 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path, required=True)
     parser.add_argument("--runtime-base", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--rotate-control-token", action="store_true")
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
     runtime_base = args.runtime_base.expanduser().resolve()
+    # Market Tape owns its runtime configuration. Preserve its last private
+    # allowlisted environment first, then fill missing values from this repo.
+    # Do not create a hidden runtime dependency on ACTP or any other service.
     for path in (
-        repo_root.parent / "actp-worker" / ".env",
+        args.output.expanduser(),
         repo_root / ".env",
         repo_root / ".env.production",
         repo_root / ".env.market-tape",
@@ -63,6 +68,14 @@ def main() -> int:
         for name, value in os.environ.items()
         if value and (name.startswith("MARKET_TAPE_") or name in PROVIDER_NAMES)
     }
+    values["MARKET_TAPE_CONTROL_TOKEN"] = (
+        secrets.token_urlsafe(48)
+        if args.rotate_control_token
+        else (
+            str(values.get("MARKET_TAPE_CONTROL_TOKEN") or "").strip()
+            or secrets.token_urlsafe(48)
+        )
+    )
     if not values.get("INSTAGRAM_BUSINESS_ACCOUNT_ID"):
         values["INSTAGRAM_BUSINESS_ACCOUNT_ID"] = values.get("INSTAGRAM_ACCOUNT_ID", "")
     if not values.get("THREADS_USER_ID"):

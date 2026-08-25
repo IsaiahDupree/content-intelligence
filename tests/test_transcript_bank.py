@@ -17,7 +17,7 @@ from services.content_quality.transcript_bank import (
 )
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.models import MarketContent, MetricCounters
-from services.market_tape.store import MarketTapeStore
+from services.market_tape.store import SCHEMA_VERSION, MarketTapeStore
 
 
 def _single_video_bank(
@@ -581,7 +581,7 @@ def test_legacy_attempt_migration_is_complete_honest_and_runs_once(tmp_path):
     assert migration["source_failure_events"] == 1
     assert migration["source_success_artifacts"] == 1
     assert migration["failure_source_url_current_row_fallbacks"] == 1
-    assert schema_version == "9"
+    assert schema_version == str(SCHEMA_VERSION)
     # Legacy attempts have no extractor fingerprint. A current runtime must
     # re-admit these videos instead of converting a historical parser gap into
     # a permanent source blacklist.

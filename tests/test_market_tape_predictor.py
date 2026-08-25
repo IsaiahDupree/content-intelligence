@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from services.market_tape.config import MarketTapeConfig
@@ -11,12 +12,16 @@ from services.market_tape.predictor import (
     ENTRY_HORIZON,
     MODEL_CONTRACT,
     MODEL_FAMILY,
+    OBSERVATION_QUALITY_CONTRACT,
     MarketTapePredictor,
     load_active_model,
     predict_probability,
     predict_trend_snapshot,
 )
-from services.market_tape.store import MarketTapeStore
+from services.market_tape.store import (
+    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+    MarketTapeStore,
+)
 
 
 def test_grouped_logistic_candidate_is_promoted_and_reproducible(tmp_path):
@@ -96,6 +101,8 @@ def test_grouped_logistic_candidate_is_promoted_and_reproducible(tmp_path):
     forecast = store.forecast_active_trends(
         observed + timedelta(minutes=1),
         limit=100,
+        run_id="live-run",
+        measurement_sources=[_measurement_capability()],
     )
     assert forecast["state"] == "completed"
     assert forecast["predictions_added"] == 0
@@ -142,6 +149,29 @@ def test_insufficient_predictor_remains_retestable_without_promotion(tmp_path):
     assert (config.prediction_model_dir / f"{result['model_version']}.json").is_file()
 
 
+def test_pre_quarantine_active_model_is_rejected_fail_closed(tmp_path):
+    config = _config(tmp_path)
+    config.prediction_model_dir.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "contract": "market_tape_trend_predictor_v1",
+        "status": "promoted",
+        "model_family": "grouped-logistic-v2",
+        "model_version": "pre-quarantine-model",
+        "training": {"index_version": "trend-strength-v2"},
+        "model": {"intercept": 0.0, "coefficients": [0.0] * 7},
+    }
+    artifact_path = config.prediction_model_dir / "pre-quarantine-model.json"
+    artifact_path.write_text(json.dumps(artifact, sort_keys=True), encoding="utf-8")
+    (config.prediction_model_dir / "active.json").write_text(json.dumps({
+        "contract": "market_tape_active_predictor_v1",
+        "model_version": artifact["model_version"],
+        "artifact_file": artifact_path.name,
+        "artifact_sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest(),
+    }, sort_keys=True), encoding="utf-8")
+
+    assert load_active_model(config) is None
+
+
 def test_future_label_leakage_cannot_promote_from_real_sqlite(tmp_path):
     config = _config(tmp_path)
     store = MarketTapeStore(config)
@@ -177,6 +207,7 @@ def test_ood_snapshot_abstains_with_diagnostics_and_no_sqlite_prediction(tmp_pat
     assert trained["status"] == "promoted"
 
     observed = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    store.start_run("ood-forecast-run", "discovery")
     with store.connect() as connection:
         _insert_trend_observation(
             connection,
@@ -198,6 +229,8 @@ def test_ood_snapshot_abstains_with_diagnostics_and_no_sqlite_prediction(tmp_pat
     forecast = store.forecast_active_trends(
         observed + timedelta(minutes=1),
         limit=10,
+        run_id="ood-forecast-run",
+        measurement_sources=[_measurement_capability()],
     )
 
     assert forecast["state"] == "completed"
@@ -325,16 +358,11 @@ def test_opportunity_ranker_rejects_generic_and_incoherent_clusters(tmp_path):
                 videos=2,
             )
             for external_id in member_ids:
-                connection.execute(
-                    """INSERT INTO mt_trend_memberships(
-                           trend_id, video_id, confidence, evidence_json,
-                           first_seen_at
-                       ) VALUES(?, ?, 0.95, '{}', ?)""",
-                    (
-                        trend_id,
-                        video_ids[external_id],
-                        observed.isoformat(),
-                    ),
+                _insert_accepted_membership(
+                    connection,
+                    trend_id,
+                    video_ids[external_id],
+                    observed,
                 )
 
     opportunities = store.trend_opportunities(
@@ -397,7 +425,13 @@ def test_early_entry_horizon_rejects_already_hot_baselines(tmp_path):
                     base.isoformat(),
                     ENTRY_HORIZON,
                     (base + timedelta(hours=6)).isoformat(),
-                    json.dumps({"state": "emerging", "trend_strength": 58.0}),
+                    json.dumps({
+                        "state": "emerging",
+                        "trend_strength": 58.0,
+                        "observation_quality_contract": (
+                            OBSERVATION_QUALITY_CONTRACT
+                        ),
+                    }),
                 ),
             )
 
@@ -429,6 +463,19 @@ def _config(tmp_path):
         topics=["measured trend"],
         supabase_sync_enabled=False,
     )
+
+
+def _measurement_capability():
+    return {
+        "state": "refresh_capable",
+        "source_id": "integration-provider",
+        "platform": "youtube",
+        "daily_request_limit": 200,
+        "request_budget_remaining": 200,
+        "refresh_batch_size": 50,
+        "request_units_per_batch": 1,
+        "credential_fingerprint": "a" * 64,
+    }
 
 
 def _insert_labeled_predictions(
@@ -499,13 +546,42 @@ def _insert_opportunity_fixture(store, model_version, observed):
                 ),
             )
             if trend_id == "specific-opportunity":
-                connection.execute(
-                    """INSERT INTO mt_trend_memberships(
-                           trend_id, video_id, confidence, evidence_json,
-                           first_seen_at
-                       ) VALUES(?, ?, 0.95, '{}', ?)""",
-                    (trend_id, source_video_id, observed.isoformat()),
+                _insert_accepted_membership(
+                    connection,
+                    trend_id,
+                    source_video_id,
+                    observed,
                 )
+
+
+def _insert_accepted_membership(connection, trend_id, video_id, observed):
+    evidence = connection.execute(
+        """SELECT observation_id
+           FROM mt_accepted_full_evidence_v1
+           WHERE video_id = ?
+           ORDER BY accepted_at DESC, observation_id DESC
+           LIMIT 1""",
+        (video_id,),
+    ).fetchone()
+    assert evidence is not None
+    connection.execute(
+        """INSERT INTO mt_trend_memberships(
+               trend_id, video_id, confidence, evidence_json, first_seen_at
+           ) VALUES(?, ?, 0.95, '{}', ?)""",
+        (trend_id, video_id, observed.isoformat()),
+    )
+    connection.execute(
+        """INSERT INTO mt_trend_membership_lineage(
+               trend_id, video_id, observation_id, linked_at, contract
+           ) VALUES(?, ?, ?, ?, ?)""",
+        (
+            trend_id,
+            video_id,
+            int(evidence["observation_id"]),
+            observed.isoformat(),
+            ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+        ),
+    )
 
 
 def _insert_trend_observation(
@@ -549,11 +625,12 @@ def _insert_trend_observation(
                counter_delta_videos, activity_coverage, median_video_velocity,
                p90_video_velocity, creator_breadth, platform_breadth,
                top1_concentration, top10_concentration, momentum, acceleration,
-               relative_strength, saturation, trend_strength, index_version, state
+               relative_strength, saturation, trend_strength, index_version,
+               observation_quality_contract, state
            ) VALUES(?, ?, ?, ?, ?, ?, ?, 100000, 10000, 1000, 500,
                     1000, 100, 10, 5, ?, 0.5,
                     2.0, 4.0, 0.8, 0.5, 0.2, 0.6, ?, ?, ?,
-                    ?, ?, 'trend-strength-v2', ?)""",
+                    ?, ?, 'trend-strength-v2', ?, ?)""",
         (
             trend_id,
             observed.isoformat(),
@@ -568,6 +645,7 @@ def _insert_trend_observation(
             relative_strength,
             saturation,
             strength,
+            OBSERVATION_QUALITY_CONTRACT,
             state,
         ),
     )
@@ -575,6 +653,7 @@ def _insert_trend_observation(
 
 def _positive_features():
     return {
+        "observation_quality_contract": OBSERVATION_QUALITY_CONTRACT,
         "index_version": "trend-strength-v2",
         "trend_strength": 66.0,
         "relative_strength": 2.5,
@@ -590,6 +669,7 @@ def _positive_features():
 
 def _negative_features():
     return {
+        "observation_quality_contract": OBSERVATION_QUALITY_CONTRACT,
         "index_version": "trend-strength-v2",
         "trend_strength": 40.0,
         "relative_strength": 0.2,

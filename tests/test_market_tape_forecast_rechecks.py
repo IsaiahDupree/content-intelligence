@@ -14,7 +14,10 @@ import pytest
 from services.market_tape.collector import MarketTapeCollector
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.models import MarketContent, MetricCounters
-from services.market_tape.predictor import ENTRY_HORIZON
+from services.market_tape.predictor import (
+    ENTRY_HORIZON,
+    OBSERVATION_QUALITY_CONTRACT,
+)
 from services.market_tape.sources.local_research import LocalResearchSource
 from services.market_tape.sources.youtube import YouTubeSource
 from services.market_tape.store import MarketTapeStore
@@ -325,7 +328,10 @@ def _write_active_model(config):
         "model_purpose": "early_breakout_entry",
         "model_version": model_version,
         "training_dataset_sha256": "b" * 64,
-        "training": {"index_version": "trend-strength-v2"},
+        "training": {
+            "index_version": "trend-strength-v2",
+            "observation_quality_contract": OBSERVATION_QUALITY_CONTRACT,
+        },
         "model": {
             "intercept": 0.0,
             "coefficients": [0.0] * 7,
@@ -409,12 +415,34 @@ def _seed_open_forecasts(
                        subject_type, subject_id, model_version, predicted_at,
                        horizon, probability, expected_remaining_life_hours,
                        features_json
-                   ) VALUES('trend', ?, ?, ?, ?, 0.6, 12.0, '{}')""",
+                   ) VALUES('trend', ?, ?, ?, ?, 0.6, 12.0, ?)""",
                 (
                     trend_id,
                     model_version,
                     predicted_at.isoformat(),
                     ENTRY_HORIZON,
+                    json.dumps({
+                        "observation_quality_contract": (
+                            OBSERVATION_QUALITY_CONTRACT
+                        ),
+                    }),
+                ),
+            )
+            observation_id = int(connection.execute(
+                """SELECT observation_id FROM mt_market_observations
+                   WHERE observation_key = ?""",
+                (forecast_item.observation_key,),
+            ).fetchone()[0])
+            connection.execute(
+                """INSERT INTO mt_trend_membership_lineage(
+                       trend_id, video_id, observation_id, linked_at, contract
+                   ) VALUES(?, ?, ?, ?, ?)""",
+                (
+                    trend_id,
+                    forecast_item.video_id,
+                    observation_id,
+                    predicted_at.isoformat(),
+                    "market_tape_accepted_observation_evidence_v1",
                 ),
             )
             prediction_ids.append(int(cursor.lastrowid))
@@ -460,10 +488,10 @@ def _insert_trend_observation(connection, *, trend_id, observed_at):
                p90_video_velocity, creator_breadth, platform_breadth,
                top1_concentration, top10_concentration, momentum, acceleration,
                relative_strength, saturation, trend_strength, index_version,
-               state
+               observation_quality_contract, state
            ) VALUES(?, ?, 2, 1, 2, 1, 1, 10000, 1000, 100, 50,
                     1000, 100, 10, 5, 1, 0.5, 1.0, 2.0, 0.8, 0.5,
                     0.5, 1.0, 1.0, 0.5, 1.0, 0.2, 60.0,
-                    'trend-strength-v2', 'emerging')""",
-        (trend_id, observed_at.isoformat()),
+                    'trend-strength-v2', ?, 'emerging')""",
+        (trend_id, observed_at.isoformat(), OBSERVATION_QUALITY_CONTRACT),
     )

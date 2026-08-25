@@ -19,7 +19,10 @@ from services.market_tape.collector import MarketTapeCollector
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.full_pipeline import pipeline_state, run_full_pipeline
 from services.market_tape.models import MarketContent, MetricCounters, utc_now
-from services.market_tape.store import MarketTapeStore
+from services.market_tape.store import (
+    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+    MarketTapeStore,
+)
 
 
 @pytest.fixture
@@ -155,6 +158,31 @@ class TestFullPipeline:
                 ) VALUES(?, ?, ?, ?, ?)
                 """,
                 ("trend:test:explicit-target", target_video_id, 1.0, "{}", now),
+            )
+            observation = connection.execute(
+                """
+                SELECT observation_id
+                FROM mt_accepted_full_evidence_v1
+                WHERE video_id = ?
+                ORDER BY accepted_at DESC, observation_id DESC
+                LIMIT 1
+                """,
+                (target_video_id,),
+            ).fetchone()
+            assert observation is not None
+            connection.execute(
+                """
+                INSERT INTO mt_trend_membership_lineage(
+                    trend_id, video_id, observation_id, linked_at, contract
+                ) VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    "trend:test:explicit-target",
+                    target_video_id,
+                    int(observation["observation_id"]),
+                    now,
+                    ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
+                ),
             )
             connection.commit()
         collector = MarketTapeCollector(market_config, store, source_builder=lambda *_: [])

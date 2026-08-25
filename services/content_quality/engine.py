@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .contracts import is_supported_transcript_audit_contract
+from .narrative_coherence import NarrativeCoherenceService
+from .script_intelligence import ScriptIntelligenceService
+
 
 UTC = timezone.utc
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
@@ -60,6 +64,40 @@ def words(text: str) -> list[str]:
 
 def clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
+
+
+def verified_transcript_patterns(
+    receipts: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Admit one receipt per immutable transcript/observation artifact.
+
+    One transcript can be discovered under several topic queries. Counting
+    those topic-specific receipts as independent sources inflates cohort size,
+    views, and language recurrence, so every downstream gate deduplicates on
+    the artifact identity before measuring evidence sufficiency.
+    """
+
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in receipts:
+        payload = item.get("payload") or {}
+        qualification = payload.get("performance_qualification") or {}
+        transcript_id = str(payload.get("transcript_id") or "").strip()
+        observation_key = str(payload.get("observation_key") or "").strip()
+        if (
+            item.get("receipt_type") != "viral_transcript_pattern"
+            or payload.get("transcript_source") != "local_whisper"
+            or qualification.get("audit_decision") != "PASS"
+            or not is_supported_transcript_audit_contract(
+                qualification.get("audit_contract")
+            )
+            or not transcript_id
+            or not observation_key
+            or len(str(payload.get("audio_sha256") or "")) != 64
+            or len(str(payload.get("transcript_sha256") or "")) != 64
+        ):
+            continue
+        unique.setdefault((transcript_id, observation_key), item)
+    return list(unique.values())
 
 
 class QualityStore:
@@ -113,10 +151,78 @@ class QualityStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cq_script_briefs (
+                    brief_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    trend_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    receipt_id TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(receipt_id) REFERENCES cq_receipts(receipt_id)
+                );
+                CREATE TABLE IF NOT EXISTS cq_workflow_runs (
+                    workflow_id TEXT PRIMARY KEY,
+                    brief_id TEXT NOT NULL,
+                    script_id TEXT,
+                    state TEXT NOT NULL,
+                    stage_receipts_json TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(brief_id) REFERENCES cq_script_briefs(brief_id)
+                );
+                CREATE TABLE IF NOT EXISTS cq_agent_queries (
+                    query_id TEXT PRIMARY KEY,
+                    principal TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    parameters_sha256 TEXT NOT NULL,
+                    response_sha256 TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    duration_ms REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_cq_receipts_type_created
                     ON cq_receipts(receipt_type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cq_audits_type_created
                     ON cq_audits(audit_type, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_cq_briefs_created
+                    ON cq_script_briefs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_cq_workflows_created
+                    ON cq_workflow_runs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_cq_agent_queries_created
+                    ON cq_agent_queries(created_at DESC);
+                CREATE TRIGGER IF NOT EXISTS cq_script_briefs_no_update
+                BEFORE UPDATE ON cq_script_briefs
+                BEGIN
+                    SELECT RAISE(ABORT, 'script intelligence briefs are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_script_briefs_no_delete
+                BEFORE DELETE ON cq_script_briefs
+                BEGIN
+                    SELECT RAISE(ABORT, 'script intelligence briefs are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_workflow_runs_no_update
+                BEFORE UPDATE ON cq_workflow_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'script workflow runs are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_workflow_runs_no_delete
+                BEFORE DELETE ON cq_workflow_runs
+                BEGIN
+                    SELECT RAISE(ABORT, 'script workflow runs are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_agent_queries_no_update
+                BEFORE UPDATE ON cq_agent_queries
+                BEGIN
+                    SELECT RAISE(ABORT, 'agent queries are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_agent_queries_no_delete
+                BEFORE DELETE ON cq_agent_queries
+                BEGIN
+                    SELECT RAISE(ABORT, 'agent queries are append-only');
+                END;
                 """
             )
             connection.commit()
@@ -137,9 +243,7 @@ class QualityStore:
                 INSERT INTO cq_receipts
                     (receipt_id, receipt_type, source_type, source_id, source_url, payload_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(receipt_id) DO UPDATE SET
-                    source_url=excluded.source_url,
-                    payload_json=excluded.payload_json
+                ON CONFLICT(receipt_id) DO NOTHING
                 """,
                 (
                     receipt_id,
@@ -152,29 +256,40 @@ class QualityStore:
                 ),
             )
             connection.commit()
-        return {
-            "receipt_id": receipt_id,
-            "receipt_type": receipt_type,
-            "source_type": source_type,
-            "source_id": source_id,
-            "source_url": source_url,
-            "payload": payload,
-            "created_at": created_at,
-        }
+            stored = connection.execute(
+                "SELECT * FROM cq_receipts WHERE receipt_id=?", (receipt_id,)
+            ).fetchone()
+        return self._receipt_row(stored)
 
-    def receipts(self, receipt_ids: Sequence[str] | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    def receipts(
+        self,
+        receipt_ids: Sequence[str] | None = None,
+        limit: int = 50,
+        receipt_type: str | None = None,
+    ) -> list[dict[str, Any]]:
         with closing(self.connect()) as connection:
             if receipt_ids:
                 marks = ",".join("?" for _ in receipt_ids)
-                rows = connection.execute(
-                    f"SELECT * FROM cq_receipts WHERE receipt_id IN ({marks}) ORDER BY created_at DESC",
-                    tuple(receipt_ids),
-                ).fetchall()
+                query = f"SELECT * FROM cq_receipts WHERE receipt_id IN ({marks})"
+                parameters: list[Any] = list(receipt_ids)
+                if receipt_type:
+                    query += " AND receipt_type=?"
+                    parameters.append(receipt_type)
+                query += " ORDER BY created_at DESC"
+                rows = connection.execute(query, parameters).fetchall()
             else:
+                where = "WHERE receipt_type=?" if receipt_type else ""
+                parameters = [receipt_type] if receipt_type else []
+                parameters.append(max(1, min(limit, 500)))
                 rows = connection.execute(
-                    "SELECT * FROM cq_receipts ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 500)),)
+                    f"SELECT * FROM cq_receipts {where} ORDER BY created_at DESC LIMIT ?",
+                    parameters,
                 ).fetchall()
         return [self._receipt_row(row) for row in rows]
+
+    def receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        rows = self.receipts([receipt_id])
+        return rows[0] if rows else None
 
     @staticmethod
     def _receipt_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -192,9 +307,10 @@ class QualityStore:
         with closing(self.connect()) as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO cq_scripts
+                INSERT INTO cq_scripts
                     (script_id, topic, objective, source_receipts_json, script_json, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(script_id) DO NOTHING
                 """,
                 (
                     script["script_id"],
@@ -237,6 +353,7 @@ class QualityStore:
             if row["audit_type"] not in latest:
                 latest[row["audit_type"]] = dict(row)
         required = {
+            "narrative_coherence": "PASS",
             "relatability_script": "PASS",
             "attention_script": "PASS",
             "attention_video_preflight": "PASS",
@@ -260,28 +377,159 @@ class QualityStore:
         with closing(self.connect()) as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO cq_audits
+                INSERT INTO cq_audits
                     (audit_id, audit_type, subject_id, decision, score, findings_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(audit_id) DO NOTHING
                 """,
                 (audit_id, audit_type, subject_id, decision, score, json.dumps(findings, sort_keys=True), created_at),
             )
             connection.commit()
+            row = connection.execute(
+                "SELECT * FROM cq_audits WHERE audit_id=?", (audit_id,)
+            ).fetchone()
         return {
-            "audit_id": audit_id,
-            "audit_type": audit_type,
-            "subject_id": subject_id,
-            "decision": decision,
-            "score": round(score, 1),
-            "findings": findings,
-            "created_at": created_at,
+            "audit_id": row["audit_id"],
+            "audit_type": row["audit_type"],
+            "subject_id": row["subject_id"],
+            "decision": row["decision"],
+            "score": round(float(row["score"]), 1),
+            "findings": json.loads(row["findings_json"]),
+            "created_at": row["created_at"],
         }
+
+    def put_script_brief(self, brief: dict[str, Any], receipt_id: str) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO cq_script_briefs(
+                    brief_id, contract, trend_id, snapshot_id, status,
+                    receipt_id, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(brief_id) DO NOTHING
+                """,
+                (
+                    brief["brief_id"], brief["contract"], brief["trend"]["trend_id"],
+                    brief["database_snapshot"]["snapshot_id"], brief["status"],
+                    receipt_id, json.dumps(brief, sort_keys=True), brief["created_at"],
+                ),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT payload_json FROM cq_script_briefs WHERE brief_id=?",
+                (brief["brief_id"],),
+            ).fetchone()
+        return json.loads(row["payload_json"])
+
+    def script_brief(self, brief_id: str) -> dict[str, Any] | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM cq_script_briefs WHERE brief_id=?",
+                (brief_id,),
+            ).fetchone()
+        return json.loads(row["payload_json"]) if row else None
+
+    def script_brief_receipt_id(self, brief_id: str) -> str | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT receipt_id FROM cq_script_briefs WHERE brief_id=?",
+                (brief_id,),
+            ).fetchone()
+        return str(row["receipt_id"]) if row else None
+
+    def script_briefs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM cq_script_briefs ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(limit, 200)),),
+            ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def put_workflow_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO cq_workflow_runs(
+                    workflow_id, brief_id, script_id, state, stage_receipts_json,
+                    result_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workflow_id) DO NOTHING
+                """,
+                (
+                    run["workflow_id"], run["brief_id"], run.get("script_id"),
+                    run["state"], json.dumps(run.get("stage_receipts") or {}, sort_keys=True),
+                    json.dumps(run.get("result") or {}, sort_keys=True), run["created_at"],
+                ),
+            )
+            connection.commit()
+        return run
+
+    def workflow_runs(
+        self,
+        *,
+        brief_id: str | None = None,
+        script_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if brief_id:
+            clauses.append("brief_id=?")
+            parameters.append(brief_id)
+        if script_id:
+            clauses.append("script_id=?")
+            parameters.append(script_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(max(1, min(limit, 200)))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT workflow_id, brief_id, script_id, state,
+                           stage_receipts_json, result_json, created_at
+                    FROM cq_workflow_runs {where}
+                    ORDER BY created_at DESC LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [
+            {
+                "workflow_id": row["workflow_id"],
+                "brief_id": row["brief_id"],
+                "script_id": row["script_id"],
+                "state": row["state"],
+                "stage_receipts": json.loads(row["stage_receipts_json"]),
+                "result": json.loads(row["result_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def put_agent_query(self, row: dict[str, Any]) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO cq_agent_queries(
+                    query_id, principal, operation, parameters_sha256,
+                    response_sha256, outcome, row_count, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(query_id) DO NOTHING
+                """,
+                (
+                    row["query_id"], row["principal"], row["operation"],
+                    row["parameters_sha256"], row["response_sha256"], row["outcome"],
+                    int(row.get("row_count") or 0), float(row.get("duration_ms") or 0.0),
+                    row["created_at"],
+                ),
+            )
+            connection.commit()
+        return row
 
     def counts(self) -> dict[str, int]:
         with closing(self.connect()) as connection:
             return {
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                for table in ("cq_receipts", "cq_scripts", "cq_audits", "cq_retention")
+                for table in (
+                    "cq_receipts", "cq_scripts", "cq_audits", "cq_retention",
+                    "cq_script_briefs", "cq_workflow_runs", "cq_agent_queries",
+                )
             }
 
 
@@ -289,22 +537,94 @@ class MarketTapeReader:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
 
+    # ── evidence tiers ────────────────────────────────────────────────
+    # The v11 tape exposes accepted-evidence views; a backfilled tape may hold
+    # only metric-scope evidence (no descriptive lineage yet); an older tape
+    # has no views at all. Every reader path names the tier it used so a
+    # receipt can say what its topic match rested on.
+    def _tape_shape(self, connection: sqlite3.Connection) -> dict[str, Any]:
+        names = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            ).fetchall()
+        }
+        observation_columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(mt_market_observations)"
+            ).fetchall()
+        }
+        has_metric_view = "mt_accepted_metric_observations_v1" in names
+        has_full_view = "mt_accepted_full_evidence_v1" in names
+        full_rows = (
+            connection.execute("SELECT COUNT(*) FROM mt_accepted_full_evidence_v1").fetchone()[0]
+            if has_full_view else 0
+        )
+        quality_table = "mt_observation_quality_flags" in names
+        confidence_predicate = (
+            "observation.source_confidence > 0"
+            if "source_confidence" in observation_columns else "1 = 1"
+        )
+        quality_predicate = (
+            f"""{confidence_predicate} AND NOT EXISTS (
+                   SELECT 1 FROM mt_observation_quality_flags quality
+                   WHERE quality.observation_id = observation.observation_id
+               )"""
+            if quality_table else confidence_predicate
+        )
+        if has_metric_view and full_rows > 0:
+            tier = "full"
+        elif has_metric_view:
+            tier = "metric_only"
+        else:
+            tier = "legacy"
+        observation_source = (
+            "mt_accepted_metric_observations_v1" if has_metric_view else
+            f"(SELECT observation.* FROM mt_market_observations observation WHERE {quality_predicate})"
+        )
+        return {
+            "tier": tier,
+            "has_metric_view": has_metric_view,
+            "has_full_view": has_full_view,
+            "full_rows": int(full_rows),
+            "quality_table": quality_table,
+            "quality_predicate": quality_predicate,
+            "observation_source": observation_source,
+        }
+
     def health(self) -> dict[str, Any]:
         if not self.path.exists():
             return {"status": "down", "path": str(self.path), "error": "market_tape_database_missing"}
         try:
             with closing(self.connect()) as connection:
+                shape = self._tape_shape(connection)
                 videos = connection.execute("SELECT COUNT(*) FROM mt_videos").fetchone()[0]
                 observations = connection.execute("SELECT COUNT(*) FROM mt_market_observations").fetchone()[0]
+                quarantined = (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM mt_observation_quality_flags"
+                    ).fetchone()[0]
+                    if shape["quality_table"] else 0
+                )
+                analytics_eligible = connection.execute(
+                    f"SELECT COUNT(*) FROM {shape['observation_source']}"
+                ).fetchone()[0]
                 transcripts = connection.execute(
-                    "SELECT COUNT(*) FROM mt_content_genomes WHERE length(trim(COALESCE(transcript, ''))) > 0"
+                    f"""SELECT COUNT(DISTINCT genome.video_id)
+                        FROM mt_content_genomes genome
+                        JOIN {shape['observation_source']} observation
+                          ON observation.video_id = genome.video_id
+                        WHERE length(trim(COALESCE(genome.transcript, ''))) > 0"""
                 ).fetchone()[0]
             return {
                 "status": "up",
                 "path": str(self.path),
                 "videos": int(videos),
                 "observations": int(observations),
+                "analytics_eligible_observations": int(analytics_eligible),
+                "quarantined_observations": int(quarantined),
                 "transcripts": int(transcripts),
+                "evidence_tier": shape["tier"],
+                "full_evidence_rows": shape["full_rows"],
             }
         except (sqlite3.Error, OSError) as exc:
             return {"status": "down", "path": str(self.path), "error": str(exc)}
@@ -319,14 +639,26 @@ class MarketTapeReader:
             token.lower() for token in words(topic)
             if (len(token) > 2 or token.lower() == "ai") and token.lower() not in STOP_WORDS
         ][:6]
+        # Descriptive text comes from accepted full evidence when the tape has
+        # it, otherwise from mt_videos (labelled so). It is only used to match
+        # the topic; persistence downstream still demands a Whisper artifact.
+        descriptive = {
+            "title": "COALESCE(e.title, v.title)",
+            "caption": "COALESCE(e.caption, v.caption)",
+            "description": "COALESCE(e.description, v.description)",
+            "url": "COALESCE(e.url, v.url)",
+            "duration_seconds": "COALESCE(e.duration_seconds, v.duration_seconds)",
+        }
         where = ""
         params: list[Any] = []
         if tokens:
             clauses = []
             for token in tokens:
                 clauses.append(
-                    "lower(COALESCE(v.title,'') || ' ' || COALESCE(v.caption,'') || ' ' || "
-                    "COALESCE(v.description,'') || ' ' || COALESCE(g.transcript,'')) LIKE ?"
+                    f"lower(COALESCE({descriptive['title']},'') || ' ' || "
+                    f"COALESCE({descriptive['caption']},'') || ' ' || "
+                    f"COALESCE({descriptive['description']},'') || ' ' || "
+                    "COALESCE(g.transcript,'')) LIKE ?"
                 )
                 params.append(f"%{token}%")
             where = "WHERE (" + " OR ".join(clauses) + ")"
@@ -335,17 +667,34 @@ class MarketTapeReader:
         # "for"; those could become persisted evidence receipts. Stop words are excluded
         # above and multi-word topics must match at least two meaningful terms.
         params.append(max(1, min(limit * 5, 500)))
-        query = f"""
+        with closing(self.connect()) as connection:
+            shape = self._tape_shape(connection)
+            tier = shape["tier"]
+            if shape["has_full_view"]:
+                evidence_join = (
+                    "LEFT JOIN mt_accepted_full_evidence_v1 e ON e.observation_id = o.observation_id"
+                )
+                scope_expr = f"CASE WHEN e.observation_id IS NULL THEN '{tier}' ELSE 'full' END"
+            else:
+                evidence_join = (
+                    "LEFT JOIN (SELECT NULL AS observation_id, NULL AS title, NULL AS caption, "
+                    "NULL AS description, NULL AS url, NULL AS duration_seconds) e "
+                    "ON e.observation_id = o.observation_id"
+                )
+                scope_expr = f"'{tier}'"
+            query = f"""
             WITH latest AS (
-                SELECT o.*
-                FROM mt_market_observations o
-                JOIN (
-                    SELECT video_id, MAX(observed_at) AS observed_at
-                    FROM mt_market_observations GROUP BY video_id
-                ) pick ON pick.video_id=o.video_id AND pick.observed_at=o.observed_at
+                SELECT o.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY o.video_id
+                           ORDER BY o.observed_at DESC, o.observation_id DESC
+                       ) AS row_number
+                FROM {shape['observation_source']} o
             )
-            SELECT v.video_id, v.platform, v.external_id, v.creator_id, v.title, v.caption,
-                   v.description, v.url, v.duration_seconds, v.first_seen_at,
+            SELECT v.video_id, v.platform, v.external_id, v.creator_id,
+                   {descriptive['title']} AS title, {descriptive['caption']} AS caption,
+                   {descriptive['description']} AS description, {descriptive['url']} AS url,
+                   {descriptive['duration_seconds']} AS duration_seconds, v.first_seen_at,
                    COALESCE(g.transcript, '') AS transcript,
                    COALESCE(g.opening_words, '') AS opening_words,
                    COALESCE(g.hook_type, '') AS hook_type,
@@ -354,18 +703,22 @@ class MarketTapeReader:
                    COALESCE(o.view_velocity, 0) AS velocity,
                    COALESCE(o.view_acceleration, 0) AS acceleration,
                    COALESCE(o.relative_strength, 0) AS relative_strength,
-                   o.observation_key, o.observed_at
+                   o.observation_key, o.observed_at,
+                   {scope_expr} AS evidence_scope,
+                   CASE WHEN e.observation_id IS NULL THEN 'mt_videos' ELSE 'accepted_evidence' END
+                       AS descriptive_source
             FROM mt_videos v
+            JOIN latest o ON o.video_id=v.video_id AND o.row_number=1
+            {evidence_join}
             LEFT JOIN mt_content_genomes g ON g.video_id=v.video_id
-            LEFT JOIN latest o ON o.video_id=v.video_id
             {where}
-            ORDER BY CASE WHEN length(trim(COALESCE(g.transcript, ''))) > 0 THEN 0 ELSE 1 END,
+            ORDER BY CASE WHEN e.observation_id IS NULL THEN 1 ELSE 0 END,
+                     CASE WHEN length(trim(COALESCE(g.transcript, ''))) > 0 THEN 0 ELSE 1 END,
                      COALESCE(o.relative_strength, 0) DESC,
                      COALESCE(o.view_velocity, 0) DESC,
                      COALESCE(o.views, 0) DESC
             LIMIT ?
         """
-        with closing(self.connect()) as connection:
             rows = connection.execute(query, params).fetchall()
         result = [dict(row) for row in rows]
         if tokens:
@@ -385,18 +738,201 @@ class MarketTapeReader:
             result = qualified
         return result[:limit]
 
-    def transcript_artifact(self, video_id: str) -> dict[str, Any] | None:
+    def transcript_candidates(
+        self,
+        topic: str,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Search only accepted, artifact-bound language evidence.
+
+        Trend discovery needs the whole Market Tape; script language does not.
+        Scanning every latest market observation to find the small subset with a
+        Whisper artifact made a cold product request take nearly two minutes.
+        This lane starts at the immutable artifact ledger, uses accepted evidence
+        only when resolving each artifact, and retains the same exact-word topic
+        qualification as :meth:`candidates`.
+        """
+
+        bounded_limit = max(1, min(int(limit), 500))
+        tokens = [
+            token.lower() for token in words(topic)
+            if (len(token) > 2 or token.lower() == "ai")
+            and token.lower() not in STOP_WORDS
+        ][:6]
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        searchable = (
+            "COALESCE(evidence.title, video.title, '') || ' ' || "
+            "COALESCE(evidence.caption, video.caption, '') || ' ' || "
+            "COALESCE(evidence.description, video.description, '') || ' ' || "
+            "COALESCE(genome.transcript, '')"
+        )
+        for token in tokens:
+            clauses.append(f"lower({searchable}) LIKE ?")
+            parameters.append(f"%{token}%")
+        where = "WHERE (" + " OR ".join(clauses) + ")" if clauses else ""
+        # Widen small calls before exact-word filtering, but keep one bounded
+        # artifact lookup compatible with SQLite's parameter limits.
+        parameters.append(max(bounded_limit, min(500, bounded_limit * 5)))
+        with closing(self.connect()) as connection:
+            shape = self._tape_shape(connection)
+            if shape["has_full_view"]:
+                evidence_join = (
+                    "LEFT JOIN mt_accepted_full_evidence_v1 evidence "
+                    "ON evidence.video_id = artifact.video_id "
+                    "AND evidence.observation_key = artifact.observation_key"
+                )
+            else:
+                evidence_join = (
+                    "LEFT JOIN (SELECT NULL AS video_id, NULL AS observation_key, "
+                    "NULL AS title, NULL AS caption, NULL AS description) evidence "
+                    "ON 1 = 0"
+                )
+            rows = connection.execute(
+                f"""
+                SELECT artifact.video_id, MAX(artifact.created_at) AS created_at
+                FROM mt_transcript_artifacts artifact
+                JOIN mt_videos video ON video.video_id = artifact.video_id
+                {evidence_join}
+                LEFT JOIN mt_content_genomes genome
+                  ON genome.video_id = artifact.video_id
+                {where}
+                GROUP BY artifact.video_id
+                ORDER BY created_at DESC, artifact.video_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        resolved = self.artifact_bound_candidates([
+            str(row["video_id"]) for row in rows
+        ])
+        if tokens:
+            minimum_matches = 1 if len(tokens) == 1 else 2
+            qualified: list[dict[str, Any]] = []
+            for row in resolved:
+                source_words = {
+                    token.lower() for token in words(" ".join(
+                        str(row.get(field) or "")
+                        for field in (
+                            "title", "caption", "description", "transcript",
+                        )
+                    ))
+                }
+                match_count = sum(token in source_words for token in tokens)
+                if match_count >= minimum_matches:
+                    row["topic_match_count"] = match_count
+                    qualified.append(row)
+            resolved = qualified
+        return resolved[:bounded_limit]
+
+    def artifact_bound_candidates(
+        self,
+        video_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Return each video's newest artifact and its original accepted snapshot.
+
+        A later monotonic metric recheck must not invalidate a transcript that was
+        already hash-bound and audited against an earlier accepted observation.
+        Fresh trend selection and immutable transcript qualification are separate
+        clocks, so this query joins the artifact back to *its* observation_key.
+        """
+
+        identifiers = list(dict.fromkeys(str(value) for value in video_ids if value))[:500]
+        if not identifiers:
+            return []
+        marks = ",".join("?" for _ in identifiers)
+        with closing(self.connect()) as connection:
+            shape = self._tape_shape(connection)
+            if shape["has_full_view"]:
+                evidence_join = (
+                    "LEFT JOIN mt_accepted_full_evidence_v1 evidence "
+                    "ON evidence.observation_id = observation.observation_id"
+                )
+                scope_expr = (
+                    "CASE WHEN evidence.observation_id IS NULL "
+                    f"THEN '{shape['tier']}' ELSE 'full' END"
+                )
+            else:
+                evidence_join = (
+                    "LEFT JOIN (SELECT NULL AS observation_id, NULL AS title, "
+                    "NULL AS caption, NULL AS description, NULL AS url, "
+                    "NULL AS duration_seconds) evidence "
+                    "ON evidence.observation_id = observation.observation_id"
+                )
+                scope_expr = f"'{shape['tier']}'"
+            rows = connection.execute(
+                f"""
+                WITH accepted_artifacts AS (
+                    SELECT artifact.video_id, artifact.observation_key,
+                           artifact.created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY artifact.video_id
+                               ORDER BY artifact.created_at DESC,
+                                        artifact.transcript_id DESC
+                           ) AS row_number
+                    FROM mt_transcript_artifacts artifact
+                    JOIN {shape['observation_source']} accepted
+                      ON accepted.video_id = artifact.video_id
+                     AND accepted.observation_key = artifact.observation_key
+                    WHERE artifact.video_id IN ({marks})
+                )
+                SELECT video.video_id, video.platform, video.external_id,
+                       video.creator_id,
+                       COALESCE(evidence.title, video.title) AS title,
+                       COALESCE(evidence.caption, video.caption) AS caption,
+                       COALESCE(evidence.description, video.description) AS description,
+                       COALESCE(evidence.url, video.url) AS url,
+                       COALESCE(evidence.duration_seconds, video.duration_seconds)
+                           AS duration_seconds,
+                       video.first_seen_at,
+                       COALESCE(genome.transcript, '') AS transcript,
+                       COALESCE(genome.opening_words, '') AS opening_words,
+                       COALESCE(genome.hook_type, '') AS hook_type,
+                       COALESCE(observation.views, 0) AS views,
+                       COALESCE(observation.likes, 0) AS likes,
+                       COALESCE(observation.comments, 0) AS comments,
+                       COALESCE(observation.shares, 0) AS shares,
+                       COALESCE(observation.view_velocity, 0) AS velocity,
+                       COALESCE(observation.view_acceleration, 0) AS acceleration,
+                       COALESCE(observation.relative_strength, 0) AS relative_strength,
+                       observation.observation_key, observation.observed_at,
+                       {scope_expr} AS evidence_scope,
+                       CASE WHEN evidence.observation_id IS NULL THEN 'mt_videos'
+                            ELSE 'accepted_evidence' END AS descriptive_source
+                FROM accepted_artifacts artifact_pick
+                JOIN {shape['observation_source']} observation
+                  ON observation.video_id = artifact_pick.video_id
+                 AND observation.observation_key = artifact_pick.observation_key
+                JOIN mt_videos video ON video.video_id = artifact_pick.video_id
+                {evidence_join}
+                LEFT JOIN mt_content_genomes genome
+                  ON genome.video_id = artifact_pick.video_id
+                WHERE artifact_pick.row_number = 1
+                ORDER BY COALESCE(observation.relative_strength, 0) DESC,
+                         COALESCE(observation.view_velocity, 0) DESC,
+                         COALESCE(observation.views, 0) DESC,
+                         video.video_id
+                """,
+                identifiers,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def transcript_artifact(
+        self,
+        video_id: str,
+        observation_key: str | None = None,
+    ) -> dict[str, Any] | None:
         """Return the latest local Whisper artifact for a video, if one exists."""
 
         try:
             with closing(self.connect()) as connection:
-                row = connection.execute(
-                    """
-                    SELECT * FROM mt_transcript_artifacts
-                    WHERE video_id=? ORDER BY created_at DESC LIMIT 1
-                    """,
-                    (video_id,),
-                ).fetchone()
+                query = "SELECT * FROM mt_transcript_artifacts WHERE video_id=?"
+                parameters: list[Any] = [video_id]
+                if observation_key:
+                    query += " AND observation_key=?"
+                    parameters.append(observation_key)
+                query += " ORDER BY created_at DESC, transcript_id DESC LIMIT 1"
+                row = connection.execute(query, parameters).fetchone()
         except sqlite3.Error:
             return None
         if not row:
@@ -487,14 +1023,43 @@ class ViralTranscriptService:
         if not topic.strip():
             raise ValueError("topic is required")
         # Artifact coverage is intentionally sparse during backfill. Search a wide
-        # metadata window, then accept only exact local Whisper/audit bindings.
-        rows = self.tape.candidates(topic, limit=max(limit * 50, 200))
+        # metadata window, then resolve each artifact to the immutable observation
+        # it was audited against. A newer metric recheck does not stale a transcript.
+        candidates = self.tape.candidates(topic, limit=max(limit * 50, 200))
+        rows = self.tape.artifact_bound_candidates(
+            [str(row["video_id"]) for row in candidates]
+        )
+        return self._discover_rows(topic, rows, limit)
+
+    def discover_for_videos(
+        self,
+        topic: str,
+        video_ids: Sequence[str],
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        if not topic.strip():
+            raise ValueError("topic is required")
+        return self._discover_rows(
+            topic,
+            self.tape.artifact_bound_candidates(video_ids),
+            limit,
+        )
+
+    def _discover_rows(
+        self,
+        topic: str,
+        rows: Sequence[dict[str, Any]],
+        limit: int,
+    ) -> dict[str, Any]:
         receipts: list[dict[str, Any]] = []
         failures: list[dict[str, str]] = []
         for row in rows:
             if len(receipts) >= limit:
                 break
-            artifact = self.tape.transcript_artifact(str(row["video_id"]))
+            artifact = self.tape.transcript_artifact(
+                str(row["video_id"]),
+                str(row.get("observation_key") or ""),
+            )
             if not artifact:
                 failures.append({
                     "source_id": str(row.get("external_id") or row["video_id"]),
@@ -504,7 +1069,9 @@ class ViralTranscriptService:
             artifact_audit = dict(artifact.get("audit") or {})
             if (
                 artifact_audit.get("decision") != "PASS"
-                or artifact_audit.get("contract") != "performance_bound_whisper_transcript_v3"
+                or not is_supported_transcript_audit_contract(
+                    artifact_audit.get("contract")
+                )
                 or artifact.get("observation_key") != row.get("observation_key")
             ):
                 failures.append({
@@ -530,9 +1097,12 @@ class ViralTranscriptService:
             })[:300]
             payload = {
                 "topic": topic,
+                "video_id": row.get("video_id"),
                 "platform": row.get("platform"),
                 "title": row.get("title"),
                 "creator_id": row.get("creator_id"),
+                "evidence_scope": row.get("evidence_scope"),
+                "descriptive_source": row.get("descriptive_source"),
                 "transcript_source": document.source,
                 "transcript_id": artifact.get("transcript_id"),
                 "observation_key": artifact.get("observation_key"),
@@ -599,10 +1169,23 @@ class AudienceIntelligenceService:
         self.tape = tape
         self.store = store
 
-    def human_moments(self, topic: str, audience: str, limit: int = 8) -> dict[str, Any]:
+    def human_moments(
+        self,
+        topic: str,
+        audience: str,
+        limit: int = 8,
+        video_ids: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         if not topic.strip() or not audience.strip():
             raise ValueError("topic and audience are required")
-        candidates = self.tape.candidates(topic, limit=60)
+        candidates = (
+            self.tape.candidates(topic, limit=60)
+            if video_ids is None
+            else self.tape.artifact_bound_candidates(video_ids)
+        )
+        candidates = self.tape.artifact_bound_candidates(
+            [str(row["video_id"]) for row in candidates]
+        )
         cues = (
             "anxious", "anxiety", "burned", "burnout", "burnt", "can't", "exhausted",
             "feel", "feeling", "hopeless", "overwhelmed", "pressure", "struggle",
@@ -610,13 +1193,16 @@ class AudienceIntelligenceService:
         )
         moments: list[dict[str, Any]] = []
         for row in candidates:
-            artifact = self.tape.transcript_artifact(str(row["video_id"]))
+            artifact = self.tape.transcript_artifact(
+                str(row["video_id"]),
+                str(row.get("observation_key") or ""),
+            )
             if not artifact:
                 continue
             audit = artifact.get("audit") or {}
             if (
                 audit.get("decision") != "PASS"
-                or audit.get("contract") != "performance_bound_whisper_transcript_v3"
+                or not is_supported_transcript_audit_contract(audit.get("contract"))
                 or artifact.get("observation_key") != row.get("observation_key")
                 or not str(artifact.get("whisper_language") or "").lower().startswith("en")
             ):
@@ -636,6 +1222,7 @@ class AudienceIntelligenceService:
                             "audience": audience,
                             "source_video_id": row.get("video_id"),
                             "source_transcript_id": artifact.get("transcript_id"),
+                            "source_observation_key": artifact.get("observation_key"),
                             "source_url": row.get("url"),
                             "basis": "performance_qualified_local_whisper_transcript",
                         }
@@ -666,8 +1253,9 @@ class AudienceIntelligenceService:
 
 
 class ScriptService:
-    def __init__(self, store: QualityStore):
+    def __init__(self, store: QualityStore, narrative: NarrativeCoherenceService | None = None):
         self.store = store
+        self.narrative = narrative
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
         topic = str(payload.get("topic") or "").strip()
@@ -705,17 +1293,11 @@ class ScriptService:
                 "reason": "A conversion objective requires owned proof supplied by the operator.",
             }
 
-        pattern_receipts = [item for item in receipts if item["receipt_type"] == "viral_transcript_pattern"]
-        verified_patterns = [
-            item for item in pattern_receipts
-            if item["payload"].get("transcript_source") == "local_whisper"
-            and item["payload"].get("performance_qualification", {}).get("audit_decision") == "PASS"
-            and item["payload"].get("performance_qualification", {}).get("audit_contract")
-            == "performance_bound_whisper_transcript_v3"
-            and item["payload"].get("observation_key")
-            and len(str(item["payload"].get("audio_sha256") or "")) == 64
-            and len(str(item["payload"].get("transcript_sha256") or "")) == 64
+        pattern_receipts = [
+            item for item in receipts
+            if item["receipt_type"] == "viral_transcript_pattern"
         ]
+        verified_patterns = verified_transcript_patterns(pattern_receipts)
         if len(verified_patterns) < 5:
             return {
                 "status": "rejected",
@@ -754,9 +1336,14 @@ class ScriptService:
                 str(token).lower()
                 for token in item["payload"].get("transcript_keywords") or []
             }
+            creator_identity = str(
+                item["payload"].get("creator_id")
+                or item["payload"].get("transcript_id")
+                or item["receipt_id"]
+            )
             for term in HUMAN_EXPERIENCE_WORDS & source_terms:
                 display = human_term_groups.get(term, term)
-                human_term_sources.setdefault(display, set()).add(item["receipt_id"])
+                human_term_sources.setdefault(display, set()).add(creator_identity)
         recurring_human_terms = sorted(
             (term for term, sources in human_term_sources.items() if len(sources) >= 2),
             key=lambda term: (-len(human_term_sources[term]), term),
@@ -765,7 +1352,7 @@ class ScriptService:
             return {
                 "status": "rejected",
                 "code": "REJECT_NO_RECURRING_HUMAN_LANGUAGE",
-                "reason": "At least one human-experience term must recur across two transcripts.",
+                "reason": "At least one human-experience term must recur across two distinct creators.",
             }
         named_terms = recurring_human_terms[:4]
         if len(named_terms) == 1:
@@ -795,6 +1382,9 @@ class ScriptService:
             "topic": topic,
             "audience": audience,
             "objective": objective,
+            "brief_id": payload.get("brief_id"),
+            "trend_id": payload.get("trend_id"),
+            "parent_script_id": payload.get("parent_script_id"),
             "source_receipt_ids": receipt_ids,
             "evidence_summary": {
                 "viral_transcript_patterns": source_count,
@@ -807,6 +1397,35 @@ class ScriptService:
             "text": full_text,
             "created_at": utc_now(),
         }
+        # Owner directive 2026-08-22: the context behind the transcript must make
+        # sense in timeline order as presented to the audience. Audit, auto-revise
+        # deterministically, and fail closed if coherence cannot be reached.
+        if self.narrative is not None:
+            result, coherence = self.narrative.enforce(result)
+            if coherence["decision"] != "PASS":
+                self.store.put_audit(
+                    "narrative_coherence", None, coherence["decision"], 0.0,
+                    {"attempts": coherence["attempts"], "defects_open": coherence["defects_open"],
+                     "llm_judgment": coherence["llm_judgment"], "topic": topic},
+                )
+                code = ("REJECT_COHERENCE_JUDGE_UNAVAILABLE"
+                        if coherence["decision"] == "JUDGE_UNAVAILABLE"
+                        else "REJECT_NARRATIVE_INCOHERENT")
+                return {
+                    "status": "rejected", "code": code,
+                    "reason": "The script cannot be presented coherently in timeline order.",
+                    "narrative_coherence": coherence,
+                }
+            result["script_id"] = stable_id("script", topic, objective, receipt_ids, result["text"])
+            result["narrative_coherence"] = {
+                "decision": "PASS",
+                "attempts": len(coherence["attempts"]),
+                "revised": len(coherence["attempts"]) > 1,
+            }
+            self.store.put_audit(
+                "narrative_coherence", result["script_id"], "PASS", 100.0,
+                {"attempts": coherence["attempts"], "llm_judgment": coherence["llm_judgment"]},
+            )
         self.store.put_script(result)
         return result
 
@@ -834,14 +1453,7 @@ class RelatabilityService:
             item for item in receipts
             if item["receipt_type"] == "viral_transcript_pattern"
         ]
-        verified_patterns = [
-            item for item in patterns
-            if item["payload"].get("transcript_source") == "local_whisper"
-            and item["payload"].get("performance_qualification", {}).get("audit_decision") == "PASS"
-            and item["payload"].get("performance_qualification", {}).get("audit_contract")
-            == "performance_bound_whisper_transcript_v3"
-            and item["payload"].get("observation_key")
-        ]
+        verified_patterns = verified_transcript_patterns(patterns)
         creators = {
             str(item["payload"].get("creator_id") or "")
             for item in verified_patterns if item["payload"].get("creator_id")
@@ -862,6 +1474,12 @@ class RelatabilityService:
         supported_sources = sum(
             len(significant_tokens & source_keywords) >= 3 for source_keywords in keyword_sets
         )
+        supported_creators = {
+            str(item["payload"].get("creator_id") or "")
+            for item, source_keywords in zip(verified_patterns, keyword_sets)
+            if len(significant_tokens & source_keywords) >= 3
+            and item["payload"].get("creator_id")
+        }
         opening_human_terms = sorted(
             set(opening_tokens) & HUMAN_EXPERIENCE_WORDS & union_keywords
         )
@@ -892,6 +1510,7 @@ class RelatabilityService:
             "audience_facing_not_pipeline_meta": not pipeline_meta_matches,
             "script_vocabulary_supported": vocabulary_overlap >= 0.18,
             "supported_by_three_transcripts": supported_sources >= 3,
+            "supported_by_three_creators": len(supported_creators) >= 3,
             "concrete_stakes_present": any(token in text.lower() for token in ("because", "cost", "lose", "matters", "stuck", "waste", "without")),
             "audience_language_present": any(token in token_list for token in ("you", "your", "we", "i")),
             "not_product_first": not any(token in first_sentence for token in ("app", "platform", "product", "service", "software", "tool")),
@@ -906,6 +1525,7 @@ class RelatabilityService:
             "human_experience_in_opening",
             "audience_facing_not_pipeline_meta",
             "supported_by_three_transcripts",
+            "supported_by_three_creators",
         )
         score = min(85.0, 100.0 * sum(checks.values()) / len(checks))
         hard_requirements_pass = all(checks[name] for name in hard_requirements)
@@ -934,6 +1554,7 @@ class RelatabilityService:
                 "observed_views_snapshot": observed_views,
                 "script_vocabulary_overlap": round(vocabulary_overlap, 6),
                 "supported_source_count": supported_sources,
+                "supported_creator_count": len(supported_creators),
                 "opening_human_terms": opening_human_terms,
                 "pipeline_meta_phrases_in_script": pipeline_meta_matches,
             },
@@ -1165,18 +1786,48 @@ class RetentionService:
 
 
 class ContentQualityEngine:
-    def __init__(self, market_tape_path: str | Path, quality_db_path: str | Path):
+    def __init__(
+        self,
+        market_tape_path: str | Path,
+        quality_db_path: str | Path,
+        narrative_llm_runner: Any = None,
+        transcript_storage_root: str | Path | None = None,
+        script_language_demand_enqueuer: Any = None,
+    ):
         self.store = QualityStore(quality_db_path)
         self.tape = MarketTapeReader(market_tape_path)
+        self.narrative = NarrativeCoherenceService(self.store, narrative_llm_runner)
         self.viral = ViralTranscriptService(self.tape, self.store)
         self.audience = AudienceIntelligenceService(self.tape, self.store)
-        self.scripts = ScriptService(self.store)
+        self.scripts = ScriptService(self.store, self.narrative)
         self.relatability = RelatabilityService(self.store)
         self.attention = AttentionService(self.store)
         self.retention = RetentionService(self.store)
+        self.script_intelligence = ScriptIntelligenceService(
+            tape=self.tape,
+            store=self.store,
+            viral=self.viral,
+            audience=self.audience,
+            scripts=self.scripts,
+            relatability=self.relatability,
+            attention=self.attention,
+            transcript_storage_root=(
+                transcript_storage_root
+                or os.getenv(
+                    "TRANSCRIPT_BANK_ROOT",
+                    "/Volumes/My Passport/MarketTape/transcript-bank",
+                )
+            ),
+            demand_enqueuer=script_language_demand_enqueuer,
+        )
 
     def health(self) -> dict[str, Any]:
         tape = self.tape.health()
+        script_intelligence = self.script_intelligence.readiness()
+        ai_configured = bool(
+            self.narrative.llm_runner is not None
+            and str(os.getenv("OPENAI_API_KEY") or "").strip()
+        )
         return {
             "status": "healthy" if tape["status"] == "up" else "degraded",
             "service": "content-quality",
@@ -1184,7 +1835,36 @@ class ContentQualityEngine:
             "learning_store": {"status": "up", "path": str(self.store.path), "counts": self.store.counts()},
             "capabilities": [
                 "audience-intelligence", "viral-transcripts", "evidence-first-scripts",
-                "relatability", "attention", "retention", "learning-memory",
+                "narrative-coherence", "relatability", "attention", "retention", "learning-memory",
+                "script-intelligence",
             ],
+            "data_readiness": {
+                "script_intelligence": script_intelligence,
+                "script_language_demand_feedback": {
+                    "status": (
+                        "ready"
+                        if self.script_intelligence.demand_enqueuer is not None
+                        else "not_configured"
+                    ),
+                    "transport": "authenticated_loopback_api",
+                    "direct_cross_database_writes": False,
+                },
+                "owned_retention": {
+                    "status": (
+                        "ready"
+                        if self.store.counts()["cq_retention"] > 0
+                        else "no_owned_outcomes"
+                    ),
+                },
+            },
+            "ai_readiness": {
+                "narrative_judge_configured": ai_configured,
+                "deterministic_services_available": True,
+                "note": (
+                    "AI judgment is configured."
+                    if ai_configured
+                    else "Deterministic services remain available; the production AI judge is not configured."
+                ),
+            },
             "checked_at": utc_now(),
         }

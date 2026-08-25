@@ -21,8 +21,11 @@ ACTIVE_MODEL_CONTRACT = "market_tape_active_predictor_v2"
 INFERENCE_CONTRACT = "market_tape_trend_inference_v2"
 INFERENCE_POLICY_CONTRACT = "market_tape_standardized_ood_policy_v1"
 PROMOTION_GATE_CONTRACT = "market_tape_predictor_promotion_gate_v2"
-MODEL_FAMILY = "early-breakout-logistic-walk-forward-v4"
+MODEL_FAMILY = "early-breakout-logistic-walk-forward-v6"
 MODEL_PURPOSE = "early_breakout_entry"
+OBSERVATION_QUALITY_CONTRACT = (
+    "market_tape_accepted_observation_lineage_v2"
+)
 ENTRY_HORIZON = "enters_breakout_within_6h"
 PROGRESSION_HORIZON = "is_or_reaches_breakout_within_6h"
 TRAINING_SOURCE_MODELS = (
@@ -132,6 +135,9 @@ class MarketTapePredictor:
             "training": {
                 "source_model_versions": list(TRAINING_SOURCE_MODELS),
                 "index_version": TRAINING_INDEX_VERSION,
+                "observation_quality_contract": (
+                    OBSERVATION_QUALITY_CONTRACT
+                ),
                 "horizon": ENTRY_HORIZON,
                 "eligibility": {
                     "initial_states_excluded": sorted(BREAKOUT_STATES),
@@ -243,6 +249,10 @@ class MarketTapePredictor:
             if outcome.get("state") != "scored":
                 continue
             if features.get("index_version") != TRAINING_INDEX_VERSION:
+                continue
+            if features.get("observation_quality_contract") != (
+                OBSERVATION_QUALITY_CONTRACT
+            ):
                 continue
             if not eligible_for_early_entry(features):
                 continue
@@ -523,6 +533,10 @@ def load_active_model(config: MarketTapeConfig) -> Dict[str, Any] | None:
         return None
     if artifact.get("status") != "promoted":
         return None
+    if (artifact.get("training") or {}).get(
+        "observation_quality_contract"
+    ) != OBSERVATION_QUALITY_CONTRACT:
+        return None
     contract = artifact.get("contract")
     if contract == MODEL_CONTRACT and not _safe_v2_artifact(artifact):
         return None
@@ -567,6 +581,14 @@ def eligible_for_early_entry(features: Dict[str, Any]) -> bool:
 
 
 def model_accepts_features(artifact: Dict[str, Any], features: Dict[str, Any]) -> bool:
+    if (artifact.get("training") or {}).get(
+        "observation_quality_contract"
+    ) != OBSERVATION_QUALITY_CONTRACT:
+        return False
+    if features.get("observation_quality_contract") != (
+        OBSERVATION_QUALITY_CONTRACT
+    ):
+        return False
     training_index_version = str(
         (artifact.get("training") or {}).get("index_version")
         or "trend-strength-v1"
@@ -783,6 +805,9 @@ def _safe_v2_artifact(artifact: Dict[str, Any]) -> bool:
         artifact.get("contract") == MODEL_CONTRACT
         and int(artifact.get("schema_version") or 0) == 2
         and artifact.get("model_family") == MODEL_FAMILY
+        and (artifact.get("training") or {}).get(
+            "observation_quality_contract"
+        ) == OBSERVATION_QUALITY_CONTRACT
         and artifact.get("status") == "promoted"
         and gate.get("contract") == PROMOTION_GATE_CONTRACT
         and gate.get("passed") is True

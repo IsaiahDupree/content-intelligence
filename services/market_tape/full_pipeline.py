@@ -13,6 +13,7 @@ as a single unit, on demand.
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -68,6 +69,8 @@ def run_full_pipeline(
     transcript_model: str = "base",
     topic: str = "",
     transcript_trend_ids: Sequence[str] = (),
+    exclude_creator_ids: Sequence[str] = (),
+    performance_discovery: bool = False,
     transcript_storage_root: Path | None = None,
     cookies_from_browser: str | None = None,
     bank_factory: Any = None,
@@ -80,27 +83,73 @@ def run_full_pipeline(
     ``yt-dlp`` download and a real local ``whisper.transcribe`` call.
     """
     resolved_config = config or MarketTapeConfig.from_environment()
-    resolved_store = store or MarketTapeStore(resolved_config)
-    resolved_collector = collector or MarketTapeCollector(resolved_config, resolved_store)
+    normalized_topic = str(topic or "").strip()
+    requested_platforms = tuple(dict.fromkeys(
+        str(value).strip().lower()
+        for value in transcript_platforms
+        if str(value).strip()
+    ))
+    if not requested_platforms:
+        raise ValueError("transcript_platforms must include at least one platform")
 
-    discovery = resolved_collector.run_cycle(discovery_mode)
+    discovery_config = resolved_config
+    if normalized_topic:
+        enabled_platforms = set(resolved_config.platforms)
+        discovery_config = replace(
+            resolved_config,
+            topics=[normalized_topic],
+            platforms=[
+                platform for platform in requested_platforms
+                if platform in enabled_platforms
+            ],
+            adaptive_topics_enabled=False,
+        )
+
+    resolved_store = store or MarketTapeStore(discovery_config)
+    if collector is None:
+        resolved_collector = MarketTapeCollector(discovery_config, resolved_store)
+    elif discovery_config == resolved_config:
+        resolved_collector = collector
+    else:
+        # Preserve an injected real-source builder while ensuring a caller-
+        # supplied collector cannot retain its broad/adaptive configuration.
+        resolved_collector = MarketTapeCollector(
+            discovery_config,
+            resolved_store,
+            source_builder=collector.source_builder,
+        )
+
+    if performance_discovery:
+        if not normalized_topic:
+            raise ValueError("performance_discovery requires topic")
+        if "youtube" not in discovery_config.platforms:
+            raise ValueError(
+                "performance_discovery requires youtube in transcript_platforms"
+            )
+        discovery = resolved_collector.run_topic_performance_discovery(
+            normalized_topic,
+            max_items=discovery_config.max_discovery_items_per_source,
+        )
+    else:
+        discovery = resolved_collector.run_cycle(discovery_mode)
 
     if bank_factory is None:
         from services.content_quality.transcript_bank import TranscriptBank as bank_factory  # noqa: N813
 
     storage_root = transcript_storage_root or DEFAULT_TRANSCRIPT_STORAGE_ROOT
-    bank = bank_factory(resolved_config.db_path, storage_root)
+    bank = bank_factory(discovery_config.db_path, storage_root)
     target_trend_ids = list(dict.fromkeys(
         str(value) for value in transcript_trend_ids if str(value)
     ))
-    if not target_trend_ids and topic:
-        target_trend_ids = matching_trend_ids(resolved_store, topic)
+    if not target_trend_ids and normalized_topic:
+        target_trend_ids = matching_trend_ids(resolved_store, normalized_topic)
     backfill = bank.run_backfill(
         limit=transcript_limit,
-        platforms=transcript_platforms,
+        platforms=requested_platforms,
         model_name=transcript_model,
-        topic=topic,
+        topic=normalized_topic,
         trend_ids=target_trend_ids,
+        exclude_creator_ids=exclude_creator_ids,
         cookies_from_browser=cookies_from_browser,
     )
 
@@ -120,6 +169,15 @@ def run_full_pipeline(
                 int(receipt.get("accepted_count", 0) or 0) for receipt in discovery["receipts"]
             ),
             "receipts": discovery["receipts"],
+            "scope": {
+                "topic": normalized_topic,
+                "platforms": list(discovery_config.platforms),
+                "adaptive_topics_enabled": discovery_config.adaptive_topics_enabled,
+                "lane": (
+                    "performance_query"
+                    if performance_discovery else "standard_discovery"
+                ),
+            },
         },
         "transcription": {
             "run_id": backfill["run_id"],
@@ -131,6 +189,11 @@ def run_full_pipeline(
             "failures": backfill["failures"],
             "manifest_path": backfill["manifest_path"],
             "trend_ids": target_trend_ids,
+            "excluded_creator_ids": sorted({
+                str(value).strip()
+                for value in exclude_creator_ids
+                if str(value).strip()
+            }),
         },
         "fully_vetted_transcript_ids": vetted_transcript_ids,
     }

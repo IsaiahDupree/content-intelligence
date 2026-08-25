@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from services.market_tape.collector import MarketTapeCollector
 from services.market_tape.config import MarketTapeConfig
-from services.market_tape.models import SourceState
+from services.market_tape.models import MarketContent, MetricCounters, SourceState
 from services.market_tape.sources.registry import build_sources
 from services.market_tape.sources.social import ThreadsKeywordSearchSource
+from services.market_tape.store import MarketTapeStore
 
 
 class ThreadsProviderHandler(BaseHTTPRequestHandler):
@@ -140,6 +143,7 @@ def test_threads_source_uses_official_host_and_token_contract(threads_config):
         assert source.base_url == "https://graph.threads.net"
         assert source.credential_names == ("THREADS_ACCESS_TOKEN",)
         assert source.source_id == "threads-graph-keyword-search"
+        assert source.terminal_metrics_capable() is False
     finally:
         source.close()
 
@@ -271,33 +275,27 @@ def test_threads_object_refresh_uses_object_edge_without_invented_metrics(
 
     assert batch.receipt.state == SourceState.READY
     assert batch.receipt.request_count == 1
-    assert batch.receipt.refreshed_count == 1
+    assert batch.receipt.refreshed_count == 0
     assert batch.receipt.metadata["metered"] is False
     assert batch.receipt.metadata["operation"] == "refresh"
     assert batch.receipt.metadata["scope"] == "public_object_lookup"
     assert batch.receipt.metadata["endpoint"] == "thread_object"
     assert batch.receipt.metadata["required_scope"] == "threads_basic"
     assert batch.receipt.metadata["engagement_metrics_observed"] is False
+    assert batch.receipt.metadata["metadata_only_count"] == 1
+    assert batch.receipt.metadata["item_failure_code"] == (
+        "engagement_metrics_unavailable"
+    )
+    assert batch.receipt.metadata["metric_contract"] == (
+        "provider_counters_required_for_observation"
+    )
     assert ThreadsProviderHandler.requests == [{
         "path": "/thread-refresh-1",
         "query": {"fields": [ThreadsKeywordSearchSource.fields]},
         "authorization": "Bearer loopback-threads-token",
     }]
 
-    item = batch.items[0]
-    assert item.external_id == "thread-refresh-1"
-    assert item.creator_external_id == "owner-fresh"
-    assert item.creator_handle == "fresh"
-    assert item.caption == "Fresh object lookup without invented engagement metrics"
-    assert item.metrics.views == 0
-    assert item.metrics.likes == 0
-    assert item.metrics.comments == 0
-    assert item.metrics.shares == 0
-    assert {
-        key: item.discovery_context[key] for key in prior
-    } == prior
-    assert item.discovery_context["engagement_metrics_observed"] is False
-    assert item.discovery_context["metric_contract"] == "content_metadata_only"
+    assert batch.items == []
 
 
 def test_registry_replaces_legacy_threads_meta_edge(threads_config):
@@ -317,3 +315,92 @@ def test_registry_replaces_legacy_threads_meta_edge(threads_config):
     finally:
         for source in sources:
             source.close()
+
+
+def test_threads_metadata_refresh_cannot_poison_prior_positive_observation(
+    threads_provider_server,
+    threads_config,
+    monkeypatch,
+):
+    monkeypatch.setenv("THREADS_ACCESS_TOKEN", "loopback-threads-token")
+    store = MarketTapeStore(threads_config)
+    observed_at = datetime.now(timezone.utc) - timedelta(hours=2)
+    item = MarketContent(
+        platform="threads",
+        external_id="thread-refresh-1",
+        creator_external_id="owner-prior",
+        creator_handle="prior",
+        published_at=observed_at - timedelta(hours=1),
+        observed_at=observed_at,
+        source_id=ThreadsKeywordSearchSource.source_id,
+        metrics=MetricCounters.from_values(
+            views=1250,
+            likes=95,
+            comments=14,
+            shares=8,
+        ),
+        caption="Prior measured Threads post",
+        url="https://www.threads.net/@prior/post/thread-refresh-1",
+    )
+    store.start_run("threads-positive-seed", "discover")
+    assert store.ingest(item, "threads-positive-seed") == (True, True)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE mt_poll_queue SET due_at = ? WHERE video_id = ?",
+            (
+                (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                item.video_id,
+            ),
+        )
+
+    def source_builder(resolved, run_id, budget_for):
+        return [ThreadsKeywordSearchSource(
+            resolved,
+            run_id,
+            budget_for(
+                ThreadsKeywordSearchSource.source_id,
+                resolved.request_limit_for("threads"),
+            ),
+            base_url=threads_provider_server,
+        )]
+
+    run_id = "threads-metadata-refresh"
+    store.start_run(run_id, "recheck")
+    receipts = MarketTapeCollector(
+        threads_config,
+        store,
+        source_builder=source_builder,
+    )._run_rechecks(run_id, phase="scheduled")
+
+    planner = next(
+        receipt for receipt in receipts
+        if receipt["source_id"] == "market-tape-recheck-planner-scheduled"
+    )
+    assert planner["metadata"]["recheck_plan"]["source_capability"] == [{
+        "source_id": ThreadsKeywordSearchSource.source_id,
+        "platform": "threads",
+        "state": "metadata_only_no_terminal_metrics",
+        "request_budget_remaining": 10,
+        "metered": False,
+    }]
+    provider = next(
+        receipt for receipt in receipts
+        if receipt["source_id"] == ThreadsKeywordSearchSource.source_id
+    )
+    assert provider["metadata"]["item_failure_code"] == (
+        "engagement_metrics_unavailable"
+    )
+    assert provider["metadata"]["new_observation_count"] == 0
+    with store.connect() as connection:
+        observations = connection.execute(
+            "SELECT views, likes, comments, shares FROM mt_market_observations "
+            "WHERE video_id = ? ORDER BY observed_at",
+            (item.video_id,),
+        ).fetchall()
+        poll = connection.execute(
+            "SELECT failure_count, last_error_code FROM mt_poll_queue "
+            "WHERE video_id = ?",
+            (item.video_id,),
+        ).fetchone()
+    assert [tuple(row) for row in observations] == [(1250, 95, 14, 8)]
+    assert tuple(poll) == (1, "engagement_metrics_unavailable")
