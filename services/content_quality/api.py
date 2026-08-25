@@ -219,6 +219,9 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     health_routes = {
         "/api/audience-intelligence/health": ("audience-intelligence", "market_tape"),
         "/api/viral-transcripts/health": ("viral-transcripts", "market_tape"),
+        "/api/transcript-style-guides/health": (
+            "transcript-style-guides", "market_tape"
+        ),
         "/api/scripts/health": ("evidence-first-scripts", "script_intelligence"),
         "/api/script-intelligence/health": ("script-intelligence", "script_intelligence"),
         "/api/relatability/health": ("relatability", "script_intelligence"),
@@ -637,6 +640,91 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         payload = json_body()
         return jsonify(engine.viral.discover(str(payload.get("topic") or ""), int(payload.get("limit") or 5)))
 
+    @app.get("/api/transcript-style-guides/status")
+    def transcript_style_status():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        platform = str(request.args.get("platform") or "tiktok")
+        result = engine.style_guides.status(platform)
+        return audited_agent_response(
+            "transcript_style_status", {"platform": platform}, result,
+            started_at=started,
+        )
+
+    @app.post("/api/transcript-style-guides/build")
+    def build_transcript_style_guide():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = engine.style_guides.build(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "build_transcript_style_guide", payload, error, started
+            )
+        return audited_agent_response(
+            "build_transcript_style_guide", payload, result,
+            201 if result.get("status") == "ready" else 422, started,
+        )
+
+    @app.get("/api/transcript-style-guides")
+    def list_transcript_style_guides():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        platform = request.args.get("platform")
+        limit = max(1, min(200, int(request.args.get("limit") or 50)))
+        guides = engine.style_guides.list(platform, limit)
+        result = {"status": "ok", "guides": guides, "count": len(guides)}
+        return audited_agent_response(
+            "list_transcript_style_guides",
+            {"platform": platform, "limit": limit}, result,
+            started_at=started,
+        )
+
+    @app.get("/api/transcript-style-guides/<guide_id>")
+    def get_transcript_style_guide(guide_id: str):
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        receipt = engine.style_guides.resolve(guide_id)
+        result = (
+            {"status": "ok", "guide": receipt}
+            if receipt is not None else {
+                "status": "error", "code": "STYLE_GUIDE_NOT_FOUND",
+                "guide_id": guide_id,
+            }
+        )
+        return audited_agent_response(
+            "get_transcript_style_guide", {"guide_id": guide_id}, result,
+            200 if receipt is not None else 404, started,
+        )
+
+    @app.post("/api/transcript-style-guides/audit")
+    def audit_transcript_style_guide():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = engine.style_guides.audit(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "audit_transcript_style_guide", payload, error, started
+            )
+        status_code = 200 if result.get("decision") == "PASS" else 422
+        return audited_agent_response(
+            "audit_transcript_style_guide", payload, result,
+            status_code, started,
+        )
+
     @app.post("/api/audience/human-moments")
     def human_moments():
         payload = json_body()
@@ -660,10 +748,37 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 "intelligence_status": {
                     "method": "GET", "path": "/api/script-intelligence/health",
                 },
+                "transcript_style_status": {
+                    "method": "GET",
+                    "path": "/api/transcript-style-guides/status",
+                    "optional": ["platform"],
+                },
+                "build_transcript_style_guide": {
+                    "method": "POST",
+                    "path": "/api/transcript-style-guides/build",
+                    "required": ["topic", "platform", "receipt_ids"],
+                    "minimums": {
+                        "verified_transcripts": 5,
+                        "distinct_creators": 3,
+                        "observed_views": 100000,
+                    },
+                },
+                "audit_transcript_style": {
+                    "method": "POST",
+                    "path": "/api/transcript-style-guides/audit",
+                    "required": ["style_guide_id", "text"],
+                    "effect": (
+                        "measures aggregate style fit and rejects excessive "
+                        "five-word source overlap"
+                    ),
+                },
                 "build_script_brief": {
                     "method": "POST", "path": "/api/script-intelligence/briefs",
                     "required": ["audience"],
-                    "optional": ["topic", "objective", "variant_index"],
+                    "optional": [
+                        "topic", "objective", "variant_index",
+                        "style_platform",
+                    ],
                     "bounds": {"variant_index": [0, 7]},
                     "variant_selection": (
                         "zero-based selection over text-distinct stored human "
@@ -686,7 +801,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "method": "POST",
                     "path": "/api/script-intelligence/run",
                     "required": ["audience"],
-                    "optional": ["topic", "objective", "variant_index"],
+                    "optional": [
+                        "topic", "objective", "variant_index",
+                        "style_platform",
+                    ],
                     "bounds": {"variant_index": [0, 7]},
                     "effect": (
                         "build immutable brief then generate and audit, or "

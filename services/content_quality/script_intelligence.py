@@ -119,6 +119,7 @@ class ScriptIntelligenceService:
         store: Any,
         viral: Any,
         audience: Any,
+        style_guides: Any,
         scripts: Any,
         relatability: Any,
         ai_relatability: Any,
@@ -130,6 +131,7 @@ class ScriptIntelligenceService:
         self.store = store
         self.viral = viral
         self.audience = audience
+        self.style_guides = style_guides
         self.scripts = scripts
         self.relatability = relatability
         self.ai_relatability = ai_relatability
@@ -677,6 +679,7 @@ class ScriptIntelligenceService:
         requested_topic: str,
         audience_name: str,
         minimum_transcripts: int,
+        style_platform: str,
         semantic_candidates: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Evaluate one ranked trend without weakening any script evidence gate."""
@@ -804,6 +807,9 @@ class ScriptIntelligenceService:
                 "transcript_cohort_audit": {"status": "not_evaluated"},
                 "source_bound_human_moment": {"status": "not_evaluated"},
                 "cross_creator_human_language": {"status": "not_evaluated"},
+                "aggregate_transcript_style_guide": {
+                    "status": "not_evaluated"
+                },
             },
         }
 
@@ -964,6 +970,36 @@ class ScriptIntelligenceService:
             })
             return {"eligible": False, "assessment": assessment}
 
+        style_result = self.style_guides.build({
+            "topic": language_query,
+            "platform": style_platform,
+            "receipt_ids": [receipt["receipt_id"] for receipt in receipts],
+            "minimum_transcripts": minimum_transcripts,
+            "minimum_creators": 3,
+            "minimum_observed_views": 100_000,
+        })
+        style_ready = style_result.get("status") == "ready"
+        assessment["gates"]["aggregate_transcript_style_guide"] = {
+            "status": "evaluated",
+            "pass": style_ready,
+            "platform": style_platform,
+            "code": style_result.get("code"),
+            "guide_id": (
+                (style_result.get("guide") or {}).get("guide_id")
+            ),
+            "receipt_id": (
+                (style_result.get("receipt") or {}).get("receipt_id")
+            ),
+        }
+        if not style_ready:
+            assessment.update({
+                "decision": "REJECT",
+                "code": style_result.get("code") or "STYLE_GUIDE_NOT_READY",
+                "failed_gates": ["aggregate_transcript_style_guide"],
+                "style_guide_result": style_result,
+            })
+            return {"eligible": False, "assessment": assessment}
+
         assessment.update({
             "decision": "PASS",
             "code": "SCRIPT_READY_TREND_CANDIDATE",
@@ -987,12 +1023,18 @@ class ScriptIntelligenceService:
             "structures": structures,
             "proof_seconds": proof_seconds,
             "words_per_second": words_per_second,
+            "style_guide": style_result,
         }
 
     def build_brief(self, payload: dict[str, Any]) -> dict[str, Any]:
         audience_name = str(payload.get("audience") or "").strip()
         requested_topic = str(payload.get("topic") or "").strip()
         objective = str(payload.get("objective") or "qualified_attention").strip()
+        style_platform = str(
+            payload.get("style_platform")
+            or payload.get("platform")
+            or "cross_platform"
+        ).strip().lower()
         variant_index = self._variant_index(payload)
         minimum_transcripts = max(5, min(20, int(payload.get("minimum_transcripts") or 5)))
         if not audience_name:
@@ -1035,6 +1077,7 @@ class ScriptIntelligenceService:
                 requested_topic=requested_topic,
                 audience_name=audience_name,
                 minimum_transcripts=minimum_transcripts,
+                style_platform=style_platform,
                 semantic_candidates=shared_semantic_candidates,
             )
             candidate_assessments.append(result["assessment"])
@@ -1080,6 +1123,9 @@ class ScriptIntelligenceService:
         structures = selected["structures"]
         proof_seconds = selected["proof_seconds"]
         words_per_second = selected["words_per_second"]
+        style_result = selected["style_guide"]
+        style_guide = style_result["guide"]
+        style_receipt = style_result["receipt"]
         cohort_manifest_path = Path(cohort["manifest_path"]).expanduser().resolve()
         cohort_manifest_payload = json.loads(
             cohort_manifest_path.read_text(encoding="utf-8")
@@ -1122,6 +1168,11 @@ class ScriptIntelligenceService:
             "keyword_signals": keyword_signals,
             "cohort_id": cohort["cohort_id"],
             "cohort_manifest_sha256": cohort_manifest_sha256,
+            "style_guide_id": style_guide["guide_id"],
+            "style_guide_receipt_id": style_receipt["receipt_id"],
+            "style_source_material_sha256": style_guide[
+                "source_material_sha256"
+            ],
         }
         evidence_sha256 = canonical_sha256(source_material)
         created_at = utc_now()
@@ -1192,6 +1243,20 @@ class ScriptIntelligenceService:
                     round(statistics.median(words_per_second), 3) if words_per_second else None
                 ),
                 "sources": transcript_sources,
+                "style_guide": {
+                    "guide_id": style_guide["guide_id"],
+                    "receipt_id": style_receipt["receipt_id"],
+                    "contract": style_guide["contract"],
+                    "platform": style_guide["platform"],
+                    "evidence": style_guide["evidence"],
+                    "speech": style_guide["speech"],
+                    "hooks": style_guide["hooks"],
+                    "structure": style_guide["structure"],
+                    "delivery": style_guide["delivery"],
+                    "rights_and_originality": style_guide[
+                        "rights_and_originality"
+                    ],
+                },
                 "relationship_policy": {
                     "exact_trend_member": "proves membership in the selected trend",
                     "keyword_match": "supports wording for a measured keyword, not trend rise",
@@ -1226,6 +1291,9 @@ class ScriptIntelligenceService:
                 "variant_index": variant_index,
                 "variant_selection_contract": SCRIPT_VARIANT_SELECTION_CONTRACT,
                 "generation_contract": SCRIPT_GENERATION_CONTRACT,
+                "style_platform": style_guide["platform"],
+                "style_guide_id": style_guide["guide_id"],
+                "style_guide_receipt_id": style_receipt["receipt_id"],
                 "claim": claim,
                 "human_moment": {
                     **selected_moment,
@@ -1257,6 +1325,8 @@ class ScriptIntelligenceService:
             key for key in (
                 "topic", "trend_id", "audience", "objective", "claim",
                 "human_moment", "receipt_ids", "source_receipt_ids",
+                "style_platform", "style_guide_id",
+                "style_guide_receipt_id",
             )
             if key in payload
         )
@@ -1309,6 +1379,14 @@ class ScriptIntelligenceService:
 
         relatability = self.relatability.audit(generated)
         qualitative_relatability = self.ai_relatability.audit(generated)
+        style_fit = self.style_guides.audit({
+            "script_id": generated["script_id"],
+            "style_guide_id": generated["style_guide_id"],
+            "style_guide_receipt_id": generated[
+                "style_guide_receipt_id"
+            ],
+            "target_duration_seconds": generated["timeline"][-1]["end"],
+        })
         attention = self.attention.script_audit(generated)
         preflight = self.attention.video_preflight(generated)
 
@@ -1363,6 +1441,7 @@ class ScriptIntelligenceService:
                 in {"PASS", NON_AI_PASS_DECISION}
             ),
             "cohort_integrity": cohort_pass,
+            "transcript_style": style_fit["decision"] == "PASS",
             "attention": attention["decision"] == "PASS",
             "video_preflight": preflight["decision"] == "PASS",
         }
@@ -1374,7 +1453,7 @@ class ScriptIntelligenceService:
             "audit_ids": [
                 relatability["audit_id"], qualitative_relatability["audit_id"],
                 attention["audit_id"], preflight["audit_id"],
-                cohort_quality_audit["audit_id"],
+                cohort_quality_audit["audit_id"], style_fit["audit_id"],
             ],
         })[:24]
         stage_receipts = {
@@ -1387,6 +1466,7 @@ class ScriptIntelligenceService:
                 "audit_id"
             ],
             "cohort_relatability_audit_id": cohort_quality_audit["audit_id"],
+            "transcript_style_audit_id": style_fit["audit_id"],
             "attention_audit_id": attention["audit_id"],
             "video_preflight_audit_id": preflight["audit_id"],
         }
@@ -1400,6 +1480,7 @@ class ScriptIntelligenceService:
                 "relatability": relatability,
                 "qualitative_relatability": qualitative_relatability,
                 "transcript_cohort_relatability": cohort_quality_audit,
+                "transcript_style": style_fit,
                 "attention": attention,
                 "video_preflight": preflight,
             },

@@ -18,6 +18,7 @@ from .ai_relatability import AIRelatabilityAdjudicator, NON_AI_PASS_DECISION
 from .contracts import is_supported_transcript_audit_contract
 from .narrative_coherence import NarrativeCoherenceService
 from .script_intelligence import ScriptIntelligenceService
+from .transcript_style import TranscriptStyleGuideService
 
 
 UTC = timezone.utc
@@ -154,7 +155,8 @@ def stable_id(prefix: str, *parts: Any) -> str:
 SCRIPT_IDENTITY_FIELDS = (
     "topic", "audience", "objective", "brief_id", "trend_id",
     "parent_script_id", "variant_index", "variant_selection_contract",
-    "source_receipt_ids", "human_moment",
+    "source_receipt_ids", "human_moment", "style_guide_id",
+    "style_guide_receipt_id", "style_application",
     "evidence_summary", "timeline", "text",
 )
 
@@ -413,6 +415,7 @@ class QualityStore:
         "text", "timeline", "evidence_summary", "source_receipt_ids",
         "audience", "human_moment", "brief_id", "topic", "objective",
         "variant_index", "variant_selection_contract",
+        "style_guide_id", "style_guide_receipt_id", "style_application",
     )
 
     def __init__(self, path: str | Path):
@@ -881,6 +884,13 @@ class QualityStore:
             "attention_script": ("PASS",),
             "attention_video_preflight": ("PASS",),
         }
+        # Existing stored scripts predate aggregate style receipts. New scripts
+        # always carry a style guide and cannot become render-ready without its
+        # bound audit; historical scripts retain their original six-gate contract.
+        if isinstance(stored_script, dict) and stored_script.get(
+            "style_guide_receipt_id"
+        ):
+            accepted["transcript_style_fit"] = ("PASS",)
         return {
             "ready_for_render": all(
                 latest.get(kind, {}).get("decision") in decisions
@@ -2546,9 +2556,15 @@ class AudienceIntelligenceService:
 
 
 class ScriptService:
-    def __init__(self, store: QualityStore, narrative: NarrativeCoherenceService | None = None):
+    def __init__(
+        self,
+        store: QualityStore,
+        narrative: NarrativeCoherenceService | None = None,
+        style_guides: TranscriptStyleGuideService | None = None,
+    ):
         self.store = store
         self.narrative = narrative
+        self.style_guides = style_guides
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
         topic = str(payload.get("topic") or "").strip()
@@ -2614,6 +2630,86 @@ class ScriptService:
                 "verified_transcript_count": source_count,
                 "creator_count": len(creators),
                 "observed_views_snapshot": observed_views,
+            }
+        style_receipts = [
+            item for item in receipts
+            if item["receipt_type"] == "transcript_style_guide"
+        ]
+        requested_style_receipt = str(
+            payload.get("style_guide_receipt_id") or ""
+        ).strip()
+        if requested_style_receipt and not style_receipts:
+            requested = self.store.receipt(requested_style_receipt)
+            if requested is None:
+                return {
+                    "status": "rejected",
+                    "code": "REJECT_UNKNOWN_STYLE_GUIDE",
+                    "style_guide_receipt_id": requested_style_receipt,
+                }
+            style_receipts = [requested]
+        if len(style_receipts) > 1:
+            return {
+                "status": "rejected",
+                "code": "REJECT_MULTIPLE_STYLE_GUIDES",
+                "style_guide_receipt_ids": sorted(
+                    item["receipt_id"] for item in style_receipts
+                ),
+            }
+        if not style_receipts:
+            if self.style_guides is None:
+                return {
+                    "status": "rejected",
+                    "code": "REJECT_STYLE_GUIDE_SERVICE_UNAVAILABLE",
+                }
+            pattern_platforms = {
+                str(item["payload"].get("platform") or "").lower()
+                for item in verified_patterns
+                if item["payload"].get("platform")
+            }
+            style_platform = str(
+                payload.get("style_platform")
+                or (
+                    next(iter(pattern_platforms))
+                    if len(pattern_platforms) == 1 else "cross_platform"
+                )
+            ).lower()
+            built_style = self.style_guides.build({
+                "topic": topic,
+                "platform": style_platform,
+                "receipt_ids": [
+                    item["receipt_id"] for item in verified_patterns
+                ],
+                "minimum_transcripts": 5,
+                "minimum_creators": 3,
+                "minimum_observed_views": 100_000,
+            })
+            if built_style.get("status") != "ready":
+                return {
+                    "status": "rejected",
+                    "code": "REJECT_STYLE_GUIDE_NOT_READY",
+                    "style_guide_result": built_style,
+                }
+            style_receipts = [built_style["receipt"]]
+        style_receipt = style_receipts[0]
+        if style_receipt.get("receipt_type") != "transcript_style_guide":
+            return {
+                "status": "rejected",
+                "code": "REJECT_INVALID_STYLE_GUIDE_RECEIPT",
+            }
+        style_guide = style_receipt["payload"]
+        style_source_ids = {
+            str(item.get("receipt_id") or "")
+            for item in style_guide.get("evidence", {}).get("sources") or []
+        }
+        verified_pattern_ids = {
+            item["receipt_id"] for item in verified_patterns
+        }
+        if not style_source_ids or not style_source_ids.issubset(
+            verified_pattern_ids
+        ):
+            return {
+                "status": "rejected",
+                "code": "REJECT_STYLE_GUIDE_SOURCE_MISMATCH",
             }
         human_term_sources: dict[str, set[str]] = {}
         human_term_receipts: dict[str, set[str]] = {}
@@ -2835,17 +2931,68 @@ class ScriptService:
             if source_stakes_text[-1] not in ".?!":
                 source_stakes_text += "."
             stakes_text = f"{source_stakes_text} {contextual_stakes_text}"
+        preferred_hook_shapes = list(
+            style_guide.get("hooks", {}).get("preferred_shapes") or []
+        )
+        preferred_hook = (
+            preferred_hook_shapes[0]
+            if preferred_hook_shapes else "direct_claim"
+        )
         hook_text = situation.strip()
         if hook_text[-1] not in ".?!":
             hook_text += "."
+        applied_hook = "source_moment_direct"
+        if preferred_hook == "question" and not hook_text.endswith("?"):
+            hook_text = f"Does this happen to you? {hook_text}"
+            applied_hook = "question_then_source_moment"
+        elif preferred_hook == "contrarian_warning":
+            hook_text = f"Don't normalize this. {hook_text}"
+            applied_hook = "contrarian_warning_then_source_moment"
+        elif preferred_hook == "personal_receipt" and set(
+            normalized_source_word(token) for token in words(situation)
+        ) & {"i", "i'm", "i've", "my", "me"}:
+            applied_hook = "source_personal_receipt"
+        transitions = list(
+            style_guide.get("delivery", {}).get("direction", {}).get(
+                "transitions"
+            ) or []
+        )
+        applied_transition = next(
+            (
+                marker for marker in transitions
+                if marker in {"actually", "honestly", "here's", "so", "the thing is"}
+            ),
+            None,
+        )
+        if applied_transition and not proof_line.lower().startswith(
+            applied_transition
+        ):
+            separator = ": " if applied_transition in {"here's", "the thing is"} else ", "
+            proof_line = (
+                applied_transition.capitalize()
+                + separator
+                + proof_line[:1].lower()
+                + proof_line[1:]
+            )
+        target_duration_range = (
+            style_guide.get("speech", {}).get("target_ranges", {}).get(
+                "duration_seconds", {}
+            )
+        )
+        target_duration = max(
+            24.0,
+            min(45.0, float(target_duration_range.get("median") or 43.0)),
+        )
+        cut_points = [0.0, 0.07, 0.19, 0.35, 0.53, 0.72, 0.88, 1.0]
+        times = [round(target_duration * point, 2) for point in cut_points]
         timeline = [
-            {"start": 0.0, "end": 3.0, "beat": "human_hook", "text": hook_text},
-            {"start": 3.0, "end": 8.0, "beat": "stakes", "text": stakes_text},
-            {"start": 8.0, "end": 15.0, "beat": "proof", "text": proof_line.rstrip(".") + "."},
-            {"start": 15.0, "end": 23.0, "beat": "claim", "text": claim_text},
-            {"start": 23.0, "end": 31.0, "beat": "method", "text": method_text},
-            {"start": 31.0, "end": 38.0, "beat": "payoff", "text": payoff_text},
-            {"start": 38.0, "end": 43.0, "beat": "cta", "text": cta_text},
+            {"start": times[0], "end": times[1], "beat": "human_hook", "text": hook_text},
+            {"start": times[1], "end": times[2], "beat": "stakes", "text": stakes_text},
+            {"start": times[2], "end": times[3], "beat": "proof", "text": proof_line.rstrip(".") + "."},
+            {"start": times[3], "end": times[4], "beat": "claim", "text": claim_text},
+            {"start": times[4], "end": times[5], "beat": "method", "text": method_text},
+            {"start": times[5], "end": times[6], "beat": "payoff", "text": payoff_text},
+            {"start": times[6], "end": times[7], "beat": "cta", "text": cta_text},
         ]
         full_text = " ".join(beat["text"] for beat in timeline)
         result = {
@@ -2861,6 +3008,16 @@ class ScriptService:
                 "variant_selection_contract"
             ),
             "source_receipt_ids": receipt_ids,
+            "style_guide_id": style_guide["guide_id"],
+            "style_guide_receipt_id": style_receipt["receipt_id"],
+            "style_application": {
+                "contract": "aggregate_style_application_v1",
+                "preferred_hook_shape": preferred_hook,
+                "applied_hook": applied_hook,
+                "applied_transition": applied_transition,
+                "target_duration_seconds": target_duration,
+                "actual_voice_or_likeness_imitation": False,
+            },
             "human_moment": dict(human),
             "source_language_binding": {
                 "contract": "source_moment_spoken_binding_v1",
@@ -2889,6 +3046,7 @@ class ScriptService:
                 ),
                 "generation_contract": payload.get("generation_contract"),
                 "owned_proof_count": len(proof),
+                "style_guide_receipt_id": style_receipt["receipt_id"],
             },
             "timeline": timeline,
             "text": full_text,
@@ -3600,7 +3758,10 @@ class ContentQualityEngine:
         self.narrative = NarrativeCoherenceService(self.store, narrative_llm_runner)
         self.viral = ViralTranscriptService(self.tape, self.store)
         self.audience = AudienceIntelligenceService(self.tape, self.store)
-        self.scripts = ScriptService(self.store, self.narrative)
+        self.style_guides = TranscriptStyleGuideService(self.tape, self.store)
+        self.scripts = ScriptService(
+            self.store, self.narrative, self.style_guides
+        )
         self.relatability = RelatabilityService(self.store)
         self.ai_relatability = AIRelatabilityAdjudicator(
             self.store, relatability_llm_runner
@@ -3613,6 +3774,7 @@ class ContentQualityEngine:
             store=self.store,
             viral=self.viral,
             audience=self.audience,
+            style_guides=self.style_guides,
             scripts=self.scripts,
             relatability=self.relatability,
             ai_relatability=self.ai_relatability,
@@ -3636,6 +3798,7 @@ class ContentQualityEngine:
         script_intelligence = self.script_intelligence.readiness()
         store_counts = self.store.counts()
         owned_outcome_readiness = self.store.owned_outcome_readiness()
+        tiktok_style_readiness = self.style_guides.status("tiktok")
         openai_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
         usable_openai_key = bool(
             openai_key and not openai_key.startswith("__")
@@ -3657,6 +3820,7 @@ class ContentQualityEngine:
                 "audience-intelligence", "viral-transcripts", "evidence-first-scripts",
                 "narrative-coherence", "relatability", "attention", "retention", "learning-memory",
                 "script-intelligence", "owned-outcome-attribution",
+                "transcript-style-guides",
             ],
             "data_readiness": {
                 "script_intelligence": script_intelligence,
@@ -3672,6 +3836,7 @@ class ContentQualityEngine:
                 "owned_retention": {
                     **owned_outcome_readiness,
                 },
+                "tiktok_transcript_style": tiktok_style_readiness,
             },
             "ai_readiness": {
                 "narrative_judge_configured": narrative_ai_configured,

@@ -608,13 +608,14 @@ def test_authenticated_source_moment_variants_share_cohort_and_pass_all_gates(
             "relatability_audit_id",
             "qualitative_relatability_audit_id",
             "cohort_relatability_audit_id",
+            "transcript_style_audit_id",
             "attention_audit_id",
             "video_preflight_audit_id",
         }
         assert all(stored_run["stage_receipts"].values())
         gates = engine.store.script_gate_summary(script["script_id"])
         assert gates["ready_for_render"] is True
-        assert len(gates["latest_audits"]) == 6
+        assert len(gates["latest_audits"]) == 7
         assert all(
             audit["stored_script_binding_valid"]
             for audit in gates["latest_audits"].values()

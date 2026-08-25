@@ -86,7 +86,7 @@ def test_same_script_id_cannot_alias_different_immutable_content(tmp_path: Path)
     assert store.script(script["script_id"])["audience"] == "software founders"
 
 
-def test_render_summary_requires_six_current_hash_bound_gates(tmp_path: Path):
+def test_render_summary_requires_seven_current_hash_bound_gates(tmp_path: Path):
     store = QualityStore(tmp_path / "quality.sqlite3")
     script = stored_script(store)
     binding = {
@@ -100,6 +100,7 @@ def test_render_summary_requires_six_current_hash_bound_gates(tmp_path: Path):
         "relatability_script": "PASS",
         "relatability_ai_qualitative": "PASS_NON_AI",
         "relatability_transcript_cohort": "PASS",
+        "transcript_style_fit": "PASS",
         "attention_script": "PASS",
         "attention_video_preflight": "PASS",
     }
