@@ -18,6 +18,7 @@ from .ai_relatability import AIRelatabilityAdjudicator, NON_AI_PASS_DECISION
 from .contracts import is_supported_transcript_audit_contract
 from .narrative_coherence import NarrativeCoherenceService
 from .script_intelligence import ScriptIntelligenceService
+from .transcript_bank import immutable_artifact_attestation
 from .transcript_style import TranscriptStyleGuideService
 
 
@@ -1871,6 +1872,8 @@ class MarketTapeReader:
                 f"""
                 SELECT artifact.video_id, MAX(artifact.created_at) AS created_at
                 FROM mt_transcript_artifacts artifact
+                JOIN mt_transcript_payload_snapshots payload_snapshot
+                  ON payload_snapshot.transcript_id=artifact.transcript_id
                 JOIN mt_videos video ON video.video_id = artifact.video_id
                 {evidence_join}
                 LEFT JOIN mt_content_genomes genome
@@ -1882,7 +1885,7 @@ class MarketTapeReader:
                 """,
                 parameters,
             ).fetchall()
-        resolved = self.artifact_bound_candidates([
+        resolved = self.production_artifact_bound_candidates([
             str(row["video_id"]) for row in rows
         ])
         if tokens:
@@ -1996,10 +1999,174 @@ class MarketTapeReader:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def production_artifact_bound_candidates(
+        self,
+        video_ids: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Return only artifacts that can pass the production cohort audit.
+
+        Legacy performance-passing rows may predate the immutable acquisition
+        payload snapshot.  They remain valid historical evidence, but they must
+        not enter a production brief because the later script audit cannot
+        attest them.  Apply the shared immutable attestation first, then select
+        the newest valid artifact per video without reading its legacy file
+        path.
+        """
+
+        identifiers = list(dict.fromkeys(
+            str(value) for value in video_ids if value
+        ))[:500]
+        if not identifiers:
+            return []
+        marks = ",".join("?" for _ in identifiers)
+        try:
+            with closing(self.connect()) as connection:
+                shape = self._tape_shape(connection)
+                if shape["has_full_view"]:
+                    evidence_join = (
+                        "LEFT JOIN mt_accepted_full_evidence_v1 evidence "
+                        "ON evidence.observation_id = observation.observation_id"
+                    )
+                    scope_expr = (
+                        "CASE WHEN evidence.observation_id IS NULL "
+                        f"THEN '{shape['tier']}' ELSE 'full' END"
+                    )
+                else:
+                    evidence_join = (
+                        "LEFT JOIN (SELECT NULL AS observation_id, "
+                        "NULL AS title, NULL AS caption, NULL AS description, "
+                        "NULL AS url, NULL AS duration_seconds) evidence "
+                        "ON evidence.observation_id = observation.observation_id"
+                    )
+                    scope_expr = f"'{shape['tier']}'"
+                rows = connection.execute(
+                    f"""
+                    SELECT video.video_id, video.platform, video.external_id,
+                           video.creator_id,
+                           COALESCE(evidence.title, video.title) AS title,
+                           COALESCE(evidence.caption, video.caption) AS caption,
+                           COALESCE(evidence.description, video.description)
+                               AS description,
+                           COALESCE(evidence.url, video.url) AS url,
+                           COALESCE(
+                               evidence.duration_seconds,
+                               video.duration_seconds
+                           ) AS duration_seconds,
+                           video.first_seen_at,
+                           COALESCE(genome.transcript, '') AS transcript,
+                           COALESCE(genome.opening_words, '') AS opening_words,
+                           COALESCE(genome.hook_type, '') AS hook_type,
+                           COALESCE(observation.views, 0) AS views,
+                           COALESCE(observation.likes, 0) AS likes,
+                           COALESCE(observation.comments, 0) AS comments,
+                           COALESCE(observation.shares, 0) AS shares,
+                           COALESCE(observation.view_velocity, 0) AS velocity,
+                           COALESCE(observation.view_acceleration, 0)
+                               AS acceleration,
+                           COALESCE(observation.relative_strength, 0)
+                               AS relative_strength,
+                           observation.observation_key,
+                           observation.observed_at,
+                           {scope_expr} AS evidence_scope,
+                           CASE WHEN evidence.observation_id IS NULL
+                                THEN 'mt_videos'
+                                ELSE 'accepted_evidence'
+                           END AS descriptive_source,
+                           artifact.transcript_id AS _artifact_transcript_id,
+                           artifact.transcript_sha256
+                               AS _artifact_transcript_sha256,
+                           artifact.audio_sha256 AS _artifact_audio_sha256,
+                           artifact.word_count AS _artifact_word_count,
+                           artifact.audit_json AS _artifact_audit_json,
+                           artifact.created_at AS _artifact_created_at,
+                           genome.transcript_embedding_ref
+                               AS _artifact_transcript_embedding_ref,
+                           genome.extraction_status
+                               AS _artifact_extraction_status,
+                           snapshot.payload_json AS _artifact_payload_json
+                    FROM mt_transcript_artifacts artifact
+                    JOIN {shape['observation_source']} observation
+                      ON observation.video_id=artifact.video_id
+                     AND observation.observation_key=artifact.observation_key
+                    JOIN mt_videos video ON video.video_id=artifact.video_id
+                    {evidence_join}
+                    LEFT JOIN mt_content_genomes genome
+                      ON genome.video_id=artifact.video_id
+                    LEFT JOIN mt_transcript_payload_snapshots snapshot
+                      ON snapshot.transcript_id=artifact.transcript_id
+                    WHERE artifact.video_id IN ({marks})
+                    ORDER BY artifact.created_at DESC,
+                             artifact.transcript_id DESC
+                    """,
+                    identifiers,
+                ).fetchall()
+        except sqlite3.Error:
+            # A pre-snapshot tape cannot supply production-grade evidence.
+            return []
+
+        admitted_by_video: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            video_id = str(row["video_id"])
+            if video_id in admitted_by_video:
+                continue
+            try:
+                artifact_audit = json.loads(row["_artifact_audit_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(artifact_audit, dict)
+                or artifact_audit.get("decision") != "PASS"
+                or not is_supported_transcript_audit_contract(
+                    artifact_audit.get("contract")
+                )
+            ):
+                continue
+            attestation = immutable_artifact_attestation(
+                artifact={
+                    "transcript_id": row["_artifact_transcript_id"],
+                    "transcript_sha256": row[
+                        "_artifact_transcript_sha256"
+                    ],
+                    "audio_sha256": row["_artifact_audio_sha256"],
+                    "word_count": row["_artifact_word_count"],
+                    "audit": artifact_audit,
+                },
+                genome={
+                    "transcript": row["transcript"],
+                    "transcript_embedding_ref": row[
+                        "_artifact_transcript_embedding_ref"
+                    ],
+                    "extraction_status": row[
+                        "_artifact_extraction_status"
+                    ],
+                },
+                raw_transcript_payload=str(
+                    row["_artifact_payload_json"] or ""
+                ),
+            )
+            if all(attestation["checks"].values()):
+                admitted_by_video[video_id] = {
+                    **{
+                        key: value for key, value in dict(row).items()
+                        if not key.startswith("_artifact_")
+                    },
+                    "transcript_id": row["_artifact_transcript_id"],
+                }
+        return sorted(
+            admitted_by_video.values(),
+            key=lambda row: (
+                -float(row.get("relative_strength") or 0),
+                -float(row.get("velocity") or 0),
+                -int(row.get("views") or 0),
+                str(row["video_id"]),
+            ),
+        )
+
     def transcript_artifact(
         self,
         video_id: str,
         observation_key: str | None = None,
+        transcript_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Return the latest local Whisper artifact for a video, if one exists."""
 
@@ -2010,6 +2177,9 @@ class MarketTapeReader:
                 if observation_key:
                     query += " AND observation_key=?"
                     parameters.append(observation_key)
+                if transcript_id:
+                    query += " AND transcript_id=?"
+                    parameters.append(transcript_id)
                 query += " ORDER BY created_at DESC, transcript_id DESC LIMIT 1"
                 row = connection.execute(query, parameters).fetchone()
         except sqlite3.Error:
@@ -2120,7 +2290,7 @@ class ViralTranscriptService:
             raise ValueError("topic is required")
         return self._discover_rows(
             topic,
-            self.tape.artifact_bound_candidates(video_ids),
+            self.tape.production_artifact_bound_candidates(video_ids),
             limit,
         )
 
@@ -2138,6 +2308,7 @@ class ViralTranscriptService:
             artifact = self.tape.transcript_artifact(
                 str(row["video_id"]),
                 str(row.get("observation_key") or ""),
+                str(row.get("transcript_id") or "") or None,
             )
             if not artifact:
                 failures.append({
@@ -2260,17 +2431,23 @@ class AudienceIntelligenceService:
         audience: str,
         limit: int = 8,
         video_ids: Sequence[str] | None = None,
+        require_immutable_artifacts: bool = False,
     ) -> dict[str, Any]:
         if not topic.strip() or not audience.strip():
             raise ValueError("topic and audience are required")
-        candidates = (
-            self.tape.candidates(topic, limit=60)
-            if video_ids is None
-            else self.tape.artifact_bound_candidates(video_ids)
-        )
-        candidates = self.tape.artifact_bound_candidates(
-            [str(row["video_id"]) for row in candidates]
-        )
+        candidates = self.tape.candidates(topic, limit=60)
+        if video_ids is not None and require_immutable_artifacts:
+            candidates = self.tape.production_artifact_bound_candidates(
+                video_ids
+            )
+        else:
+            candidates = self.tape.artifact_bound_candidates(
+                (
+                    video_ids
+                    if video_ids is not None
+                    else [str(row["video_id"]) for row in candidates]
+                )
+            )
         audience_vocabulary, audience_off_context = (
             audience_context_vocabulary(audience)
         )
@@ -2279,6 +2456,7 @@ class AudienceIntelligenceService:
             artifact = self.tape.transcript_artifact(
                 str(row["video_id"]),
                 str(row.get("observation_key") or ""),
+                str(row.get("transcript_id") or "") or None,
             )
             if not artifact:
                 continue

@@ -25,7 +25,7 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable, Sequence
+from typing import Any, Mapping, Sequence
 
 from services.market_tape.source_urls import is_usable_source_url
 
@@ -151,6 +151,109 @@ def read_legacy_json_payload_bounded(
 
 def words(text: str) -> list[str]:
     return WORD_RE.findall(text or "")
+
+
+def immutable_artifact_attestation(
+    *,
+    artifact: Mapping[str, Any],
+    genome: Mapping[str, Any] | None,
+    raw_transcript_payload: str,
+) -> dict[str, Any]:
+    """Verify the immutable inputs required by the production script audit.
+
+    Brief selection and the final script audit must use the same fail-closed
+    artifact rule.  Keeping this attestation independent of removable-volume
+    reads lets both stages verify the acquisition-time payload snapshot against
+    the atomic Market Tape transcript without risking an unbounded legacy read.
+    """
+
+    transcript_id = str(artifact.get("transcript_id") or "")
+    transcript_hash = str(artifact.get("transcript_sha256") or "")
+    audio_hash = str(artifact.get("audio_sha256") or "")
+    acquisition_audit = artifact.get("audit") or {}
+    acquisition_checks = acquisition_audit.get("checks") or {}
+    genome_payload = genome or {}
+    transcript_text = str(genome_payload.get("transcript") or "")
+    transcript_payload: dict[str, Any] | None = None
+    transcript_payload_error: str | None = None
+    if raw_transcript_payload:
+        try:
+            loaded_transcript_payload = json.loads(raw_transcript_payload)
+        except (TypeError, json.JSONDecodeError) as exc:
+            transcript_payload_error = type(exc).__name__
+        else:
+            if isinstance(loaded_transcript_payload, dict):
+                transcript_payload = loaded_transcript_payload
+            else:
+                transcript_payload_error = "payload_not_object"
+    else:
+        transcript_payload_error = "payload_snapshot_missing"
+    acquisition_payload_sha256 = (
+        canonical_sha256(transcript_payload)
+        if transcript_payload is not None else ""
+    )
+    rebound_payload = (
+        {**transcript_payload, "text": transcript_text}
+        if transcript_payload is not None else None
+    )
+    atomic_tape_payload_sha256 = (
+        canonical_sha256(rebound_payload)
+        if rebound_payload is not None else ""
+    )
+    attestation_checks = {
+        "acquisition_audit_passed": (
+            acquisition_audit.get("decision") == "PASS"
+        ),
+        "transcript_hash_matches_acquisition_audit": (
+            len(transcript_hash) == 64
+            and acquisition_audit.get("transcript_payload_sha256")
+                == transcript_hash
+        ),
+        "audio_hash_was_bound_at_acquisition": (
+            len(audio_hash) == 64
+            and acquisition_checks.get("audio_file_exists") is True
+            and acquisition_checks.get("audio_sha256_bound") is True
+        ),
+        "acquisition_transcript_payload_snapshot_present": (
+            transcript_payload is not None
+        ),
+        "acquisition_transcript_payload_sha256_matches": (
+            bool(transcript_hash)
+            and acquisition_payload_sha256 == transcript_hash
+        ),
+        "atomic_tape_transcript_present": bool(transcript_text),
+        "atomic_tape_transcript_payload_sha256_matches": (
+            bool(transcript_text)
+            and atomic_tape_payload_sha256 == transcript_hash
+        ),
+        "atomic_tape_hash_reference_matches": (
+            genome_payload.get("transcript_embedding_ref")
+            == f"sha256:{transcript_hash}"
+        ),
+        "atomic_tape_word_count_matches": (
+            len(words(transcript_text))
+            == int(artifact.get("word_count") or 0)
+        ),
+        "atomic_tape_extraction_status_matches": (
+            genome_payload.get("extraction_status")
+            == "whisper_transcribed"
+        ),
+    }
+    return {
+        "transcript_id": transcript_id,
+        "verification_mode": (
+            "acquisition_payload_hash_plus_atomic_tape_reconstruction"
+        ),
+        "fresh_removable_volume_rehash": False,
+        "acquisition_transcript_payload_sha256": (
+            acquisition_payload_sha256 or None
+        ),
+        "atomic_tape_transcript_payload_sha256": (
+            atomic_tape_payload_sha256 or None
+        ),
+        "transcript_payload_snapshot_error": transcript_payload_error,
+        "checks": attestation_checks,
+    }
 
 
 def topic_terms(topic: str) -> list[str]:
@@ -2750,96 +2853,18 @@ class TranscriptBank:
         integrity_attestations: list[dict[str, Any]] = []
         for member in members:
             transcript_id = str(member.get("transcript_id") or "")
-            transcript_hash = str(member.get("transcript_sha256") or "")
-            audio_hash = str(member.get("audio_sha256") or "")
-            acquisition_audit = member.get("audit") or {}
-            acquisition_checks = acquisition_audit.get("checks") or {}
             genome = genome_by_video.get(str(member.get("video_id") or ""))
             transcript_text = str((genome or {}).get("transcript") or "")
-            transcript_payload: dict[str, Any] | None = None
-            transcript_payload_error: str | None = None
             raw_transcript_payload = payload_json_by_transcript.get(
                 transcript_id, ""
             )
-            if raw_transcript_payload:
-                try:
-                    loaded_transcript_payload = json.loads(raw_transcript_payload)
-                except (TypeError, json.JSONDecodeError) as exc:
-                    transcript_payload_error = type(exc).__name__
-                else:
-                    if isinstance(loaded_transcript_payload, dict):
-                        transcript_payload = loaded_transcript_payload
-                    else:
-                        transcript_payload_error = "payload_not_object"
-            else:
-                transcript_payload_error = "payload_snapshot_missing"
-            acquisition_payload_sha256 = (
-                canonical_sha256(transcript_payload)
-                if transcript_payload is not None else ""
+            attestation = immutable_artifact_attestation(
+                artifact=member,
+                genome=genome,
+                raw_transcript_payload=raw_transcript_payload,
             )
-            rebound_payload = (
-                {**transcript_payload, "text": transcript_text}
-                if transcript_payload is not None else None
-            )
-            atomic_tape_payload_sha256 = (
-                canonical_sha256(rebound_payload)
-                if rebound_payload is not None else ""
-            )
-            attestation_checks = {
-                "acquisition_audit_passed": (
-                    acquisition_audit.get("decision") == "PASS"
-                ),
-                "transcript_hash_matches_acquisition_audit": (
-                    len(transcript_hash) == 64
-                    and acquisition_audit.get("transcript_payload_sha256")
-                    == transcript_hash
-                ),
-                "audio_hash_was_bound_at_acquisition": (
-                    len(audio_hash) == 64
-                    and acquisition_checks.get("audio_file_exists") is True
-                    and acquisition_checks.get("audio_sha256_bound") is True
-                ),
-                "acquisition_transcript_payload_snapshot_present": (
-                    transcript_payload is not None
-                ),
-                "acquisition_transcript_payload_sha256_matches": (
-                    bool(transcript_hash)
-                    and acquisition_payload_sha256 == transcript_hash
-                ),
-                "atomic_tape_transcript_present": bool(transcript_text),
-                "atomic_tape_transcript_payload_sha256_matches": (
-                    bool(transcript_text)
-                    and atomic_tape_payload_sha256 == transcript_hash
-                ),
-                "atomic_tape_hash_reference_matches": (
-                    (genome or {}).get("transcript_embedding_ref")
-                    == f"sha256:{transcript_hash}"
-                ),
-                "atomic_tape_word_count_matches": (
-                    len(words(transcript_text))
-                    == int(member.get("word_count") or 0)
-                ),
-                "atomic_tape_extraction_status_matches": (
-                    (genome or {}).get("extraction_status")
-                    == "whisper_transcribed"
-                ),
-            }
-            integrity_attestations.append({
-                "transcript_id": transcript_id,
-                "verification_mode": (
-                    "acquisition_payload_hash_plus_atomic_tape_reconstruction"
-                ),
-                "fresh_removable_volume_rehash": False,
-                "acquisition_transcript_payload_sha256": (
-                    acquisition_payload_sha256 or None
-                ),
-                "atomic_tape_transcript_payload_sha256": (
-                    atomic_tape_payload_sha256 or None
-                ),
-                "transcript_payload_snapshot_error": transcript_payload_error,
-                "checks": attestation_checks,
-            })
-            if not all(attestation_checks.values()):
+            integrity_attestations.append(attestation)
+            if not all(attestation["checks"].values()):
                 integrity_failures.append({
                     "transcript_id": transcript_id,
                     "error": "acquisition or atomic tape integrity attestation failed",

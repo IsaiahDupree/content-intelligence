@@ -386,6 +386,115 @@ def seed_competing_trend(
         connection.commit()
 
 
+def seed_legacy_artifacts_without_payload_snapshots(tape_path, count=4):
+    """Add performance-passing legacy rows that cannot pass cohort integrity."""
+
+    def clone_row(connection, table, source_query, source_params, overrides):
+        source = connection.execute(source_query, source_params).fetchone()
+        assert source is not None
+        payload = dict(source)
+        payload.update(overrides)
+        columns = list(payload)
+        connection.execute(
+            f"INSERT INTO {table} ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            [payload[column] for column in columns],
+        )
+
+    legacy_video_ids = []
+    with closing(sqlite3.connect(tape_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        for index in range(count):
+            source_index = index % 5
+            source_video_id = f"youtube:video:script-source-{source_index}"
+            creator_id = f"youtube:creator:legacy-{index}"
+            video_id = f"youtube:video:legacy-script-source-{index}"
+            external_id = f"legacy-script-source-{index}"
+            observation_key = f"accepted-legacy-script-observation-{index}"
+            source_url = f"https://www.youtube.com/watch?v={external_id}"
+            clone_row(
+                connection,
+                "mt_creators",
+                "SELECT * FROM mt_creators WHERE creator_id=?",
+                (f"youtube:creator:{source_index}",),
+                {
+                    "creator_id": creator_id,
+                    "external_id": f"legacy-creator-{index}",
+                    "handle": f"legacy-creator-{index}",
+                    "display_name": f"Legacy Creator {index}",
+                },
+            )
+            clone_row(
+                connection,
+                "mt_videos",
+                "SELECT * FROM mt_videos WHERE video_id=?",
+                (source_video_id,),
+                {
+                    "video_id": video_id,
+                    "external_id": external_id,
+                    "creator_id": creator_id,
+                    "url": source_url,
+                },
+            )
+            observation = dict(connection.execute(
+                "SELECT * FROM mt_market_observations WHERE video_id=? LIMIT 1",
+                (source_video_id,),
+            ).fetchone())
+            observation.pop("observation_id")
+            observation.update({
+                "observation_key": observation_key,
+                "video_id": video_id,
+                "creator_id": creator_id,
+            })
+            columns = list(observation)
+            cursor = connection.execute(
+                f"INSERT INTO mt_market_observations ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                [observation[column] for column in columns],
+            )
+            clone_row(
+                connection,
+                "mt_accepted_observation_evidence",
+                """SELECT * FROM mt_accepted_observation_evidence
+                   WHERE video_id=? LIMIT 1""",
+                (source_video_id,),
+                {
+                    "evidence_id": f"accepted:{observation_key}:full",
+                    "observation_id": cursor.lastrowid,
+                    "observation_key": observation_key,
+                    "video_id": video_id,
+                    "creator_id": creator_id,
+                    "url": source_url,
+                },
+            )
+            clone_row(
+                connection,
+                "mt_content_genomes",
+                "SELECT * FROM mt_content_genomes WHERE video_id=?",
+                (source_video_id,),
+                {"video_id": video_id},
+            )
+            clone_row(
+                connection,
+                "mt_transcript_artifacts",
+                "SELECT * FROM mt_transcript_artifacts WHERE video_id=? LIMIT 1",
+                (source_video_id,),
+                {
+                    "transcript_id": f"whisper-legacy-script-{index}",
+                    "video_id": video_id,
+                    "external_id": external_id,
+                    "source_url": source_url,
+                    "observation_key": observation_key,
+                },
+            )
+            # Deliberately do not create mt_transcript_payload_snapshots. These
+            # rows model the historical artifacts that caused a late audit
+            # failure despite a passing performance qualification.
+            legacy_video_ids.append(video_id)
+        connection.commit()
+    return legacy_video_ids
+
+
 def test_trend_ranking_prefers_a_direct_topic_label_over_member_cooccurrence(
     tmp_path,
 ):
@@ -493,6 +602,155 @@ def test_trend_to_script_workflow_is_persisted_and_passes_every_gate(tmp_path):
                 "UPDATE cq_script_briefs SET status='changed' WHERE brief_id=?",
                 (brief["brief_id"],),
             )
+
+
+def test_production_brief_excludes_unattested_legacy_artifacts_upstream(
+    tmp_path,
+):
+    _app, engine = app_and_engine(tmp_path)
+    legacy_video_ids = seed_legacy_artifacts_without_payload_snapshots(
+        engine.tape.path,
+    )
+    all_video_ids = [
+        *(f"youtube:video:script-source-{index}" for index in range(5)),
+        *legacy_video_ids,
+    ]
+
+    # The generic evidence reader keeps historical rows available, while the
+    # production lane applies the same immutable attestation as the final audit.
+    assert len(engine.tape.artifact_bound_candidates(all_video_ids)) == 9
+    admitted = engine.tape.production_artifact_bound_candidates(all_video_ids)
+    assert {row["video_id"] for row in admitted} == {
+        f"youtube:video:script-source-{index}" for index in range(5)
+    }
+    assert len(engine.tape.transcript_candidates("AI automation", limit=20)) == 5
+
+    brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    })
+    assert brief["status"] == "ready", brief
+    assert brief["language"]["aggregate_metrics"]["member_count"] == 5
+    assert len(brief["language"]["sources"]) == 5
+    assert not (
+        {row["video_id"] for row in brief["language"]["sources"]}
+        & set(legacy_video_ids)
+    )
+    manifest = json.loads(
+        Path(brief["language"]["cohort_manifest_path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(manifest["members"]) == 5
+    assert all(
+        member["transcript_id"].startswith("whisper-script-")
+        for member in manifest["members"]
+    )
+
+    result = engine.script_intelligence.generate_and_audit({
+        "brief_id": brief["brief_id"],
+    })
+    assert result["decisions"]["cohort_integrity"] is True, result
+    cohort_findings = result["audits"]["transcript_cohort_relatability"][
+        "findings"
+    ]["findings"]
+    assert cohort_findings["artifact_integrity_failures"] == []
+    assert all(
+        all(attestation["checks"].values())
+        for attestation in cohort_findings["artifact_integrity_attestations"]
+    )
+
+
+def test_production_lane_selects_newest_valid_artifact_after_attestation(
+    tmp_path,
+):
+    _app, engine = app_and_engine(tmp_path)
+    video_id = "youtube:video:script-source-0"
+    valid_transcript_id = "whisper-script-0"
+    with closing(sqlite3.connect(engine.tape.path)) as connection:
+        connection.row_factory = sqlite3.Row
+        source = dict(connection.execute(
+            "SELECT * FROM mt_transcript_artifacts WHERE transcript_id=?",
+            (valid_transcript_id,),
+        ).fetchone())
+
+        unattested = {
+            **source,
+            "transcript_id": "whisper-newer-unattested",
+            "created_at": "2098-08-25T00:00:00+00:00",
+        }
+        columns = list(unattested)
+        connection.execute(
+            f"INSERT INTO mt_transcript_artifacts ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            [unattested[column] for column in columns],
+        )
+
+        rejected_audit = json.loads(source["audit_json"])
+        rejected_audit["decision"] = "REJECTED"
+        rejected = {
+            **source,
+            "transcript_id": "whisper-newest-rejected",
+            "audit_json": json.dumps(rejected_audit, sort_keys=True),
+            "created_at": "2099-08-25T00:00:00+00:00",
+        }
+        columns = list(rejected)
+        connection.execute(
+            f"INSERT INTO mt_transcript_artifacts ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            [rejected[column] for column in columns],
+        )
+        snapshot = dict(connection.execute(
+            """SELECT * FROM mt_transcript_payload_snapshots
+               WHERE transcript_id=?""",
+            (valid_transcript_id,),
+        ).fetchone())
+        snapshot.update({
+            "transcript_id": rejected["transcript_id"],
+            "created_at": rejected["created_at"],
+        })
+        columns = list(snapshot)
+        connection.execute(
+            f"INSERT INTO mt_transcript_payload_snapshots ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})",
+            [snapshot[column] for column in columns],
+        )
+        connection.commit()
+
+    assert engine.tape.transcript_artifact(video_id)["transcript_id"] == (
+        "whisper-newest-rejected"
+    )
+    admitted = engine.tape.production_artifact_bound_candidates([video_id])
+    assert len(admitted) == 1
+    assert admitted[0]["transcript_id"] == valid_transcript_id
+    assert admitted[0]["observation_key"] == (
+        "accepted-script-observation-0"
+    )
+
+    discovery = engine.viral.discover_for_videos(
+        "AI automation", [video_id], limit=1
+    )
+    assert discovery["receipt_count"] == 1
+    assert discovery["receipts"][0]["payload"]["transcript_id"] == (
+        valid_transcript_id
+    )
+
+    brief = engine.script_intelligence.build_brief({
+        "topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified_attention",
+    })
+    assert brief["status"] == "ready", brief
+    selected_source = next(
+        source for source in brief["language"]["sources"]
+        if source["video_id"] == video_id
+    )
+    assert selected_source["transcript_id"] == valid_transcript_id
+    result = engine.script_intelligence.generate_and_audit({
+        "brief_id": brief["brief_id"],
+    })
+    assert result["decisions"]["cohort_integrity"] is True, result
 
 
 def test_authenticated_source_moment_variants_share_cohort_and_pass_all_gates(

@@ -31,7 +31,6 @@ from .contracts import (
     SCRIPT_INTELLIGENCE_BRIEF_CONTRACT,
     SCRIPT_LANGUAGE_DEMAND_CONTRACT,
     TREND_OBSERVATION_QUALITY_CONTRACT,
-    is_supported_transcript_audit_contract,
 )
 
 
@@ -707,7 +706,9 @@ class ScriptIntelligenceService:
             }
             artifact_by_video.update({
                 str(row["video_id"]): dict(row)
-                for row in self.tape.artifact_bound_candidates(exact_video_ids)
+                for row in self.tape.production_artifact_bound_candidates(
+                    exact_video_ids
+                )
             })
             artifact_rows = list(artifact_by_video.values())
         else:
@@ -715,7 +716,9 @@ class ScriptIntelligenceService:
                 str(row["video_id"]) for row in semantic
                 if str(row["video_id"]) not in exact_video_id_set
             ]]
-            artifact_rows = self.tape.artifact_bound_candidates(candidate_ids)
+            artifact_rows = self.tape.production_artifact_bound_candidates(
+                candidate_ids
+            )
         language_terms = set(_terms(language_query))
         differentiating_set = set(differentiating_terms)
         qualified_rows: list[dict[str, Any]] = []
@@ -833,7 +836,9 @@ class ScriptIntelligenceService:
         for receipt in receipts:
             source = receipt["payload"]
             artifact = self.tape.transcript_artifact(
-                str(source["video_id"]), str(source["observation_key"])
+                str(source["video_id"]),
+                str(source["observation_key"]),
+                str(source.get("transcript_id") or "") or None,
             )
             if artifact:
                 artifacts.append(artifact)
@@ -868,6 +873,7 @@ class ScriptIntelligenceService:
             audience_name,
             limit=8,
             video_ids=[str(receipt["payload"]["video_id"]) for receipt in receipts],
+            require_immutable_artifacts=True,
         )
         assessment["gates"]["source_bound_human_moment"] = {
             "status": "evaluated",
@@ -1148,7 +1154,6 @@ class ScriptIntelligenceService:
                 },
             )
         selected_moment = variant_moments[variant_index]
-        stakes = str(selected_moment["stakes"])
         claim = (
             f"For {audience_name}, useful {topic} completes one task where the "
             "work already happens instead of adding another app"
