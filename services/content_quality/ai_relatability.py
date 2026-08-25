@@ -31,6 +31,8 @@ MINIMUM_CREATORS = 3
 MINIMUM_OBSERVED_VIEWS = 100_000
 PASS_THRESHOLD = 70
 PREDICTION_SCORE_CAP = 90
+MAX_JUDGE_ATTEMPTS = 3
+MAX_COMPLETION_TOKENS = 1_600
 
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
 STOP_WORDS = {
@@ -407,7 +409,7 @@ def openai_relatability_runner(prompt: str, timeout_seconds: int = 90) -> str:
             },
             {"role": "user", "content": prompt},
         ],
-        "max_completion_tokens": 900,
+        "max_completion_tokens": MAX_COMPLETION_TOKENS,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -594,6 +596,28 @@ def _validate_judgment(
             "code": "unsupported_source_terms_removed",
             "removed_count": unsupported_term_count,
         })
+    alienating_language = [
+        item.strip() for item in value["alienating_language"]
+        if item.strip().lower() not in {"none", "none identified", "n/a"}
+    ]
+    if (
+        rubric_scores["non_alienating_framing"] == 0
+        and not alienating_language
+    ):
+        normalized_score = score + 10
+        if (normalized_score >= PASS_THRESHOLD) != (
+            score >= PASS_THRESHOLD
+        ):
+            return None
+        rubric_scores = {
+            **rubric_scores,
+            "non_alienating_framing": 10,
+        }
+        semantic_normalizations.append({
+            "code": "non_alienating_default_without_identified_language",
+            "normalized_score": normalized_score,
+        })
+        score = normalized_score
     if value["relatable"] != (score >= PASS_THRESHOLD):
         return None
     if value["relatable"] and (
@@ -604,18 +628,6 @@ def _validate_judgment(
     if not value["relatable"] and not any(
         item.strip() for item in value["rewrite_guidance"]
     ):
-        return None
-    alienating_language = [
-        item.strip() for item in value["alienating_language"]
-        if item.strip().lower() not in {"none", "none identified", "n/a"}
-    ]
-    if (
-        rubric_scores["non_alienating_framing"] == 0
-        and not alienating_language
-    ):
-        # A deduction without identified language is not auditable. Ask the
-        # bounded retry for a self-consistent judgment rather than silently
-        # manufacturing points or accepting unexplained deductions.
         return None
     return {
         "relatable": value["relatable"],
@@ -628,6 +640,105 @@ def _validate_judgment(
         "rewrite_guidance": [item.strip() for item in value["rewrite_guidance"]],
         "semantic_normalizations": semantic_normalizations,
     }
+
+
+def _judgment_attempt_receipt(
+    raw: str,
+    *,
+    supported_terms: Sequence[str],
+    judgment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Summarize validation without persisting the model response text."""
+
+    receipt: dict[str, Any] = {
+        "response_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "response_char_count": len(raw),
+        "validation": "accepted" if judgment is not None else "rejected",
+        "failure_codes": [],
+    }
+    if judgment is not None:
+        receipt.update({
+            "normalized_score": judgment["score"],
+            "relatable": judgment["relatable"],
+            "semantic_normalization_codes": [
+                str(item.get("code") or "")
+                for item in judgment.get("semantic_normalizations") or []
+            ],
+        })
+        return receipt
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        receipt["failure_codes"] = ["invalid_json"]
+        return receipt
+    if not isinstance(value, dict):
+        receipt["failure_codes"] = ["response_not_object"]
+        return receipt
+    failures: list[str] = []
+    if set(value) != set(_response_schema()["required"]):
+        failures.append("required_fields_invalid")
+    if not isinstance(value.get("relatable"), bool):
+        failures.append("relatable_type_invalid")
+    score = value.get("score")
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, int)
+        or not 0 <= score <= 100
+    ):
+        failures.append("score_invalid")
+    rubric = value.get("rubric_scores")
+    rubric_values = list(rubric.values()) if isinstance(rubric, dict) else []
+    if not rubric_values or not all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in rubric_values
+    ):
+        failures.append("rubric_invalid")
+    if not isinstance(value.get("audience_moment"), str) or not str(
+        value.get("audience_moment") or ""
+    ).strip():
+        failures.append("audience_moment_empty")
+    list_fields = (
+        "why_it_feels_human", "alienating_language",
+        "source_language_used", "rewrite_guidance",
+    )
+    if any(
+        not isinstance(value.get(name), list)
+        or not all(isinstance(item, str) for item in value.get(name) or [])
+        for name in list_fields
+    ):
+        failures.append("explanation_list_invalid")
+    supported = {str(term).strip().lower() for term in supported_terms}
+    reported_terms = {
+        str(item).strip().lower()
+        for item in value.get("source_language_used") or []
+        if isinstance(item, str) and item.strip()
+    }
+    if value.get("relatable") is True and not (reported_terms & supported):
+        failures.append("passing_verdict_lacks_supported_source_term")
+    alienating = [
+        str(item).strip()
+        for item in value.get("alienating_language") or []
+        if isinstance(item, str)
+        and item.strip().lower() not in {"", "none", "none identified", "n/a"}
+    ]
+    if (
+        isinstance(rubric, dict)
+        and rubric.get("non_alienating_framing") == 0
+        and not alienating
+    ):
+        failures.append("unexplained_non_alienating_zero")
+    if (
+        score == 0
+        and rubric_values
+        and all(item == 0 for item in rubric_values)
+        and not str(value.get("audience_moment") or "").strip()
+        and all(not (value.get(name) or []) for name in list_fields)
+    ):
+        failures.append("all_zero_empty_verdict")
+    if not failures:
+        failures.append("semantic_contract_inconsistent")
+    receipt["failure_codes"] = sorted(set(failures))
+    return receipt
 
 
 class AIRelatabilityAdjudicator:
@@ -874,6 +985,7 @@ class AIRelatabilityAdjudicator:
         judgment: dict[str, Any] | None = None
         unavailable_reason: str | None = None
         judge_attempt_count = 0
+        judge_attempts: list[dict[str, Any]] = []
         if not deterministic["passed"]:
             decision = "REJECT_NOT_RELATABLE"
             score = deterministic["score"]
@@ -888,7 +1000,7 @@ class AIRelatabilityAdjudicator:
                 audience=audience,
                 evidence=deterministic["evidence"],
             )
-            for attempt in range(1, 3):
+            for attempt in range(1, MAX_JUDGE_ATTEMPTS + 1):
                 judge_attempt_count = attempt
                 try:
                     raw = self.llm_runner(
@@ -908,7 +1020,23 @@ class AIRelatabilityAdjudicator:
                     )
                 except Exception as exc:  # never persist provider response text
                     unavailable_reason = type(exc).__name__
+                    judge_attempts.append({
+                        "attempt": attempt,
+                        "validation": "provider_error",
+                        "exception_type": type(exc).__name__,
+                        "failure_codes": ["provider_error"],
+                    })
                     break
+                judge_attempts.append({
+                    "attempt": attempt,
+                    **_judgment_attempt_receipt(
+                        raw,
+                        supported_terms=deterministic["evidence"][
+                            "overlap_terms"
+                        ],
+                        judgment=judgment,
+                    ),
+                })
                 if judgment is not None:
                     break
             if judgment is None:
@@ -937,6 +1065,7 @@ class AIRelatabilityAdjudicator:
             "judgment": judgment,
             "judge_unavailable_reason": unavailable_reason,
             "judge_attempt_count": judge_attempt_count,
+            "judge_attempts": judge_attempts,
         }
         record = self.store.put_audit(
             AUDIT_TYPE,

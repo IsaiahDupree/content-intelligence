@@ -423,8 +423,82 @@ def test_unexplained_non_alienating_deduction_retries_fail_closed(
 
     verdict = result["qualitative_verdict"]
     assert verdict["decision"] == "JUDGE_UNAVAILABLE"
-    assert verdict["judge_attempt_count"] == 2
+    assert verdict["judge_attempt_count"] == 3
     assert verdict["judge_unavailable_reason"] == "invalid_response_contract"
+
+
+def test_non_alienating_default_normalizes_only_on_same_decision_side(
+    tmp_path: Path,
+):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    same_side_rejection = {
+        **AI_PASS,
+        "relatable": False,
+        "score": 55,
+        "rubric_scores": {
+            "concrete_lived_moment": 20,
+            "clear_personal_stakes": 10,
+            "visible_input_action_output": 10,
+            "source_language_support": 10,
+            "direct_audience_perspective": 5,
+            "non_alienating_framing": 0,
+        },
+        "alienating_language": [],
+        "rewrite_guidance": ["Make the personal stakes more concrete."],
+    }
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(same_side_rejection)
+    ).audit(script_with_receipts(store))
+
+    verdict = result["qualitative_verdict"]
+    assert verdict["decision"] == "REJECT_NOT_RELATABLE"
+    assert verdict["score"] == 65.0
+    assert verdict["judgment"]["rubric_scores"][
+        "non_alienating_framing"
+    ] == 10
+    assert verdict["judgment"]["semantic_normalizations"][-1] == {
+        "code": "non_alienating_default_without_identified_language",
+        "normalized_score": 65,
+    }
+    assert verdict["judge_attempts"][0]["validation"] == "accepted"
+    assert len(verdict["judge_attempts"][0]["response_sha256"]) == 64
+
+
+def test_all_zero_model_responses_persist_content_free_failure_codes(
+    tmp_path: Path,
+):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    empty = {
+        "relatable": False,
+        "score": 0,
+        "rubric_scores": {
+            "concrete_lived_moment": 0,
+            "clear_personal_stakes": 0,
+            "visible_input_action_output": 0,
+            "source_language_support": 0,
+            "direct_audience_perspective": 0,
+            "non_alienating_framing": 0,
+        },
+        "audience_moment": "",
+        "why_it_feels_human": [],
+        "alienating_language": [],
+        "source_language_used": [],
+        "rewrite_guidance": [],
+    }
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(empty)
+    ).audit(script_with_receipts(store))
+
+    verdict = result["qualitative_verdict"]
+    assert verdict["decision"] == "JUDGE_UNAVAILABLE"
+    assert verdict["judge_attempt_count"] == 3
+    assert len(verdict["judge_attempts"]) == 3
+    assert all(
+        "all_zero_empty_verdict" in attempt["failure_codes"]
+        for attempt in verdict["judge_attempts"]
+    )
+    persisted = json.dumps(result["findings"], sort_keys=True)
+    assert '"audience_moment": ""' not in persisted
 
 
 def test_score_normalization_never_crosses_the_pass_threshold(tmp_path: Path):
@@ -451,7 +525,7 @@ def test_score_normalization_never_crosses_the_pass_threshold(tmp_path: Path):
 
     assert result["decision"] == "JUDGE_UNAVAILABLE"
     assert result["qualitative_verdict"]["ai_evaluated"] is False
-    assert result["qualitative_verdict"]["judge_attempt_count"] == 2
+    assert result["qualitative_verdict"]["judge_attempt_count"] == 3
 
 
 def test_ai_pass_still_requires_at_least_one_supported_source_term(
@@ -469,7 +543,7 @@ def test_ai_pass_still_requires_at_least_one_supported_source_term(
 
     assert result["decision"] == "JUDGE_UNAVAILABLE"
     assert result["qualitative_verdict"]["ai_evaluated"] is False
-    assert result["qualitative_verdict"]["judge_attempt_count"] == 2
+    assert result["qualitative_verdict"]["judge_attempt_count"] == 3
 
 
 def test_configured_judge_failure_is_fail_closed_and_secret_safe(tmp_path: Path):
@@ -598,7 +672,7 @@ def test_gpt5_runner_uses_strict_supported_request_contract():
     assert received["path"] == "/v1/chat/completions"
     assert received["authorization_present"] is True
     assert body["model"] == "gpt-5-nano"
-    assert body["max_completion_tokens"] == 900
+    assert body["max_completion_tokens"] == 1600
     assert body["reasoning_effort"] == "minimal"
     assert body["messages"][0]["role"] == "system"
     assert "untrusted quoted data" in body["messages"][0]["content"]
