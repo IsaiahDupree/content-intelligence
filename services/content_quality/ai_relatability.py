@@ -505,8 +505,12 @@ def _validate_judgment(
         return None
     if not isinstance(value.get("relatable"), bool):
         return None
-    score = value.get("score")
-    if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 100:
+    reported_score = value.get("score")
+    if (
+        isinstance(reported_score, bool)
+        or not isinstance(reported_score, int)
+        or not 0 <= reported_score <= 100
+    ):
         return None
     rubric_maxima = {
         "concrete_lived_moment": 25,
@@ -528,8 +532,24 @@ def _validate_judgment(
         for name, maximum in rubric_maxima.items()
     ):
         return None
-    if sum(rubric_scores.values()) != score:
-        return None
+    rubric_score = sum(rubric_scores.values())
+    semantic_normalizations: list[dict[str, Any]] = []
+    if rubric_score != reported_score:
+        # Structured Outputs guarantees JSON shape, not arithmetic.  Keep the
+        # six bounded rubric dimensions authoritative and calculate their
+        # total locally, but never let normalization move a provider verdict
+        # across the pass threshold.  That would turn an internally
+        # inconsistent response into an AI approval (or rejection).
+        if (rubric_score >= PASS_THRESHOLD) != (
+            reported_score >= PASS_THRESHOLD
+        ):
+            return None
+        semantic_normalizations.append({
+            "code": "score_derived_from_rubric",
+            "provider_reported_score": reported_score,
+            "normalized_score": rubric_score,
+        })
+    score = rubric_score
     if (
         not isinstance(value.get("audience_moment"), str)
         or not value["audience_moment"].strip()
@@ -544,13 +564,26 @@ def _validate_judgment(
             isinstance(item, str) for item in items
         ):
             return None
-    source_language_used = [
+    reported_source_language = [
         item.strip().lower() for item in value["source_language_used"]
         if item.strip()
     ]
     supported = {str(term).strip().lower() for term in supported_terms}
-    if not set(source_language_used).issubset(supported):
-        return None
+    source_language_used = [
+        term for term in reported_source_language if term in supported
+    ]
+    unsupported_term_count = len(reported_source_language) - len(
+        source_language_used
+    )
+    if unsupported_term_count:
+        # The evidence contract requires at least one supported citation for
+        # an approval.  Extra model-supplied terms are not evidence and are
+        # removed rather than persisted or allowed to turn an otherwise valid
+        # rejection into JUDGE_UNAVAILABLE.
+        semantic_normalizations.append({
+            "code": "unsupported_source_terms_removed",
+            "removed_count": unsupported_term_count,
+        })
     if value["relatable"] != (score >= PASS_THRESHOLD):
         return None
     if value["relatable"] and (
@@ -571,6 +604,7 @@ def _validate_judgment(
         "alienating_language": [item.strip() for item in value["alienating_language"]],
         "source_language_used": source_language_used,
         "rewrite_guidance": [item.strip() for item in value["rewrite_guidance"]],
+        "semantic_normalizations": semantic_normalizations,
     }
 
 

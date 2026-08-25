@@ -350,6 +350,97 @@ def test_ai_rejection_is_not_overridden_by_deterministic_pass(tmp_path: Path):
     assert result["qualitative_verdict"]["ai_evaluated"] is True
 
 
+def test_rejection_normalizes_same_side_rubric_total_and_drops_unsupported_terms(
+    tmp_path: Path,
+):
+    """GPT structured output can satisfy JSON Schema but miss local arithmetic."""
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    live_shaped_rejection = {
+        **AI_PASS,
+        "relatable": False,
+        "score": 62,
+        "rubric_scores": {
+            "concrete_lived_moment": 25,
+            "clear_personal_stakes": 0,
+            "visible_input_action_output": 0,
+            "source_language_support": 15,
+            "direct_audience_perspective": 10,
+            "non_alienating_framing": 0,
+        },
+        "source_language_used": ["feel", "invented-phrase"],
+        "alienating_language": ["The stakes are not concrete."],
+        "rewrite_guidance": ["Name the specific stakes and visible output."],
+    }
+
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(live_shaped_rejection)
+    ).audit(script_with_receipts(store))
+
+    verdict = result["qualitative_verdict"]
+    judgment = verdict["judgment"]
+    assert result["decision"] == "REJECT_NOT_RELATABLE"
+    assert result["score"] == 50.0
+    assert verdict["ai_evaluated"] is True
+    assert verdict["judge_attempt_count"] == 1
+    assert judgment["source_language_used"] == ["feel"]
+    assert judgment["semantic_normalizations"] == [
+        {
+            "code": "score_derived_from_rubric",
+            "provider_reported_score": 62,
+            "normalized_score": 50,
+        },
+        {
+            "code": "unsupported_source_terms_removed",
+            "removed_count": 1,
+        },
+    ]
+
+
+def test_score_normalization_never_crosses_the_pass_threshold(tmp_path: Path):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    inconsistent = {
+        **AI_PASS,
+        "relatable": False,
+        "score": 62,
+        "rubric_scores": {
+            "concrete_lived_moment": 20,
+            "clear_personal_stakes": 15,
+            "visible_input_action_output": 15,
+            "source_language_support": 15,
+            "direct_audience_perspective": 5,
+            "non_alienating_framing": 5,
+        },
+        "alienating_language": ["The framing is generic."],
+        "rewrite_guidance": ["Make the moment more concrete."],
+    }
+
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(inconsistent)
+    ).audit(script_with_receipts(store))
+
+    assert result["decision"] == "JUDGE_UNAVAILABLE"
+    assert result["qualitative_verdict"]["ai_evaluated"] is False
+    assert result["qualitative_verdict"]["judge_attempt_count"] == 2
+
+
+def test_ai_pass_still_requires_at_least_one_supported_source_term(
+    tmp_path: Path,
+):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    unsupported = {
+        **AI_PASS,
+        "source_language_used": ["invented-phrase"],
+    }
+
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(unsupported)
+    ).audit(script_with_receipts(store))
+
+    assert result["decision"] == "JUDGE_UNAVAILABLE"
+    assert result["qualitative_verdict"]["ai_evaluated"] is False
+    assert result["qualitative_verdict"]["judge_attempt_count"] == 2
+
+
 def test_configured_judge_failure_is_fail_closed_and_secret_safe(tmp_path: Path):
     store = QualityStore(tmp_path / "quality.sqlite3")
 
