@@ -18,6 +18,10 @@ from .contracts import SCRIPT_INTELLIGENCE_BRIEF_CONTRACT
 from .demand_client import MarketTapeDemandClient
 from .engine import ContentQualityEngine
 from .narrative_coherence import default_llm_runner, openai_llm_runner
+from .reference_corpus import (
+    ReferenceCorpusService,
+    instagram_source_reader_from_env,
+)
 
 
 DEFAULT_MARKET_TAPE = Path.home() / "Library/Application Support/ContentIntelligence/data/market-tape.sqlite3"
@@ -56,6 +60,15 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     )
     app.extensions["market_tape_demand_client"] = demand_client
     app.extensions["content_quality_engine"] = engine
+    reference_reader = app.config.get("REFERENCE_SOURCE_READER")
+    if reference_reader is None:
+        reference_reader = instagram_source_reader_from_env()
+    reference_corpus = ReferenceCorpusService(
+        app.config.get("CONTENT_REFERENCE_ROOT")
+        or os.getenv("CONTENT_REFERENCE_ROOT"),
+        source_reader=reference_reader,
+    )
+    app.extensions["reference_corpus"] = reference_corpus
 
     @app.errorhandler(ValueError)
     def invalid_request(error: ValueError):
@@ -267,6 +280,218 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         }
         return jsonify(response), status_code
 
+    def reference_invalid_request(
+        action: str,
+        parameters: Any,
+        error: ValueError,
+        started_at: float,
+    ) -> tuple[Any, int]:
+        return audited_agent_response(
+            action,
+            parameters,
+            {
+                "status": "error",
+                "code": "INVALID_REQUEST",
+                "error": str(error),
+            },
+            400,
+            started_at,
+        )
+
+    @app.get("/api/reference-corpus/health")
+    def reference_corpus_health():
+        return jsonify(reference_corpus.health())
+
+    @app.get("/api/reference-corpus/status")
+    def reference_corpus_status():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        corpus_id = str(request.args.get("corpus_id") or "").strip()
+        try:
+            if not corpus_id:
+                raise ValueError("corpus_id is required")
+            result = reference_corpus.corpus_status(corpus_id)
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_status", {"corpus_id": corpus_id}, error, started
+            )
+        except KeyError:
+            result = {
+                "status": "error",
+                "code": "REFERENCE_CORPUS_NOT_FOUND",
+                "corpus_id": corpus_id,
+            }
+            return audited_agent_response(
+                "reference_corpus_status", {"corpus_id": corpus_id},
+                result, 404, started,
+            )
+        return audited_agent_response(
+            "reference_corpus_status", {"corpus_id": corpus_id},
+            result, started_at=started,
+        )
+
+    @app.get("/api/reference-corpus/items")
+    def reference_corpus_items():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        corpus_id = str(request.args.get("corpus_id") or "").strip()
+        limit = max(1, min(100, int(request.args.get("limit", "25"))))
+        include_text = str(request.args.get("include_transcript") or "").lower() in {
+            "1", "true", "yes",
+        }
+        if not corpus_id:
+            return reference_invalid_request(
+                "reference_corpus_items",
+                {"corpus_id": corpus_id},
+                ValueError("corpus_id is required"),
+                started,
+            )
+        rows = reference_corpus.list_items(
+            corpus_id, limit=limit, include_transcript=include_text
+        )
+        result = {
+            "status": "ok",
+            "contract": "content_reference_item_list_v1",
+            "corpus_id": corpus_id,
+            "items": rows,
+            "count": len(rows),
+            "limit": limit,
+        }
+        return audited_agent_response(
+            "reference_corpus_items",
+            {"corpus_id": corpus_id, "limit": limit, "include_transcript": include_text},
+            result,
+            started_at=started,
+        )
+
+    @app.post("/api/reference-corpus/find")
+    def reference_corpus_find():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            rows = reference_corpus.find_items(
+                corpus_id=str(payload.get("corpus_id") or ""),
+                query=str(payload.get("query") or ""),
+                limit=max(1, min(20, int(payload.get("limit") or 8))),
+            )
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_find", payload, error, started
+            )
+        result = {
+            "status": "ok",
+            "contract": "content_reference_evidence_v1",
+            "items": rows,
+            "count": len(rows),
+        }
+        return audited_agent_response(
+            "reference_corpus_find", payload, result, started_at=started
+        )
+
+    @app.get("/api/reference-corpus/summary")
+    def reference_corpus_summary():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        corpus_id = str(request.args.get("corpus_id") or "").strip()
+        if not corpus_id:
+            return reference_invalid_request(
+                "reference_corpus_summary",
+                {"corpus_id": corpus_id},
+                ValueError("corpus_id is required"),
+                started,
+            )
+        result = reference_corpus.summarize(corpus_id)
+        return audited_agent_response(
+            "reference_corpus_summary", {"corpus_id": corpus_id},
+            result, started_at=started,
+        )
+
+    @app.post("/api/reference-corpus/audit")
+    def reference_corpus_audit():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = reference_corpus.audit_content(
+                corpus_id=str(payload.get("corpus_id") or ""),
+                title=str(payload.get("title") or ""),
+                script=str(payload.get("script") or ""),
+                objective=str(payload.get("objective") or ""),
+                target_viewer=str(payload.get("target_viewer") or ""),
+                target_seconds=int(payload.get("target_seconds") or 60),
+            )
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_audit", payload, error, started
+            )
+        return audited_agent_response(
+            "reference_corpus_audit", payload, result, started_at=started
+        )
+
+    @app.post("/api/reference-corpus/acquire")
+    def reference_corpus_acquire():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = reference_corpus.acquire_instagram(
+                username=str(payload.get("username") or ""),
+                limit=max(1, min(100, int(payload.get("limit") or 75))),
+                corpus_id=str(payload.get("corpus_id") or "") or None,
+            )
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_acquire", payload, error, started
+            )
+        except RuntimeError as error:
+            result = {
+                "status": "error",
+                "code": "REFERENCE_SOURCE_UNAVAILABLE",
+                "error_type": type(error).__name__,
+            }
+            return audited_agent_response(
+                "reference_corpus_acquire", payload, result, 503, started
+            )
+        return audited_agent_response(
+            "reference_corpus_acquire", payload, result, 201, started
+        )
+
+    @app.post("/api/reference-corpus/extract")
+    def reference_corpus_extract():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = reference_corpus.extract_batch(
+                corpus_id=str(payload.get("corpus_id") or ""),
+                limit=max(1, min(3, int(payload.get("limit") or 1))),
+                transcript_model=str(payload.get("transcript_model") or "base.en"),
+                semantic_ai=bool(payload.get("semantic_ai", False)),
+                semantic_model=str(payload.get("semantic_model") or "gpt-5-nano"),
+            )
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_extract", payload, error, started
+            )
+        return audited_agent_response(
+            "reference_corpus_extract", payload, result, started_at=started
+        )
+
     @app.post("/api/viral-transcripts/discover")
     def discover_transcripts():
         payload = json_body()
@@ -324,6 +549,50 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 "get_script_lineage": {
                     "method": "GET",
                     "path": "/api/script-intelligence/scripts/{script_id}",
+                },
+                "reference_corpus_status": {
+                    "method": "GET",
+                    "path": "/api/reference-corpus/status",
+                    "required": ["corpus_id"],
+                },
+                "list_reference_items": {
+                    "method": "GET",
+                    "path": "/api/reference-corpus/items",
+                    "required": ["corpus_id"],
+                    "bounds": {"limit": [1, 100]},
+                },
+                "find_reference_evidence": {
+                    "method": "POST",
+                    "path": "/api/reference-corpus/find",
+                    "required": ["corpus_id", "query"],
+                    "bounds": {"limit": [1, 20]},
+                },
+                "summarize_reference_corpus": {
+                    "method": "GET",
+                    "path": "/api/reference-corpus/summary",
+                    "required": ["corpus_id"],
+                },
+                "audit_against_reference_corpus": {
+                    "method": "POST",
+                    "path": "/api/reference-corpus/audit",
+                    "required": ["corpus_id", "script"],
+                    "optional": [
+                        "title", "objective", "target_viewer", "target_seconds",
+                    ],
+                    "rights_gate": "patterns_only_no_copy_or_identity_imitation",
+                },
+                "acquire_reference_corpus": {
+                    "method": "POST",
+                    "path": "/api/reference-corpus/acquire",
+                    "required": ["username"],
+                    "bounds": {"limit": [1, 100]},
+                },
+                "extract_reference_items": {
+                    "method": "POST",
+                    "path": "/api/reference-corpus/extract",
+                    "required": ["corpus_id"],
+                    "bounds": {"limit": [1, 3]},
+                    "default": "local typed analysis with optional AI enrichment",
                 },
             },
         }

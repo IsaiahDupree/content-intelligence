@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:content-creation-audit:v1",
+  "title": "Content Creation Audit",
+  "type": "object",
+  "required": [
+    "contract",
+    "audit_id",
+    "corpus_id",
+    "status",
+    "overall_score",
+    "scores",
+    "copy_gate",
+    "evidence",
+    "rights",
+    "created_at"
+  ],
+  "properties": {
+    "contract": {"const": "content_creation_audit_v1"},
+    "audit_id": {"type": "string", "minLength": 1},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["pass", "revise"]},
+    "overall_score": {"type": "number", "minimum": 0, "maximum": 100},
+    "scores": {
+      "type": "object",
+      "required": [
+        "hook_clarity",
+        "narrative_flow",
+        "call_to_action",
+        "duration_fit",
+        "source_evidence",
+        "originality"
+      ],
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 100
+      }
+    },
+    "copy_gate": {
+      "type": "object",
+      "required": ["passed", "maximum_five_word_overlap"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "maximum_five_word_overlap": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "nearest_item_id": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["item_id", "source_url", "match_score"],
+        "properties": {
+          "item_id": {"type": "string"},
+          "source_url": {"type": "string", "format": "uri"},
+          "match_score": {"type": "number", "minimum": 0, "maximum": 100}
+        },
+        "additionalProperties": true
+      }
+    },
+    "rights": {
+      "type": "object",
+      "required": [
+        "state",
+        "direct_use_allowed",
+        "identity_imitation_allowed"
+      ],
+      "properties": {
+        "state": {"const": "public_reference_analysis_only"},
+        "direct_use_allowed": {"const": false},
+        "identity_imitation_allowed": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": true
+}

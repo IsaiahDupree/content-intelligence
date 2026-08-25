@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:content-reference-corpus:v1",
+  "title": "Content Reference Corpus",
+  "type": "object",
+  "required": [
+    "contract",
+    "corpus_id",
+    "platform",
+    "creator_handle",
+    "target_item_count",
+    "state",
+    "rights_state"
+  ],
+  "properties": {
+    "contract": {"const": "content_reference_corpus_v1"},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "platform": {"type": "string", "minLength": 1},
+    "creator_handle": {"type": "string", "minLength": 1},
+    "source_profile_url": {"type": "string", "format": "uri"},
+    "target_item_count": {"type": "integer", "minimum": 1, "maximum": 100},
+    "state": {
+      "enum": ["acquiring", "acquired", "partial", "complete"]
+    },
+    "rights_state": {"const": "public_reference_analysis_only"},
+    "source_clips_retained": {"const": false},
+    "direct_use_allowed": {"const": false}
+  },
+  "additionalProperties": true
+}
