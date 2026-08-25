@@ -324,6 +324,40 @@ def test_injected_ai_runner_returns_separately_named_verdict(tmp_path: Path):
     assert "do not make source-backed language unrelatable" in prompts[0]
     assert "Start non-alienating framing at 10" in prompts[0]
     assert "Second-person language such as you or your" in prompts[0]
+    assert verdict["judge_attempt_count"] == 2
+    assert verdict["judge_consensus"]["status"] == "pass_consensus"
+    assert verdict["judge_consensus"]["pass_votes"] == 2
+
+
+def test_split_ai_votes_require_a_third_valid_consensus_vote(tmp_path: Path):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    rejected = {
+        **AI_PASS,
+        "relatable": False,
+        "score": 60,
+        "rubric_scores": {
+            "concrete_lived_moment": 15,
+            "clear_personal_stakes": 10,
+            "visible_input_action_output": 10,
+            "source_language_support": 10,
+            "direct_audience_perspective": 5,
+            "non_alienating_framing": 10,
+        },
+        "alienating_language": [],
+        "rewrite_guidance": ["Make the lived moment more concrete."],
+    }
+    responses = iter((AI_PASS, rejected, AI_PASS))
+
+    result = AIRelatabilityAdjudicator(
+        store, lambda _prompt: json.dumps(next(responses))
+    ).audit(script_with_receipts(store))
+
+    verdict = result["qualitative_verdict"]
+    assert verdict["decision"] == "PASS"
+    assert verdict["judge_attempt_count"] == 3
+    assert verdict["judge_consensus"]["pass_votes"] == 2
+    assert verdict["judge_consensus"]["reject_votes"] == 1
+    assert verdict["judge_consensus"]["consensus_reached"] is True
 
 
 def test_ai_rejection_is_not_overridden_by_deterministic_pass(tmp_path: Path):
@@ -383,7 +417,8 @@ def test_rejection_normalizes_same_side_rubric_total_and_drops_unsupported_terms
     assert result["decision"] == "REJECT_NOT_RELATABLE"
     assert result["score"] == 50.0
     assert verdict["ai_evaluated"] is True
-    assert verdict["judge_attempt_count"] == 1
+    assert verdict["judge_attempt_count"] == 2
+    assert verdict["judge_consensus"]["status"] == "reject_consensus"
     assert judgment["source_language_used"] == ["feel"]
     assert judgment["semantic_normalizations"] == [
         {
@@ -423,7 +458,7 @@ def test_unexplained_non_alienating_deduction_retries_fail_closed(
 
     verdict = result["qualitative_verdict"]
     assert verdict["decision"] == "JUDGE_UNAVAILABLE"
-    assert verdict["judge_attempt_count"] == 3
+    assert verdict["judge_attempt_count"] == 5
     assert verdict["judge_unavailable_reason"] == "invalid_response_contract"
 
 
@@ -453,6 +488,8 @@ def test_non_alienating_default_normalizes_only_on_same_decision_side(
     verdict = result["qualitative_verdict"]
     assert verdict["decision"] == "REJECT_NOT_RELATABLE"
     assert verdict["score"] == 65.0
+    assert verdict["judge_attempt_count"] == 2
+    assert verdict["judge_consensus"]["status"] == "reject_consensus"
     assert verdict["judgment"]["rubric_scores"][
         "non_alienating_framing"
     ] == 10
@@ -491,8 +528,8 @@ def test_all_zero_model_responses_persist_content_free_failure_codes(
 
     verdict = result["qualitative_verdict"]
     assert verdict["decision"] == "JUDGE_UNAVAILABLE"
-    assert verdict["judge_attempt_count"] == 3
-    assert len(verdict["judge_attempts"]) == 3
+    assert verdict["judge_attempt_count"] == 5
+    assert len(verdict["judge_attempts"]) == 5
     assert all(
         "all_zero_empty_verdict" in attempt["failure_codes"]
         for attempt in verdict["judge_attempts"]
@@ -525,7 +562,7 @@ def test_score_normalization_never_crosses_the_pass_threshold(tmp_path: Path):
 
     assert result["decision"] == "JUDGE_UNAVAILABLE"
     assert result["qualitative_verdict"]["ai_evaluated"] is False
-    assert result["qualitative_verdict"]["judge_attempt_count"] == 3
+    assert result["qualitative_verdict"]["judge_attempt_count"] == 5
 
 
 def test_ai_pass_still_requires_at_least_one_supported_source_term(
@@ -543,7 +580,7 @@ def test_ai_pass_still_requires_at_least_one_supported_source_term(
 
     assert result["decision"] == "JUDGE_UNAVAILABLE"
     assert result["qualitative_verdict"]["ai_evaluated"] is False
-    assert result["qualitative_verdict"]["judge_attempt_count"] == 3
+    assert result["qualitative_verdict"]["judge_attempt_count"] == 5
 
 
 def test_configured_judge_failure_is_fail_closed_and_secret_safe(tmp_path: Path):
@@ -691,7 +728,7 @@ def test_gpt5_runner_uses_strict_supported_request_contract():
     assert body["store"] is False
     assert body["text"]["format"]["type"] == "json_schema"
     schema = body["text"]["format"]
-    assert schema["name"] == VERDICT_NAME
+    assert schema["name"] == "Verdict"
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
     assert "max_completion_tokens" not in body
