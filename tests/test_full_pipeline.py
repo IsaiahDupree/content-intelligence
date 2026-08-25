@@ -108,6 +108,33 @@ class TestFullPipeline:
         assert result["transcription"]["artifact_count"] == 0
         assert result["fully_vetted_transcript_ids"] == []
 
+    def test_platform_scope_applies_to_discovery_without_topic(
+        self, market_config, tmp_path
+    ):
+        config = replace(
+            market_config,
+            platforms=["youtube", "tiktok"],
+            platform_daily_targets={"youtube": 10, "tiktok": 10},
+            provider_daily_request_limits={"youtube": 20, "tiktok": 20},
+        )
+        store = MarketTapeStore(config)
+        collector = MarketTapeCollector(
+            config, store, source_builder=lambda *_: []
+        )
+
+        result = run_full_pipeline(
+            config=config,
+            store=store,
+            collector=collector,
+            discovery_mode="recheck",
+            transcript_platforms=("tiktok",),
+            transcript_storage_root=tmp_path / "transcript-bank",
+        )
+
+        assert result["state"] == "completed"
+        assert result["discovery"]["scope"]["platforms"] == ["tiktok"]
+        assert result["transcription"]["candidate_count"] == 0
+
     def test_real_candidate_triggers_real_download_and_records_honest_failure(
         self, market_config, tmp_path
     ):

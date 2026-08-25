@@ -101,18 +101,27 @@ def run_full_pipeline(
     if not requested_platforms:
         raise ValueError("transcript_platforms must include at least one platform")
 
-    discovery_config = resolved_config
-    if normalized_topic:
-        enabled_platforms = set(resolved_config.platforms)
-        discovery_config = replace(
-            resolved_config,
-            topics=[normalized_topic],
-            platforms=[
-                platform for platform in requested_platforms
-                if platform in enabled_platforms
-            ],
-            adaptive_topics_enabled=False,
+    enabled_platforms = set(resolved_config.platforms)
+    scoped_platforms = [
+        platform for platform in requested_platforms
+        if not enabled_platforms or platform in enabled_platforms
+    ]
+    if not scoped_platforms:
+        raise ValueError(
+            "none of transcript_platforms are enabled for discovery"
         )
+    discovery_config = resolved_config
+    if (
+        normalized_topic
+        or tuple(scoped_platforms) != tuple(resolved_config.platforms)
+    ):
+        replacements: dict[str, Any] = {"platforms": scoped_platforms}
+        if normalized_topic:
+            replacements.update({
+                "topics": [normalized_topic],
+                "adaptive_topics_enabled": False,
+            })
+        discovery_config = replace(resolved_config, **replacements)
 
     resolved_store = store or MarketTapeStore(discovery_config)
     if collector is None:

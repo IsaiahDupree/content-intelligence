@@ -14,6 +14,8 @@ Full architecture, commands, source states, APIs, safety controls, and current p
 
 The local transcript bank turns performance-qualified Market Tape observations into auditable evidence. It downloads source audio to the configured external storage volume, transcribes locally with OpenAI Whisper, saves timestamped transcript JSON, and binds the audio/transcript SHA-256 hashes to the exact append-only metric observation. TikTok provider identities are structurally normalized before URL construction, and legacy object-shaped or video-ID-mismatched URLs are rejected before any downloader runs. Cohorts fail closed below five videos, three creators, or 100,000 observed views; script relatability remains explicitly predictive until the published script has real audience outcomes.
 
+The aggregate transcript style-guide service turns those verified, cross-creator receipts into reusable cadence, hook, structure, phrasing, and direct-address targets. Script briefs freeze the selected guide, generation applies it, and a required post-generation audit checks both style fit and source-wording overlap before render readiness. Operating contract and examples: [docs/TIKTOK-TRANSCRIPT-STYLE-GUIDE-SERVICE.md](docs/TIKTOK-TRANSCRIPT-STYLE-GUIDE-SERVICE.md).
+
 The unified intelligence endpoint is bounded and live-scale: it uses indexed latest-row seeks instead of materialized prediction/observation cross-products, reuses one time-windowed keyword rowset, and reports component latency plus whether its candidate scan was exhaustive or truncated. Unvalidated model probabilities cannot influence candidate preselection.
 
 Install or update unattended operation:
