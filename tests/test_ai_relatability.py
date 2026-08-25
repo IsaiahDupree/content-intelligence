@@ -661,7 +661,19 @@ def test_insufficient_evidence_rejects_before_ai_call(tmp_path: Path):
 
 
 def test_gpt5_runner_uses_strict_supported_request_contract():
-    response = {"choices": [{"message": {"content": json.dumps(AI_PASS)}}]}
+    response = {
+        "id": "resp_rel_contract",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": json.dumps(AI_PASS),
+            }],
+        }],
+    }
     with openai_contract_server(status=200, payload=response) as base_url:
         with provider_environment(base_url):
             returned = openai_relatability_runner("judge this")
@@ -669,19 +681,20 @@ def test_gpt5_runner_uses_strict_supported_request_contract():
     assert json.loads(returned) == AI_PASS
     received = OpenAIContractHandler.received[0]
     body = received["body"]
-    assert received["path"] == "/v1/chat/completions"
+    assert received["path"] == "/v1/responses"
     assert received["authorization_present"] is True
     assert body["model"] == "gpt-5-nano"
-    assert body["max_completion_tokens"] == 1600
-    assert body["reasoning_effort"] == "minimal"
-    assert body["messages"][0]["role"] == "system"
-    assert "untrusted quoted data" in body["messages"][0]["content"]
-    assert body["response_format"]["type"] == "json_schema"
-    schema = body["response_format"]["json_schema"]
+    assert body["max_output_tokens"] == 2400
+    assert body["reasoning"] == {"effort": "minimal"}
+    assert body["input"][0]["role"] == "developer"
+    assert "untrusted quoted data" in body["input"][0]["content"]
+    assert body["store"] is False
+    assert body["text"]["format"]["type"] == "json_schema"
+    schema = body["text"]["format"]
     assert schema["name"] == VERDICT_NAME
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
-    assert "max_tokens" not in body
+    assert "max_completion_tokens" not in body
     assert "temperature" not in body
 
 
