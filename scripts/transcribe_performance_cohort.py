@@ -12,7 +12,10 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from services.content_quality.transcript_bank import transcribe_cohort  # noqa: E402
+from services.content_quality.transcript_bank import (  # noqa: E402
+    model_progress_to_stderr,
+    transcribe_cohort,
+)
 
 
 DEFAULT_TAPE = (
@@ -62,19 +65,22 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    result = transcribe_cohort(
-        tape_path=args.tape,
-        storage_root=args.storage_root,
-        topic=args.topic,
-        external_ids=args.video_id,
-        platforms=args.platform or ("youtube", "tiktok", "instagram", "facebook"),
-        limit=max(1, min(args.limit, 100)),
-        model_name=args.model,
-        minimum_topic_matches=max(1, args.minimum_topic_matches),
-        force=args.force,
-        cookies_from_browser=args.cookies_from_browser,
-        target_language=args.target_language,
-    )
+    with model_progress_to_stderr():
+        result = transcribe_cohort(
+            tape_path=args.tape,
+            storage_root=args.storage_root,
+            topic=args.topic,
+            external_ids=args.video_id,
+            platforms=args.platform or (
+                "youtube", "tiktok", "instagram", "facebook"
+            ),
+            limit=max(1, min(args.limit, 100)),
+            model_name=args.model,
+            minimum_topic_matches=max(1, args.minimum_topic_matches),
+            force=args.force,
+            cookies_from_browser=args.cookies_from_browser,
+            target_language=args.target_language,
+        )
     rendered = json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

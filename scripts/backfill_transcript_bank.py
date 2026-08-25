@@ -19,6 +19,7 @@ from services.content_quality.transcript_bank import (  # noqa: E402
     TranscriptBank,
     atomic_write_json,
     canonical_sha256,
+    model_progress_to_stderr,
     storage_mount_error,
 )
 
@@ -92,13 +93,16 @@ def main() -> int:
             }, indent=2, sort_keys=True))
             return 0
         bank = TranscriptBank(args.tape, args.storage_root)
-        result = bank.run_backfill(
-            limit=max(1, min(args.limit, 500)),
-            platforms=args.platform or ("youtube", "tiktok", "instagram", "facebook"),
-            model_name=args.model,
-            topic=args.topic,
-            cookies_from_browser=args.cookies_from_browser,
-        )
+        with model_progress_to_stderr():
+            result = bank.run_backfill(
+                limit=max(1, min(args.limit, 500)),
+                platforms=args.platform or (
+                    "youtube", "tiktok", "instagram", "facebook"
+                ),
+                model_name=args.model,
+                topic=args.topic,
+                cookies_from_browser=args.cookies_from_browser,
+            )
     finally:
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

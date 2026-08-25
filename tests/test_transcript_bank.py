@@ -14,6 +14,7 @@ import pytest
 from services.content_quality.transcript_bank import (
     TranscriptBank,
     canonical_sha256,
+    classify_acquisition_failure,
     file_sha256,
     file_sha256_bounded,
     transcribe_cohort,
@@ -854,6 +855,134 @@ def test_extractor_upgrade_restarts_unsupported_failure_cooldown(tmp_path):
     assert datetime.fromisoformat(receipt["retry_after"]) == (
         finished_at + timedelta(hours=24)
     )
+    assert bank.select_backfill_candidates(
+        limit=1,
+        platforms=["youtube"],
+    ) == []
+
+
+def test_broken_pipe_is_local_output_but_similar_provider_error_is_not():
+    assert classify_acquisition_failure(
+        "BrokenPipeError", "[Errno 32] Broken pipe"
+    ) == {
+        "failure_class": "local_output",
+        "retryable": True,
+        "retry_base_hours": 0,
+    }
+    assert classify_acquisition_failure(
+        "RuntimeError", "wrapped BrokenPipeError from a provider adapter"
+    ) == {
+        "failure_class": "provider_error",
+        "retryable": True,
+        "retry_base_hours": 24,
+    }
+    assert classify_acquisition_failure(
+        " BrokenPipeError ", "[Errno 32] Broken pipe"
+    ) == {
+        "failure_class": "provider_error",
+        "retryable": True,
+        "retry_base_hours": 24,
+    }
+
+
+def test_immutable_legacy_broken_pipe_attempt_retries_without_ledger_rewrite(
+    tmp_path,
+):
+    config, bank, candidate, observed_at = _single_video_bank(
+        tmp_path,
+        external_id="legacy-broken-pipe-retry",
+    )
+    retry_after = (observed_at + timedelta(hours=24)).isoformat()
+    with bank.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO mt_transcript_acquisition_attempts(
+                attempt_id, run_id, video_id, platform, external_id,
+                source_url, model_name, outcome, failure_class,
+                retryable, retry_after, error_type, error,
+                attempt_ordinal, receipt_source, runtime_fingerprint,
+                claim_id, attempt_contract, receipt_sha256,
+                started_at, finished_at
+            ) VALUES(?, ?, ?, ?, ?, ?, 'base', 'failure', 'provider_error',
+                     1, ?, 'BrokenPipeError', '[Errno 32] Broken pipe',
+                     1, 'post_release_cli', 'runtime-before-output-fix', '',
+                     'transcript_acquisition_attempt_v1', ?, ?, ?)
+            """,
+            (
+                "immutable-broken-pipe-attempt",
+                "post-release-cli-run",
+                candidate.video_id,
+                candidate.platform,
+                candidate.external_id,
+                candidate.source_url,
+                retry_after,
+                "immutable-receipt-sha256",
+                observed_at.isoformat(),
+                observed_at.isoformat(),
+            ),
+        )
+        before = dict(connection.execute(
+            """SELECT * FROM mt_transcript_acquisition_attempts
+               WHERE attempt_id='immutable-broken-pipe-attempt'"""
+        ).fetchone())
+
+    selected = bank.select_backfill_candidates(
+        limit=1,
+        platforms=["youtube"],
+    )
+    assert [item.external_id for item in selected] == [
+        "legacy-broken-pipe-retry"
+    ]
+    claim = bank.claim_candidate(
+        run_id="retry-after-output-fix",
+        candidate=selected[0],
+    )
+    assert claim["admitted"] is True
+    assert bank.attempt_ledger_status()["current_source_url_exclusions"] == {
+        "permanent": 0,
+        "cooldown_deferred": 0,
+    }
+    with bank.connect() as connection:
+        after = dict(connection.execute(
+            """SELECT * FROM mt_transcript_acquisition_attempts
+               WHERE attempt_id='immutable-broken-pipe-attempt'"""
+        ).fetchone())
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM mt_transcript_acquisition_attempts"
+        ).fetchone()[0]
+    assert after == before
+    assert attempt_count == 1
+    assert bank.release_claim(
+        run_id="retry-after-output-fix",
+        claim_id=claim["claim_id"],
+        reason="test_completed_without_data_work",
+    ) is True
+
+    with bank.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO mt_transcript_acquisition_attempts(
+                attempt_id, run_id, video_id, platform, external_id,
+                source_url, model_name, outcome, failure_class,
+                retryable, retry_after, error_type, error,
+                attempt_ordinal, receipt_source, runtime_fingerprint,
+                started_at, finished_at
+            ) VALUES(?, ?, ?, ?, ?, ?, 'base', 'failure', 'provider_error',
+                     1, ?, 'BrokenPipeError ', 'ordinary provider failure',
+                     2, 'integration', 'current-runtime', ?, ?)
+            """,
+            (
+                "ordinary-provider-cooldown",
+                "ordinary-provider-run",
+                candidate.video_id,
+                candidate.platform,
+                candidate.external_id,
+                candidate.source_url,
+                retry_after,
+                observed_at.isoformat(),
+                observed_at.isoformat(),
+            ),
+        )
     assert bank.select_backfill_candidates(
         limit=1,
         platforms=["youtube"],

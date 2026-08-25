@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from scripts.backfill_transcript_bank import exit_code_for_status, storage_mount_error
+from services.content_quality.transcript_bank import model_progress_to_stderr
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -60,3 +61,14 @@ def test_real_process_lock_emits_hashed_busy_receipt_without_opening_tape(tmp_pa
     assert receipt["contract"] == "transcript_backfill_singleton_busy_v1"
     assert receipt["status"] == "busy_existing_worker"
     assert len(receipt["receipt_sha256"]) == 64
+
+
+def test_model_progress_is_routed_away_from_machine_json_stdout(capsys):
+    with model_progress_to_stderr():
+        print("model progress: 75%")
+    print(json.dumps({"status": "completed"}))
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"status": "completed"}
+    assert "model progress: 75%" in captured.err
+    assert "model progress" not in captured.out

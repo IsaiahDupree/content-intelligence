@@ -18,7 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager, redirect_stdout
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -334,6 +334,7 @@ FAILURE_RETRY_BASE_HOURS = {
     "network": 6,
     "access_challenge": 72,
     "local_runtime": 1,
+    "local_output": 0,
     "provider_error": 24,
 }
 MAX_FAILURE_RETRY_HOURS = 24 * 7
@@ -357,6 +358,16 @@ def classify_acquisition_failure(error_type: str, error: str) -> dict[str, Any]:
     from consuming every hourly batch.
     """
 
+    # A closed machine-output pipe is a local CLI boundary failure, not
+    # evidence that the source provider failed. Keep this exact so unrelated
+    # runtime errors containing similar prose retain their existing cooldown.
+    if error_type == "BrokenPipeError":
+        return {
+            "failure_class": "local_output",
+            "retryable": True,
+            "retry_base_hours": FAILURE_RETRY_BASE_HOURS["local_output"],
+        }
+
     normalized = f"{error_type} {error}".casefold()
     for failure_class, patterns in PERMANENT_FAILURE_PATTERNS.items():
         if any(pattern in normalized for pattern in patterns):
@@ -377,6 +388,14 @@ def classify_acquisition_failure(error_type: str, error: str) -> dict[str, Any]:
         "retryable": True,
         "retry_base_hours": FAILURE_RETRY_BASE_HOURS["provider_error"],
     }
+
+
+@contextmanager
+def model_progress_to_stderr():
+    """Keep model progress off stdout reserved for one JSON document."""
+
+    with redirect_stdout(sys.stderr):
+        yield
 
 
 def retry_after_timestamp(
@@ -1095,6 +1114,10 @@ class TranscriptBank:
                     AND attempt.source_url=e.url
                     AND attempt.outcome='failure'
                     AND (
+                        attempt.error_type IS NULL
+                        OR attempt.error_type != 'BrokenPipeError'
+                    )
+                    AND (
                         attempt.retryable=0
                         OR (attempt.retry_after IS NOT NULL AND attempt.retry_after > ?)
                     )
@@ -1292,6 +1315,7 @@ class TranscriptBank:
                     """
                     SELECT 1 FROM mt_transcript_acquisition_attempts
                     WHERE video_id=? AND source_url=? AND outcome='failure'
+                      AND (error_type IS NULL OR error_type != 'BrokenPipeError')
                       AND (retryable=0 OR (retry_after IS NOT NULL AND retry_after > ?))
                       AND (
                           failure_class != 'extractor_unsupported'
@@ -1561,6 +1585,10 @@ class TranscriptBank:
                       WHERE attempt.video_id=v.video_id
                         AND attempt.source_url=evidence.url
                         AND attempt.outcome='failure'
+                        AND (
+                            attempt.error_type IS NULL
+                            OR attempt.error_type != 'BrokenPipeError'
+                        )
                         AND attempt.retryable=0
                   )
                 """
@@ -1585,6 +1613,10 @@ class TranscriptBank:
                       WHERE attempt.video_id=v.video_id
                         AND attempt.source_url=evidence.url
                         AND attempt.outcome='failure'
+                        AND (
+                            attempt.error_type IS NULL
+                            OR attempt.error_type != 'BrokenPipeError'
+                        )
                         AND attempt.retryable=1
                         AND attempt.retry_after > ?
                         AND (

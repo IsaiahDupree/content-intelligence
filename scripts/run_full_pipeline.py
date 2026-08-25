@@ -19,6 +19,9 @@ from services.market_tape.full_pipeline import (  # noqa: E402
     DEFAULT_TRANSCRIPT_STORAGE_ROOT,
     run_full_pipeline,
 )
+from services.content_quality.transcript_bank import (  # noqa: E402
+    model_progress_to_stderr,
+)
 
 
 def main() -> int:
@@ -37,15 +40,18 @@ def main() -> int:
     parser.add_argument("--storage-root", type=Path, default=DEFAULT_TRANSCRIPT_STORAGE_ROOT)
     args = parser.parse_args()
 
-    result = run_full_pipeline(
-        discovery_mode=args.discovery_mode,
-        transcript_limit=max(1, min(args.limit, 500)),
-        transcript_platforms=args.platform or ("youtube", "tiktok", "instagram", "facebook"),
-        transcript_model=args.model,
-        topic=args.topic,
-        transcript_storage_root=args.storage_root,
-        cookies_from_browser=args.cookies_from_browser,
-    )
+    with model_progress_to_stderr():
+        result = run_full_pipeline(
+            discovery_mode=args.discovery_mode,
+            transcript_limit=max(1, min(args.limit, 500)),
+            transcript_platforms=args.platform or (
+                "youtube", "tiktok", "instagram", "facebook"
+            ),
+            transcript_model=args.model,
+            topic=args.topic,
+            transcript_storage_root=args.storage_root,
+            cookies_from_browser=args.cookies_from_browser,
+        )
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 0 if result["state"] == "completed" else (1 if result["state"] == "failed" else 2)
 
