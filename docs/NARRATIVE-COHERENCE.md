@@ -239,7 +239,7 @@ self-paired; the service does not splice together unrelated creator stories.
 ### Separate AI relatability verdict
 
 The separately named AI decision uses
-`human_relatability_qualitative_verdict_v3`. It runs only after the deterministic
+`human_relatability_qualitative_verdict_v4`. It runs only after the deterministic
 relatability evidence checks pass and remains a prediction: views demonstrate
 exposure, not measured relatability, retention, or conversion. The structured
 100-point rubric is:
@@ -253,14 +253,14 @@ exposure, not measured relatability, retention, or conversion. The structured
 | Direct audience perspective | 10 |
 | Non-alienating framing | 10 |
 
-The six rubric values must be integers within their maxima and must sum exactly
-to the top-level score. `relatable` must equal `score >= 70`; a passing verdict
-must name at least one supported source term and give a non-empty human reason.
-The provider gets one initial attempt and, only when its response fails the
-semantic verdict contract, one bounded retry in the same audit. A provider
-error, or a second invalid response, yields `JUDGE_UNAVAILABLE`; it is never
-converted into an AI pass. Scores are capped at 90 until post-publication
-outcomes exist.
+The provider returns only the six bounded rubric values and its explanations.
+The service sums those values and derives `relatable = score >= 70` locally, so
+the model cannot return a contradictory top-level score or boolean. A passing
+vote must name at least one supported source term and give a non-empty human
+reason. The service requires two matching valid votes and stops after at most
+five attempts. Provider errors, invalid responses, or a split result without
+two matching votes yield `JUDGE_UNAVAILABLE`; they are never converted into an
+AI pass. Scores are capped at 90 until post-publication outcomes exist.
 
 ### Immutable transcript payload verification
 
