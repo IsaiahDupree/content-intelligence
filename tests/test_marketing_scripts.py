@@ -18,6 +18,9 @@ from services.content_quality.reference_corpus import (
     canonical_sha256,
     normalize_reel,
 )
+from services.content_quality.copy_policy import (
+    build_independent_verification_receipt,
+)
 
 
 CORPUS_ID = "test-founder-marketing-reference-v1"
@@ -210,6 +213,58 @@ def test_source_backed_proof_requires_a_receipt(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="requires at least one source_receipt_id"):
         MarketingScriptCompiler(store).compile(payload)
+
+
+def test_source_backed_proof_requires_byte_bound_verification(
+    tmp_path: Path,
+) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["narrative"]["proof"].update({
+        "evidence_type": "sourced_fact",
+        "source_receipt_ids": ["paper-doi-1"],
+    })
+
+    with pytest.raises(
+        ValueError,
+        match="requires at least one byte-bound independent_verification_receipt",
+    ):
+        MarketingScriptCompiler(store).compile(payload)
+
+
+def test_source_backed_proof_uses_fact_provenance_receipt(
+    tmp_path: Path,
+) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    claim = (
+        "A measured source reports that you can see a clear result change "
+        "after the test"
+    )
+    verification = build_independent_verification_receipt(
+        receipt_id="paper-doi-verified-1",
+        claim=claim,
+        source_url="https://doi.org/10.0000/example",
+        source_kind="peer_reviewed_source",
+        source_sha256=hashlib.sha256(b"captured paper bytes").hexdigest(),
+        verified_at="2026-08-26T04:00:00Z",
+    )
+    payload["narrative"]["proof"] = {
+        "statement": claim,
+        "evidence_type": "sourced_fact",
+        "source_receipt_ids": [verification["receipt_id"]],
+        "independent_verification_receipts": [verification],
+    }
+
+    package = MarketingScriptCompiler(store).compile(payload)
+
+    assert package["status"] == "approved"
+    gate = package["corpus_audit"]["copy_gate"]["provenance_gate"]
+    assert gate["passed"] is True
+    assert gate["source_material_usage"] == "facts_or_general_ideas_only"
+    assert gate["independent_verification_receipt_ids"] == [
+        verification["receipt_id"]
+    ]
 
 
 def test_experience_proof_rejects_an_unresolved_receipt(tmp_path: Path) -> None:

@@ -118,6 +118,17 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
         for value in (raw_proof.get("source_receipt_ids") or [])
         if str(value).strip()
     })
+    independent_verification_receipts = raw_proof.get(
+        "independent_verification_receipts"
+    ) or []
+    if not isinstance(independent_verification_receipts, list) or any(
+        not isinstance(value, dict)
+        for value in independent_verification_receipts
+    ):
+        raise ValueError(
+            "narrative.proof.independent_verification_receipts must be a list "
+            "of objects"
+        )
     proof_statement = _text(
         raw_proof.get("statement"),
         "narrative.proof.statement",
@@ -133,6 +144,14 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
     if proof_type in SOURCE_REQUIRED_PROOF_TYPES and not source_receipt_ids:
         raise ValueError(
             f"{proof_type} proof requires at least one source_receipt_id"
+        )
+    if (
+        proof_type in SOURCE_REQUIRED_PROOF_TYPES
+        and not independent_verification_receipts
+    ):
+        raise ValueError(
+            f"{proof_type} proof requires at least one byte-bound "
+            "independent_verification_receipt"
         )
     if owned_binding_required and not source_receipt_ids:
         raise ValueError(
@@ -182,6 +201,9 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
                 "statement": proof_statement,
                 "evidence_type": proof_type,
                 "source_receipt_ids": source_receipt_ids,
+                "independent_verification_receipts": (
+                    independent_verification_receipts
+                ),
             },
             "takeaway": _text(
                 narrative.get("takeaway"), "narrative.takeaway", maximum=700
@@ -499,7 +521,15 @@ class MarketingScriptCompiler:
                     reference_item_ids=(
                         row["item_id"] for row in context["evidence"]
                     ),
-                    source_material_usage="abstract_patterns_only",
+                    source_material_usage=(
+                        "facts_or_general_ideas_only"
+                        if proof_request["evidence_type"]
+                        in SOURCE_REQUIRED_PROOF_TYPES
+                        else "abstract_patterns_only"
+                    ),
+                    independent_verification_receipts=(
+                        proof_request["independent_verification_receipts"]
+                    ),
                 ),
             )
             approved = (
