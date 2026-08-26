@@ -139,6 +139,8 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
     assert context["evidence"][0]["item_id"] == found[0]["item_id"]
     assert len(context["result_sha256"]) == 64
     assert audit["copy_gate"]["passed"] is False
+    assert audit["copy_gate"]["longest_exact_word_run"] >= 13
+    assert audit["copy_gate"]["longest_exact_word_run_item_id"] == found[0]["item_id"]
     assert audit["rights"]["direct_use_allowed"] is False
     assert store.corpus_status(CORPUS_ID)["counts"]["audits"] == 1
     assert (tmp_path / "derived" / CORPUS_ID / "corpus-summary.json").is_file()

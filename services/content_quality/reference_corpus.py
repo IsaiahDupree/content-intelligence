@@ -2231,6 +2231,25 @@ class ReferenceCorpusService:
         }
         return len(left_parts & right_parts) / max(1, len(left_parts))
 
+    @staticmethod
+    def _longest_exact_word_run(left: str, right: str) -> int:
+        """Return the longest contiguous token run shared by both texts."""
+
+        left_words = words(left)
+        right_words = words(right)
+        if not left_words or not right_words:
+            return 0
+        previous = [0] * (len(right_words) + 1)
+        longest = 0
+        for left_word in left_words:
+            current = [0] * (len(right_words) + 1)
+            for index, right_word in enumerate(right_words, start=1):
+                if left_word == right_word:
+                    current[index] = previous[index - 1] + 1
+                    longest = max(longest, current[index])
+            previous = current
+        return longest
+
     def audit_content(
         self,
         *,
@@ -2287,6 +2306,8 @@ class ReferenceCorpusService:
         pace_score = round(100.0 * pace_fit, 3)
         max_overlap = 0.0
         overlap_item = ""
+        longest_exact_run = 0
+        exact_run_item = ""
         for row in rows:
             source_text = " ".join((
                 str(row.get("caption") or ""),
@@ -2296,6 +2317,10 @@ class ReferenceCorpusService:
             if value > max_overlap:
                 max_overlap = value
                 overlap_item = str(row.get("item_id") or "")
+            exact_run = self._longest_exact_word_run(script, source_text)
+            if exact_run > longest_exact_run:
+                longest_exact_run = exact_run
+                exact_run_item = str(row.get("item_id") or "")
         copy_score = round(100.0 * (1.0 - min(1.0, max_overlap)), 3)
         query = " ".join((title, objective, target_viewer, script[:800])).strip()
         refs = self.find_items(corpus_id=corpus_id, query=query, limit=6)
@@ -2384,6 +2409,8 @@ class ReferenceCorpusService:
                 "passed": max_overlap < 0.20,
                 "maximum_five_word_overlap": round(max_overlap, 6),
                 "nearest_item_id": overlap_item,
+                "longest_exact_word_run": longest_exact_run,
+                "longest_exact_word_run_item_id": exact_run_item,
             },
             "evidence": refs,
             "notes": notes,
