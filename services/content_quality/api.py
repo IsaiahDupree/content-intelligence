@@ -534,6 +534,11 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 objective=str(payload.get("objective") or ""),
                 target_viewer=str(payload.get("target_viewer") or ""),
                 target_seconds=int(payload.get("target_seconds") or 60),
+                provenance=(
+                    payload.get("provenance")
+                    if isinstance(payload.get("provenance"), dict)
+                    else None
+                ),
             )
         except ValueError as error:
             return reference_invalid_request(
@@ -783,10 +788,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                 "audit_transcript_style": {
                     "method": "POST",
                     "path": "/api/transcript-style-guides/audit",
-                    "required": ["style_guide_id", "text"],
+                    "required": ["style_guide_id", "text", "provenance"],
                     "effect": (
-                        "measures aggregate style fit and rejects excessive "
-                        "five-word source overlap"
+                        "measures aggregate style fit and rejects substantive "
+                        "source expression, sequence, structure, or invalid provenance"
                     ),
                 },
                 "build_script_brief": {

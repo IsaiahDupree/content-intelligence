@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .copy_policy import build_script_only_provenance
 from .reference_corpus import (
     SOURCE_RIGHTS_STATE,
     ReferenceCorpusService,
@@ -493,6 +494,13 @@ class MarketingScriptCompiler:
                 objective=request["objective"],
                 target_viewer=request["audience"],
                 target_seconds=request["target_seconds"],
+                provenance=build_script_only_provenance(
+                    transcript,
+                    reference_item_ids=(
+                        row["item_id"] for row in context["evidence"]
+                    ),
+                    source_material_usage="abstract_patterns_only",
+                ),
             )
             approved = (
                 quality["status"] == "pass"

@@ -15,6 +15,7 @@ import httpx
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .copy_policy import audit_substantive_copy, build_script_only_provenance
 from .script_quality import (
     audit_owner_calibrated_quality,
     repair_owner_quality_text,
@@ -28,7 +29,6 @@ DEFAULT_CORPUS_ID = "instagram-personalbrandlaunch-reference-v1"
 DEFAULT_MODEL = "gpt-5.6"
 TARGET_SECONDS = 60
 WORD_RANGE = (125, 155)
-PEER_EXACT_WORD_RUN_LIMIT = 20
 
 ReusePolicy = Literal[
     "permissive_clean_room",
@@ -317,10 +317,8 @@ def longest_exact_word_run(left: str, right: str) -> tuple[int, str]:
 def peer_overlap_receipt(
     text: str,
     prior_scripts: list[tuple[str, str]],
-    *,
-    exact_word_run_limit: int = PEER_EXACT_WORD_RUN_LIMIT,
 ) -> dict[str, Any]:
-    """Measure candidate-to-candidate reuse separately from source-copy checks."""
+    """Audit peer reuse without a fixed matching-word cutoff."""
 
     longest = 0
     nearest_script_id = ""
@@ -331,12 +329,22 @@ def peer_overlap_receipt(
             longest = run_length
             nearest_script_id = script_id
             shared_phrase = phrase
+    comparison_sources = [
+        dict(source_id=identifier, text=value)
+        for identifier, value in prior_scripts
+    ]
+    copy_gate = audit_substantive_copy(
+        text,
+        comparison_sources,
+        provenance=build_script_only_provenance(text),
+    )
     return {
-        "passed": longest < exact_word_run_limit,
-        "exact_word_run_limit": exact_word_run_limit,
+        "passed": copy_gate["passed"],
+        "fixed_matching_word_limit_applied": False,
         "longest_exact_word_run": longest,
         "nearest_script_id": nearest_script_id,
         "shared_phrase": shared_phrase,
+        "copy_gate": copy_gate,
     }
 
 
@@ -585,6 +593,10 @@ class ContentQualityClient:
                 "objective": objective,
                 "target_viewer": target_viewer,
                 "target_seconds": target_seconds,
+                "provenance": build_script_only_provenance(
+                    script,
+                    source_material_usage="abstract_patterns_only",
+                ),
             },
         )
 
@@ -692,8 +704,6 @@ def quality_findings(
 
 def annotate_peer_overlaps(
     results: list[dict[str, Any]],
-    *,
-    exact_word_run_limit: int = PEER_EXACT_WORD_RUN_LIMIT,
 ) -> dict[str, Any]:
     """Attach deterministic cross-benchmark overlap receipts in run order."""
 
@@ -705,18 +715,14 @@ def annotate_peer_overlaps(
         for record in result["transcripts"]:
             script_id = f"{profile_id}/{record['brief_id']}"
             transcript = str(record["transcript"]["transcript"])
-            receipt = peer_overlap_receipt(
-                transcript,
-                prior_scripts,
-                exact_word_run_limit=exact_word_run_limit,
-            )
+            receipt = peer_overlap_receipt(transcript, prior_scripts)
             record["peer_overlap"] = receipt
             maximum = max(maximum, int(receipt["longest_exact_word_run"]))
             if not receipt["passed"]:
                 failures += 1
             prior_scripts.append((script_id, transcript))
     return {
-        "exact_word_run_limit": exact_word_run_limit,
+        "fixed_matching_word_limit_applied": False,
         "maximum_exact_word_run": maximum,
         "failure_count": failures,
         "passed": failures == 0,
@@ -734,7 +740,6 @@ def repair_peer_overlap_record(
     corpus_id: str,
     model: str,
     max_repairs: int,
-    exact_word_run_limit: int = PEER_EXACT_WORD_RUN_LIMIT,
 ) -> dict[str, Any]:
     """Rewrite one candidate until it clears source, owner, and peer gates."""
 
@@ -766,17 +771,12 @@ def repair_peer_overlap_record(
             final_audit,
             prior_texts=prior_texts,
         )
-        peer = peer_overlap_receipt(
-            item.transcript,
-            prior_scripts,
-            exact_word_run_limit=exact_word_run_limit,
-        )
+        peer = peer_overlap_receipt(item.transcript, prior_scripts)
         if not peer["passed"]:
             findings.extend([
                 (
-                    "Rewrite the shared passage so this script has no exact "
-                    f"contiguous run of {exact_word_run_limit} or more words "
-                    "from another benchmark script."
+                    "Rewrite the source-like expression, ordered passage, or "
+                    "source-specific structure identified by the substantive-copy gate."
                 ),
                 f"Shared passage to replace: {peer['shared_phrase']}",
             ])
@@ -829,7 +829,11 @@ def repair_peer_overlap_record(
         candidates,
         key=lambda value: (
             not bool(value[3]),
-            -int(value[4]["longest_exact_word_run"]),
+            bool(value[4]["passed"]),
+            -float(
+                value[4]["copy_gate"]["substantive_copy"]
+                ["maximum_expression_similarity"]
+            ),
             value[2].get("decision") == "PASS",
             float(value[1].get("overall_score") or 0.0),
         ),
@@ -854,7 +858,6 @@ def repair_peer_overlap_record(
                 "source_commit": profile.source_commit,
                 "audit_id": final_audit.get("audit_id"),
                 "peer_overlap_repair": True,
-                "peer_exact_word_run_limit": exact_word_run_limit,
                 "outcomes_measured": False,
             },
         )
@@ -885,9 +888,8 @@ def enforce_peer_diversity(
     corpus_id: str,
     model: str,
     max_repairs: int = 3,
-    exact_word_run_limit: int = PEER_EXACT_WORD_RUN_LIMIT,
 ) -> dict[str, Any]:
-    """Apply the separate 20-word candidate-to-candidate diversity gate."""
+    """Apply the substantive candidate-to-candidate diversity gate."""
 
     briefs = {item.brief_id: item for item in benchmark_briefs()}
     prior_scripts: list[tuple[str, str]] = []
@@ -902,11 +904,7 @@ def enforce_peer_diversity(
             removed = normalize_factual_claims(item, brief)
             normalized_claim_count += len(removed)
             record = {**record, "transcript": item.model_dump(mode="json")}
-            peer = peer_overlap_receipt(
-                item.transcript,
-                prior_scripts,
-                exact_word_run_limit=exact_word_run_limit,
-            )
+            peer = peer_overlap_receipt(item.transcript, prior_scripts)
             record["peer_overlap"] = peer
             if bool(record.get("accepted")) and not peer["passed"]:
                 record = repair_peer_overlap_record(
@@ -919,7 +917,6 @@ def enforce_peer_diversity(
                     corpus_id=corpus_id,
                     model=model,
                     max_repairs=max_repairs,
-                    exact_word_run_limit=exact_word_run_limit,
                 )
                 if record["accepted"]:
                     repaired_count += 1
@@ -944,10 +941,7 @@ def enforce_peer_diversity(
             ),
             "outcomes_measured": False,
         }
-    peer_summary = annotate_peer_overlaps(
-        results,
-        exact_word_run_limit=exact_word_run_limit,
-    )
+    peer_summary = annotate_peer_overlaps(results)
     return {
         **peer_summary,
         "repaired_count": repaired_count,
@@ -1204,8 +1198,8 @@ def render_markdown_report(run: dict[str, Any]) -> str:
                 (
                     "Receipt: brief `{brief}`; accepted `{accepted}`; words "
                     "`{words}`; quality `{score}`; source copy gate `{copy}`; "
-                    "source longest exact run `{exact_run}` words; peer gate "
-                    "`{peer_passed}`; peer longest exact run `{peer_run}` words; "
+                    "source findings `{source_findings}`; peer gate "
+                    "`{peer_passed}`; peer findings `{peer_findings}`; "
                     "owner check `{owner}`; audit `{audit_id}`."
                 ).format(
                     brief=record["brief_id"],
@@ -1213,9 +1207,15 @@ def render_markdown_report(run: dict[str, Any]) -> str:
                     words=transcript["word_count"],
                     score=audit.get("overall_score"),
                     copy=copy_gate.get("passed"),
-                    exact_run=copy_gate.get("longest_exact_word_run"),
+                    source_findings=", ".join(
+                        copy_gate.get("failure_codes") or []
+                    ) or "none",
                     peer_passed=peer_overlap.get("passed"),
-                    peer_run=peer_overlap.get("longest_exact_word_run"),
+                    peer_findings=", ".join(
+                        (peer_overlap.get("copy_gate") or {}).get(
+                            "failure_codes"
+                        ) or []
+                    ) or "none",
                     owner=owner.get("decision"),
                     audit_id=audit.get("audit_id"),
                 ),
@@ -1226,7 +1226,7 @@ def render_markdown_report(run: dict[str, Any]) -> str:
         "",
         "- The scripts used one shared model and three shared briefs so the method profile was the changed input.",
         "- Native install state is reported separately from profile-adapted writing quality.",
-        "- The source-copy gate uses five-word shingles; the separate peer gate rejects exact candidate-to-candidate runs of 20 words or more.",
+        "- Source and peer copy gates reject substantive expression, ordered passage, and source-specific structure; no fixed matching-word limit decides either gate.",
         "- No audience outcome has been observed for these scripts.",
         "- Any performance claim in an upstream project remains an upstream claim unless separately verified.",
         "- Publishing, source-asset reuse, identity imitation, and voice imitation were outside this run.",

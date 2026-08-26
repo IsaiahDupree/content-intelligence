@@ -39,15 +39,120 @@
     },
     "copy_gate": {
       "type": "object",
-      "required": ["passed", "maximum_five_word_overlap"],
+      "required": [
+        "contract",
+        "passed",
+        "policy",
+        "failure_codes",
+        "substantive_copy",
+        "provenance_gate"
+      ],
       "properties": {
+        "contract": {"const": "substantive_copy_provenance_gate_v1"},
         "passed": {"type": "boolean"},
-        "maximum_five_word_overlap": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
+        "policy": {
+          "type": "object",
+          "required": [
+            "fixed_matching_word_limit_applied",
+            "copied_expression_allowed",
+            "copied_sequence_allowed",
+            "copied_structure_allowed",
+            "facts_or_general_ideas_require_independent_verification",
+            "creator_identity_likeness_voice_or_source_clips_allowed"
+          ],
+          "properties": {
+            "fixed_matching_word_limit_applied": {"const": false},
+            "copied_expression_allowed": {"const": false},
+            "copied_sequence_allowed": {"const": false},
+            "copied_structure_allowed": {"const": false},
+            "facts_or_general_ideas_require_independent_verification": {
+              "const": true
+            },
+            "creator_identity_likeness_voice_or_source_clips_allowed": {
+              "const": false
+            }
+          },
+          "additionalProperties": false
         },
-        "nearest_item_id": {"type": "string"}
+        "failure_codes": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "substantive_copy": {
+          "type": "object",
+          "required": [
+            "copied_expression",
+            "copied_sequence",
+            "copied_structure",
+            "creator_identity_references",
+            "maximum_expression_similarity",
+            "source_findings"
+          ],
+          "properties": {
+            "copied_expression": {"type": "boolean"},
+            "copied_sequence": {"type": "boolean"},
+            "copied_structure": {"type": "boolean"},
+            "creator_identity_references": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["source_id", "identifier"],
+                "properties": {
+                  "source_id": {"type": "string"},
+                  "identifier": {"type": "string", "minLength": 1}
+                },
+                "additionalProperties": false
+              }
+            },
+            "maximum_expression_similarity": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "source_findings": {"type": "array", "items": {"type": "object"}}
+          },
+          "additionalProperties": false
+        },
+        "provenance_gate": {
+          "type": "object",
+          "required": [
+            "passed",
+            "failure_codes",
+            "candidate_sha256",
+            "provenance_sha256",
+            "source_material_usage",
+            "independent_verification_receipt_ids"
+          ],
+          "properties": {
+            "passed": {"type": "boolean"},
+            "failure_codes": {
+              "type": "array",
+              "items": {"type": "string"}
+            },
+            "candidate_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "provenance_sha256": {
+              "type": ["string", "null"],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "source_material_usage": {
+              "type": ["string", "null"],
+              "enum": [
+                null,
+                "none",
+                "abstract_patterns_only",
+                "facts_or_general_ideas_only"
+              ]
+            },
+            "independent_verification_receipt_ids": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },
@@ -70,12 +175,18 @@
       "required": [
         "state",
         "direct_use_allowed",
-        "identity_imitation_allowed"
+        "identity_imitation_allowed",
+        "likeness_imitation_allowed",
+        "voice_imitation_allowed",
+        "source_clip_use_allowed"
       ],
       "properties": {
         "state": {"const": "public_reference_analysis_only"},
         "direct_use_allowed": {"const": false},
-        "identity_imitation_allowed": {"const": false}
+        "identity_imitation_allowed": {"const": false},
+        "likeness_imitation_allowed": {"const": false},
+        "voice_imitation_allowed": {"const": false},
+        "source_clip_use_allowed": {"const": false}
       },
       "additionalProperties": false
     },

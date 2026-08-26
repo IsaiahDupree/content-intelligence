@@ -103,7 +103,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [corpus_id, script]
+              required: [corpus_id, script, provenance]
               properties:
                 corpus_id: {type: string}
                 title: {type: string}
@@ -111,6 +111,88 @@ paths:
                 objective: {type: string}
                 target_viewer: {type: string}
                 target_seconds: {type: integer, minimum: 5, maximum: 3600}
+                provenance:
+                  type: object
+                  required:
+                    - contract
+                    - candidate_sha256
+                    - source_material_usage
+                    - creator_identity_used
+                    - creator_likeness_used
+                    - creator_voice_used
+                    - source_clips_used
+                    - reference_item_ids
+                    - creator_identity_input_ids
+                    - creator_likeness_input_ids
+                    - creator_voice_input_ids
+                    - source_clip_ids
+                    - independent_verification_receipts
+                    - provenance_sha256
+                  properties:
+                    contract: {const: content_copy_provenance_v1}
+                    candidate_sha256:
+                      {type: string, pattern: '^[0-9a-f]{64}$'}
+                    source_material_usage:
+                      enum:
+                        - none
+                        - abstract_patterns_only
+                        - facts_or_general_ideas_only
+                    creator_identity_used: {const: false}
+                    creator_likeness_used: {const: false}
+                    creator_voice_used: {const: false}
+                    source_clips_used: {const: false}
+                    reference_item_ids:
+                      type: array
+                      uniqueItems: true
+                      items: {type: string, minLength: 1}
+                    creator_identity_input_ids:
+                      type: array
+                      maxItems: 0
+                    creator_likeness_input_ids:
+                      type: array
+                      maxItems: 0
+                    creator_voice_input_ids:
+                      type: array
+                      maxItems: 0
+                    source_clip_ids:
+                      type: array
+                      maxItems: 0
+                    independent_verification_receipts:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - contract
+                          - receipt_id
+                          - claim
+                          - claim_sha256
+                          - source_url
+                          - source_kind
+                          - source_sha256
+                          - verified_at
+                          - receipt_sha256
+                        properties:
+                          contract: {const: independent_claim_verification_v1}
+                          receipt_id: {type: string, minLength: 1}
+                          claim: {type: string, minLength: 1}
+                          claim_sha256:
+                            {type: string, pattern: '^[0-9a-f]{64}$'}
+                          source_url: {type: string, format: uri}
+                          source_kind:
+                            enum:
+                              - official_source
+                              - owner_first_party_measurement
+                              - peer_reviewed_source
+                              - primary_source
+                          source_sha256:
+                            {type: string, pattern: '^[0-9a-f]{64}$'}
+                          verified_at: {type: string, format: date-time}
+                          receipt_sha256:
+                            {type: string, pattern: '^[0-9a-f]{64}$'}
+                        additionalProperties: false
+                    provenance_sha256:
+                      {type: string, pattern: '^[0-9a-f]{64}$'}
+                  additionalProperties: false
       responses:
         "200":
           description: Durable scorecard with source links and copy gate.

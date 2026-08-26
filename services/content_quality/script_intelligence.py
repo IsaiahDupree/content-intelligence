@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .ai_relatability import NON_AI_PASS_DECISION
+from .copy_policy import build_script_only_provenance
 from .script_quality import MAX_QUALITY_REWRITE_ATTEMPTS
 from .contracts import (
     ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT,
@@ -1415,6 +1416,11 @@ class ScriptIntelligenceService:
             "style_guide_id": generated["style_guide_id"],
             "style_guide_receipt_id": generated["style_guide_receipt_id"],
             "target_duration_seconds": generated["timeline"][-1]["end"],
+            "provenance": build_script_only_provenance(
+                generated["text"],
+                reference_item_ids=brief.get("receipt_ids") or [],
+                source_material_usage="abstract_patterns_only",
+            ),
         })
         attention = self.attention.script_audit(generated)
         preflight = self.attention.video_preflight(generated)

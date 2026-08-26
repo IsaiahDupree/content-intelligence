@@ -195,7 +195,7 @@ def test_report_states_score_limit() -> None:
     assert "Fix the recurring delay" in rendered
 
 
-def test_peer_overlap_uses_separate_twenty_word_gate() -> None:
+def test_peer_overlap_uses_substantive_copy_not_a_word_limit() -> None:
     shared = " ".join(f"word{index}" for index in range(20))
     left = f"alpha begins {shared} left ending"
     right = f"beta starts {shared} right ending"
@@ -204,7 +204,8 @@ def test_peer_overlap_uses_separate_twenty_word_gate() -> None:
     assert run_length == 20
     assert phrase == shared
     assert receipt["passed"] is False
-    assert receipt["exact_word_run_limit"] == 20
+    assert receipt["fixed_matching_word_limit_applied"] is False
+    assert "COPIED_EXPRESSION" in receipt["copy_gate"]["failure_codes"]
     assert receipt["nearest_script_id"] == "prior/script"
 
 
@@ -227,6 +228,7 @@ def test_peer_annotation_is_deterministic_in_run_order() -> None:
     summary = annotate_peer_overlaps(results)
     assert summary["failure_count"] == 1
     assert summary["maximum_exact_word_run"] == 20
+    assert summary["fixed_matching_word_limit_applied"] is False
     assert results[1]["transcripts"][0]["peer_overlap"]["passed"] is False
 
 

@@ -13,6 +13,7 @@ from contextlib import closing
 from typing import Any, Sequence
 
 from .contracts import is_supported_transcript_audit_contract
+from .copy_policy import audit_substantive_copy
 
 
 STYLE_GUIDE_CONTRACT = "aggregate_transcript_style_guide_v1"
@@ -157,18 +158,6 @@ def _text_metrics(text: str, duration_seconds: float | None = None) -> dict[str,
         "duration_seconds": round(float(duration_seconds), 4) if duration_seconds else None,
         "marker_counts": dict(marker_counts),
     }
-
-
-def _five_grams(text: str) -> set[tuple[str, ...]]:
-    tokens = _words(text)
-    return {tuple(tokens[index:index + 5]) for index in range(max(0, len(tokens) - 4))}
-
-
-def _five_word_overlap(candidate: str, source: str) -> float:
-    candidate_grams = _five_grams(candidate)
-    if not candidate_grams:
-        return 0.0
-    return len(candidate_grams & _five_grams(source)) / len(candidate_grams)
 
 
 def _in_range(value: float, target: dict[str, Any], tolerance: float = 0.0) -> bool:
@@ -537,7 +526,7 @@ class TranscriptStyleGuideService:
                 "source_identity_likeness_or_voice_allowed": False,
                 "distinctive_source_wording_allowed": False,
                 "source_media_direct_use_allowed": False,
-                "maximum_five_word_ngram_overlap_ratio": 0.20,
+                "fixed_matching_word_limit_applied": False,
             },
             "source_material_sha256": hashlib.sha256(
                 encoded_source
@@ -737,21 +726,24 @@ class TranscriptStyleGuideService:
             for row in guide.get("evidence", {}).get("sources") or []
             if row.get("video_id")
         ]
-        max_overlap = 0.0
-        nearest_video_id = None
-        for row in self.tape.artifact_bound_candidates(source_ids):
-            overlap = _five_word_overlap(
-                text, str(row.get("transcript") or "")
-            )
-            if overlap > max_overlap:
-                max_overlap = overlap
-                nearest_video_id = row.get("video_id")
-        overlap_limit = float(
-            guide.get("rights_and_originality", {}).get(
-                "maximum_five_word_ngram_overlap_ratio", 0.20
-            )
+        source_rows = self.tape.artifact_bound_candidates(source_ids)
+        copy_gate = audit_substantive_copy(
+            text,
+            (
+                {
+                    "source_id": str(row.get("video_id") or ""),
+                    "text": str(row.get("transcript") or ""),
+                    "creator_identifiers": [str(row.get("creator_id") or "")],
+                }
+                for row in source_rows
+            ),
+            provenance=(
+                payload.get("provenance")
+                if isinstance(payload.get("provenance"), dict)
+                else None
+            ),
         )
-        originality_pass = max_overlap < overlap_limit
+        originality_pass = bool(copy_gate["passed"])
         weights = {
             "words_per_second_in_observed_range": 20,
             "sentence_length_in_observed_range": 15,
@@ -779,12 +771,7 @@ class TranscriptStyleGuideService:
                 name for name, passed in checks.items() if not passed
             ],
             "metrics": metrics,
-            "copy_gate": {
-                "passed": originality_pass,
-                "maximum_five_word_overlap": round(max_overlap, 6),
-                "threshold": overlap_limit,
-                "nearest_video_id": nearest_video_id,
-            },
+            "copy_gate": copy_gate,
             "identity_voice_or_likeness_imitation_allowed": False,
             "input_binding": input_binding,
         }

@@ -64,7 +64,15 @@ The command writes and hashes the local bundle first. A slow or unhealthy target
 - Source clips must not be retained.
 - Do not copy source hooks, scripts, footage, branded art, identity, likeness, or voice.
 - A source link may support an abstract lesson; it does not grant direct-use rights.
-- New content must pass the five-word overlap gate before production.
+- New content must pass the substantive-copy and provenance gate before
+  production. No fixed count of matching words decides the result. Copied
+  expression, ordered passage, or source-specific structure fails. Facts and
+  general ideas may pass only with an independently verified, byte-bound claim
+  receipt. Creator identity, likeness, voice, and source clips remain forbidden.
+- The audit request must include an exact `content_copy_provenance_v1` object
+  self-hashed by `provenance_sha256` and bound to the script by
+  `candidate_sha256`. All identity, likeness, voice, and source-clip input ID
+  lists must exist and be empty; missing or extra contract fields fail closed.
 
 ## Receipt Rules
 

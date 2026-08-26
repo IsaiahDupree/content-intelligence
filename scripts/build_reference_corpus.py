@@ -137,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--objective", default="")
     audit.add_argument("--target-viewer", default="")
     audit.add_argument("--target-seconds", type=int, default=60)
+    audit.add_argument(
+        "--provenance-file",
+        help="JSON content_copy_provenance_v1 receipt bound to the exact script",
+    )
     audit.set_defaults(handler=run_audit)
 
     write_script = commands.add_parser("write-script")
@@ -261,6 +265,11 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     script = args.script
     if args.script_file:
         script = Path(args.script_file).read_text(encoding="utf-8")
+    provenance = None
+    if args.provenance_file:
+        provenance = json.loads(
+            Path(args.provenance_file).read_text(encoding="utf-8")
+        )
     return service(args).audit_content(
         corpus_id=args.corpus_id,
         title=args.title,
@@ -268,6 +277,7 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         objective=args.objective,
         target_viewer=args.target_viewer,
         target_seconds=args.target_seconds,
+        provenance=provenance,
     )
 
 

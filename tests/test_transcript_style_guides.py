@@ -5,6 +5,7 @@ from contextlib import closing
 from pathlib import Path
 
 from services.content_quality.api import create_content_quality_app
+from services.content_quality.copy_policy import build_script_only_provenance
 
 
 SCRIPT_FIXTURES = runpy.run_path(
@@ -132,13 +133,14 @@ def test_style_copy_gate_rejects_source_transcript_reuse(tmp_path):
         "style_guide_id": built["guide"]["guide_id"],
         "text": source,
         "target_duration_seconds": 45,
+        "provenance": build_script_only_provenance(source),
     })
 
     assert audit["decision"] == "REVISE"
     assert audit["findings"]["copy_gate"]["passed"] is False
-    assert audit["findings"]["copy_gate"][
-        "maximum_five_word_overlap"
-    ] == 1.0
+    assert "COPIED_EXPRESSION" in audit["findings"]["copy_gate"][
+        "failure_codes"
+    ]
 
 
 def test_tiktok_brief_freezes_style_receipt_and_script_passes_style_gate(

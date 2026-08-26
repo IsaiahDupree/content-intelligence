@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from pathlib import Path
 
+from jsonschema import Draft202012Validator, FormatChecker
+
 from services.content_quality.api import create_content_quality_app
+from services.content_quality.copy_policy import build_script_only_provenance
 from services.content_quality.reference_corpus import (
     SOURCE_RIGHTS_STATE,
     ReferenceCorpusService,
@@ -118,16 +122,18 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
         query="engaging hook with a visible result",
         evidence_limit=3,
     )
+    copied_script = (
+        "This is a boring hook and this is a fun and engaging hook. "
+        "Now compare the result and follow for the next lesson."
+    )
     audit = store.audit_content(
         corpus_id=CORPUS_ID,
         title="Hook lesson",
-        script=(
-            "This is a boring hook and this is a fun and engaging hook. "
-            "Now compare the result and follow for the next lesson."
-        ),
+        script=copied_script,
         objective="teach hook construction",
         target_viewer="business owners",
         target_seconds=20,
+        provenance=build_script_only_provenance(copied_script),
     )
 
     assert status["counts"]["items"] == 1
@@ -139,9 +145,23 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
     assert context["evidence"][0]["item_id"] == found[0]["item_id"]
     assert len(context["result_sha256"]) == 64
     assert audit["copy_gate"]["passed"] is False
-    assert audit["copy_gate"]["longest_exact_word_run"] >= 13
-    assert audit["copy_gate"]["longest_exact_word_run_item_id"] == found[0]["item_id"]
+    assert "COPIED_EXPRESSION" in audit["copy_gate"]["failure_codes"]
+    assert audit["copy_gate"]["substantive_copy"]["source_findings"][0][
+        "source_id"
+    ] == found[0]["item_id"]
     assert audit["rights"]["direct_use_allowed"] is False
+    audit_schema = json.loads(
+        (
+            Path(__file__).resolve().parent.parent
+            / "protocols/content-reference-audit-v1/content-creation-audit.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    errors = list(
+        Draft202012Validator(
+            audit_schema, format_checker=FormatChecker()
+        ).iter_errors(audit)
+    )
+    assert [error.message for error in errors] == []
     assert store.corpus_status(CORPUS_ID)["counts"]["audits"] == 1
     assert (tmp_path / "derived" / CORPUS_ID / "corpus-summary.json").is_file()
 
@@ -149,16 +169,18 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
 def test_generic_pronouns_and_step_words_do_not_inflate_quality(tmp_path):
     store = seed_service(tmp_path)
 
+    script = (
+        "The this you your. First, the this you your. Next, the this you "
+        "your. Then, the this you your."
+    )
     audit = store.audit_content(
         corpus_id=CORPUS_ID,
         title="Generic words",
-        script=(
-            "The this you your. First, the this you your. Next, the this you "
-            "your. Then, the this you your."
-        ),
+        script=script,
         objective="educate",
         target_viewer="business owners",
         target_seconds=20,
+        provenance=build_script_only_provenance(script),
     )
 
     assert audit["status"] == "revise"

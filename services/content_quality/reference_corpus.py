@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterable
 from .visual_bank import EXTRACTOR_VERSION as VISUAL_EXTRACTOR_VERSION
 from .visual_bank import extract_visual_features, tool_version
 from .script_quality import audit_owner_calibrated_quality
+from .copy_policy import audit_substantive_copy
 
 
 CORPUS_CONTRACT = "content_reference_corpus_v1"
@@ -2215,41 +2216,6 @@ class ReferenceCorpusService:
             "expected_sha256": expected_sha,
         }
 
-    @staticmethod
-    def _ngram_overlap(left: str, right: str, size: int = 5) -> float:
-        left_words = words(left)
-        right_words = words(right)
-        if len(left_words) < size or len(right_words) < size:
-            return 0.0
-        left_parts = {
-            tuple(left_words[index:index + size])
-            for index in range(len(left_words) - size + 1)
-        }
-        right_parts = {
-            tuple(right_words[index:index + size])
-            for index in range(len(right_words) - size + 1)
-        }
-        return len(left_parts & right_parts) / max(1, len(left_parts))
-
-    @staticmethod
-    def _longest_exact_word_run(left: str, right: str) -> int:
-        """Return the longest contiguous token run shared by both texts."""
-
-        left_words = words(left)
-        right_words = words(right)
-        if not left_words or not right_words:
-            return 0
-        previous = [0] * (len(right_words) + 1)
-        longest = 0
-        for left_word in left_words:
-            current = [0] * (len(right_words) + 1)
-            for index, right_word in enumerate(right_words, start=1):
-                if left_word == right_word:
-                    current[index] = previous[index - 1] + 1
-                    longest = max(longest, current[index])
-            previous = current
-        return longest
-
     def audit_content(
         self,
         *,
@@ -2259,6 +2225,7 @@ class ReferenceCorpusService:
         objective: str = "",
         target_viewer: str = "",
         target_seconds: int = 60,
+        provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         script = str(script or "").strip()
         if not script:
@@ -2304,24 +2271,28 @@ class ReferenceCorpusService:
         )
         cta_score = min(100.0, 25.0 + action_hits * 28.0)
         pace_score = round(100.0 * pace_fit, 3)
-        max_overlap = 0.0
-        overlap_item = ""
-        longest_exact_run = 0
-        exact_run_item = ""
+        copy_sources: list[dict[str, str]] = []
         for row in rows:
             source_text = " ".join((
                 str(row.get("caption") or ""),
                 str((row.get("transcript") or {}).get("text") or ""),
             ))
-            value = self._ngram_overlap(script, source_text)
-            if value > max_overlap:
-                max_overlap = value
-                overlap_item = str(row.get("item_id") or "")
-            exact_run = self._longest_exact_word_run(script, source_text)
-            if exact_run > longest_exact_run:
-                longest_exact_run = exact_run
-                exact_run_item = str(row.get("item_id") or "")
-        copy_score = round(100.0 * (1.0 - min(1.0, max_overlap)), 3)
+            copy_sources.append({
+                "source_id": str(row.get("item_id") or ""),
+                "text": source_text,
+                "creator_identifiers": [str(row.get("creator_handle") or "")],
+            })
+        copy_gate = audit_substantive_copy(
+            script,
+            copy_sources,
+            provenance=provenance,
+        )
+        maximum_expression_similarity = float(
+            copy_gate["substantive_copy"]["maximum_expression_similarity"]
+        )
+        copy_score = round(
+            100.0 * (1.0 - min(1.0, maximum_expression_similarity)), 3
+        )
         query = " ".join((title, objective, target_viewer, script[:800])).strip()
         refs = self.find_items(corpus_id=corpus_id, query=query, limit=6)
         evidence_score = min(100.0, 35.0 + len(refs) * 10.0)
@@ -2369,8 +2340,11 @@ class ReferenceCorpusService:
             notes.append(
                 f"Aim for about {expected_words} spoken words for {target_seconds} seconds."
             )
-        if max_overlap >= 0.20:
-            notes.append("Rewrite source-like five-word phrases before production.")
+        if not copy_gate["passed"]:
+            notes.extend(
+                f"Resolve substantive-copy/provenance finding: {code}."
+                for code in copy_gate["failure_codes"]
+            )
         if owner_quality["decision"] != "PASS":
             notes.extend(
                 f"Resolve owner-quality finding: {code}."
@@ -2383,12 +2357,13 @@ class ReferenceCorpusService:
             "objective": objective,
             "target_viewer": target_viewer,
             "target_seconds": target_seconds,
+            "provenance": provenance,
         }
         result = {
             "status": (
                 "pass"
                 if overall >= 70
-                and max_overlap < 0.20
+                and copy_gate["passed"]
                 and owner_quality["decision"] == "PASS"
                 else "revise"
             ),
@@ -2405,19 +2380,16 @@ class ReferenceCorpusService:
             "overall_score": overall,
             "scores": scores,
             "quality_judgments": owner_quality,
-            "copy_gate": {
-                "passed": max_overlap < 0.20,
-                "maximum_five_word_overlap": round(max_overlap, 6),
-                "nearest_item_id": overlap_item,
-                "longest_exact_word_run": longest_exact_run,
-                "longest_exact_word_run_item_id": exact_run_item,
-            },
+            "copy_gate": copy_gate,
             "evidence": refs,
             "notes": notes,
             "rights": {
                 "state": SOURCE_RIGHTS_STATE,
                 "direct_use_allowed": False,
                 "identity_imitation_allowed": False,
+                "likeness_imitation_allowed": False,
+                "voice_imitation_allowed": False,
+                "source_clip_use_allowed": False,
             },
             "created_at": utc_now(),
         }

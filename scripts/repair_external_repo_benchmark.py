@@ -21,7 +21,6 @@ from services.content_quality.repo_benchmark import (  # noqa: E402
     BENCHMARK_CONTRACT,
     DEFAULT_CORPUS_ID,
     DEFAULT_MODEL,
-    PEER_EXACT_WORD_RUN_LIMIT,
     ContentQualityClient,
     GeneratedTranscript,
     RepositoryProfile,
@@ -55,12 +54,6 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--corpus-id", default=DEFAULT_CORPUS_ID)
     value.add_argument("--model", default=DEFAULT_MODEL)
     value.add_argument("--max-repairs", type=int, default=3)
-    value.add_argument(
-        "--peer-run-limit",
-        type=int,
-        default=PEER_EXACT_WORD_RUN_LIMIT,
-        help="Reject exact candidate-to-candidate runs at or above this length.",
-    )
     value.add_argument(
         "--runtime-env",
         type=Path,
@@ -214,8 +207,6 @@ def main() -> int:
     args = parser().parse_args()
     if args.max_repairs < 0 or args.max_repairs > 3:
         raise ValueError("max-repairs must be between 0 and 3")
-    if args.peer_run_limit < 5 or args.peer_run_limit > 100:
-        raise ValueError("peer-run-limit must be between 5 and 100")
     run = json.loads(args.input.read_text(encoding="utf-8"))
     profiles = {item.profile_id: item for item in load_registry(args.registry)}
     rejected = sum(
@@ -224,10 +215,7 @@ def main() -> int:
         for record in result.get("transcripts", [])
     )
     if not args.execute:
-        peer_summary = annotate_peer_overlaps(
-            run.get("results", []),
-            exact_word_run_limit=args.peer_run_limit,
-        )
+        peer_summary = annotate_peer_overlaps(run.get("results", []))
         print(json.dumps({
             "status": "validated",
             "rejected_count": rejected,
@@ -292,7 +280,6 @@ def main() -> int:
             corpus_id=args.corpus_id,
             model=args.model,
             max_repairs=args.max_repairs,
-            exact_word_run_limit=args.peer_run_limit,
         )
     run["updated_at"] = datetime.now(timezone.utc).isoformat()
     run["post_run_repair"] = {
@@ -305,7 +292,7 @@ def main() -> int:
         int(result["summary"]["accepted_count"]) for result in run["results"]
     )
     run["summary"]["peer_overlap"] = {
-        "exact_word_run_limit": peer_enforcement["exact_word_run_limit"],
+        "fixed_matching_word_limit_applied": False,
         "maximum_exact_word_run": peer_enforcement["maximum_exact_word_run"],
         "failure_count": peer_enforcement["failure_count"],
         "passed": peer_enforcement["passed"],

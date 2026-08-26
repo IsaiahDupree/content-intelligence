@@ -124,14 +124,32 @@ curl --fail-with-body \
   -d '{
     "style_guide_id": "style_...",
     "text": "Original proposed script text",
-    "target_duration_seconds": 30
+    "target_duration_seconds": 30,
+    "provenance": {
+      "contract": "content_copy_provenance_v1",
+      "candidate_sha256": "50c48cd80adfdd03b1edaebda7be2ec969d78cb3387872234a042bea5b62097b",
+      "source_material_usage": "abstract_patterns_only",
+      "reference_item_ids": [],
+      "creator_identity_used": false,
+      "creator_likeness_used": false,
+      "creator_voice_used": false,
+      "source_clips_used": false,
+      "creator_identity_input_ids": [],
+      "creator_likeness_input_ids": [],
+      "creator_voice_input_ids": [],
+      "source_clip_ids": [],
+      "independent_verification_receipts": [],
+      "provenance_sha256": "1d5d6d6e9aaf852cbdf774673cb4eb9937428030c04375d3b97e91f50d63cec4"
+    }
   }'
 ```
 
 The audit checks speech-rate fit, sentence shape, direct address,
-contractions, hook family, recurring structure, and transitions. It separately
-rejects a script when its maximum five-word overlap with any source transcript
-reaches the guide's 0.20 threshold.
+contractions, hook family, recurring structure, and transitions. Its separate
+substantive-copy receipt rejects copied expression, ordered passage, or
+source-specific structure and requires byte-bound provenance. It does not use
+a fixed count of matching words. Independently verified facts and general ideas
+may pass; creator identity, likeness, voice, and source clips never do.
 
 ## Generation Enforcement
 

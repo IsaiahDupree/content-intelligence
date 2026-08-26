@@ -21,7 +21,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from services.content_quality.repo_benchmark import (  # noqa: E402
     DEFAULT_CORPUS_ID,
     DEFAULT_MODEL,
-    PEER_EXACT_WORD_RUN_LIMIT,
     ContentQualityClient,
     assemble_run,
     configured_ai_client,
@@ -75,12 +74,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--profile", action="append", default=[])
     parser.add_argument("--max-repairs", type=int, default=3)
-    parser.add_argument(
-        "--peer-run-limit",
-        type=int,
-        default=PEER_EXACT_WORD_RUN_LIMIT,
-        help="Reject exact candidate-to-candidate runs at or above this length.",
-    )
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument(
         "--execute",
@@ -134,8 +127,6 @@ def main() -> int:
 
     if args.max_repairs < 0 or args.max_repairs > 3:
         raise ValueError("max-repairs must be between 0 and 3")
-    if args.peer_run_limit < 5 or args.peer_run_limit > 100:
-        raise ValueError("peer-run-limit must be between 5 and 100")
     if args.workers < 1 or args.workers > 4:
         raise ValueError("workers must be between 1 and 4")
     with ContentQualityClient(args.base_url) as quality:
@@ -181,7 +172,6 @@ def main() -> int:
             corpus_id=args.corpus_id,
             model=args.model,
             max_repairs=args.max_repairs,
-            exact_word_run_limit=args.peer_run_limit,
         )
     run = assemble_run(
         results=results,
