@@ -29,7 +29,7 @@ from .script_quality import (
 
 REQUEST_CONTRACT = "reference_marketing_script_request_v1"
 PACKAGE_CONTRACT = "reference_marketing_script_package_v1"
-COMPILER_VERSION = "reference_marketing_script_compiler_v2"
+COMPILER_VERSION = "reference_marketing_script_compiler_v5"
 SPOKEN_WORDS_PER_SECOND = 2.35
 
 OBJECTIVES = ("awareness", "educate", "engage", "convert")
@@ -55,12 +55,6 @@ LEADING_STEP_RE = re.compile(
     r"^(?:step\s+\d+\s*[:,.-]?|first|second|third|fourth|next|then|finally)\s*[:,.-]?\s*",
     re.IGNORECASE,
 )
-STEP_OPENERS = {
-    "contrast_reveal": ("", "Now: ", "One more check: ", "Last: "),
-    "stakes_then_method": ("Start here: ", "", "Also: ", "Finish here: "),
-    "proof_bridge": ("Try this: ", "", "Now: ", "Close with: "),
-    "myth_turn": ("Check this: ", "", "Also: ", "Last: "),
-}
 
 
 def _text(value: Any, field: str, *, maximum: int = 1200) -> str:
@@ -216,9 +210,7 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _step_text(value: str, index: int, structure_id: str) -> str:
     clean = LEADING_STEP_RE.sub("", value).strip()
-    openers = STEP_OPENERS.get(structure_id, ())
-    opener = openers[index] if index < len(openers) else ""
-    line = f"{opener}{clean}" if opener else clean[:1].upper() + clean[1:]
+    line = clean[:1].upper() + clean[1:]
     return _finish_sentence(line)
 
 
@@ -516,6 +508,7 @@ class MarketingScriptCompiler:
                 objective=request["objective"],
                 target_viewer=request["audience"],
                 target_seconds=request["target_seconds"],
+                timeline=beats,
                 provenance=build_script_only_provenance(
                     transcript,
                     reference_item_ids=(

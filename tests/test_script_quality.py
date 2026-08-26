@@ -91,6 +91,80 @@ def test_tension_payoff_requires_both_sides_in_order() -> None:
         assert "OWNER_TENSION_PAYOFF" in report["failure_codes"]
 
 
+def test_topic_specific_science_turn_passes_without_keyword_filler() -> None:
+    beats = [
+        (
+            "hook",
+            "A glassfrog does not make its blood transparent. It moves most red "
+            "blood cells into its reflective liver while resting.",
+        ),
+        (
+            "problem",
+            "Blood absorbs light, so visible circulation would expose the animal.",
+        ),
+        (
+            "stakes",
+            "Hiding those cells raises transparency but briefly limits oxygen transport.",
+        ),
+        (
+            "proof",
+            "A lab team measured about 89 percent of circulating red blood cells "
+            "packed into the liver, raising transparency two to three times.",
+        ),
+        (
+            "reframe",
+            "The camouflage comes from relocating blood, not changing what blood is.",
+        ),
+        (
+            "teaching_step",
+            "Watch the frog at rest, when red cells leave the visible tissue.",
+        ),
+        (
+            "teaching_step",
+            "Follow the cells back into circulation when the frog becomes active.",
+        ),
+        (
+            "takeaway",
+            "A timed storage tradeoff lets a living animal become harder to see.",
+        ),
+        (
+            "call_to_action",
+            "Look for the hidden movement behind the visible change.",
+        ),
+    ]
+    report = audit_owner_calibrated_quality(
+        " ".join(text for _role, text in beats),
+        timeline=[{"block": role, "text": text} for role, text in beats],
+        protected_phrases=(beats[3][1],),
+    )
+
+    assert report["decision"] == "PASS"
+    assert report["judgments"]["specificity"]["topic_anchor_hits"]
+    assert report["judgments"]["tension_payoff"]["role_turn_supported"] is True
+    assert report["judgments"]["repeated_phrasing"][
+        "generic_quality_bridge_hits"
+    ] == []
+
+
+def test_generic_quality_bridge_family_fails_owner_judgment() -> None:
+    text = " ".join((
+        "The problem is hard to see, so you look at the result, then you compare "
+        "the evidence and check the clear answer.",
+        "The risk is missing the cause, so you record the result, then you "
+        "compare it and check which answer works.",
+        "A wrong guess creates friction, so you show the result, then you compare "
+        "the proof and check the answer.",
+    ))
+    report = audit_owner_calibrated_quality(text)
+
+    assert report["decision"] == "REVISE"
+    assert "OWNER_REPEATED_PHRASING" in report["failure_codes"]
+    assert report["judgments"]["specificity"]["passed"] is False
+    assert len(report["judgments"]["repeated_phrasing"][
+        "generic_quality_bridge_hits"
+    ]) == 3
+
+
 def test_corpus_count_narration_is_a_quality_failure() -> None:
     report = audit_owner_calibrated_quality(
         "Across 8 public creator videos, the same problem kept coming up. "

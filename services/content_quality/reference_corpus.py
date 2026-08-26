@@ -2226,6 +2226,7 @@ class ReferenceCorpusService:
         target_viewer: str = "",
         target_seconds: int = 60,
         provenance: dict[str, Any] | None = None,
+        timeline: Iterable[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         script = str(script or "").strip()
         if not script:
@@ -2247,7 +2248,10 @@ class ReferenceCorpusService:
         opening_contrast_hits = len(
             set(opening) & {"but", "instead", "least", "without", "yet"}
         )
-        owner_quality = audit_owner_calibrated_quality(script)
+        timeline_rows = [dict(item) for item in (timeline or ())]
+        owner_quality = audit_owner_calibrated_quality(
+            script, timeline=timeline_rows
+        )
         owner_judgments = owner_quality["judgments"]
         expected_words = max(1, round(target_seconds * 2.35))
         pace_fit = max(
@@ -2358,6 +2362,7 @@ class ReferenceCorpusService:
             "target_viewer": target_viewer,
             "target_seconds": target_seconds,
             "provenance": provenance,
+            "timeline": timeline_rows,
         }
         result = {
             "status": (

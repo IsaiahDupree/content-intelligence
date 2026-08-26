@@ -41,6 +41,12 @@ FORMULA_PHRASES = (
     "it keeps coming back to the same friction",
     "you are in the middle of product work when",
 )
+GENERIC_QUALITY_BRIDGE_RE = re.compile(
+    r"\b(?:the|a|one|that|an)\s+[^.!?]{0,90}\bso you\s+"
+    r"(?:look|record|show)\b[^.!?]{0,120}\bthen you compare\b"
+    r"[^.!?]{0,90}\bcheck\b",
+    re.IGNORECASE,
+)
 FORMAL_PHRASES = (
     "it is important to note", "in order to", "therefore", "furthermore",
     "moreover", "utilize", "implementation of",
@@ -90,6 +96,27 @@ GRAM_STOP_WORDS = {
 FIRST_PERSON_WORDS = {
     "i", "i'm", "i've", "me", "my", "mine", "we", "we've", "our", "ours",
 }
+GENERIC_TOPIC_TERMS = (
+    GRAM_STOP_WORDS
+    | CONCRETE_ACTION_VERBS
+    | CONCRETE_NOUNS
+    | TENSION_TERMS
+    | PAYOFF_TERMS
+    | CONTRAST_TERMS
+    | {
+        "about", "after", "again", "also", "around", "away", "before",
+        "being", "between", "both", "cause", "clue", "could", "does",
+        "each", "even", "evidence", "every", "explanation", "finding",
+        "first", "getting", "give", "going", "guess", "here", "hidden",
+        "inside", "just", "keep", "keeps", "later", "like", "make",
+        "makes", "making", "measured", "measuring", "method", "most",
+        "much", "need", "needs", "never", "only", "other", "process",
+        "record", "same", "should", "shows", "simple", "still", "study",
+        "than", "then", "through", "today", "turn", "turns", "until",
+        "used", "using", "very", "what", "when", "where", "which",
+        "while", "will", "would",
+    }
+)
 
 STRUCTURE_PLANS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "reference_marketing": (
@@ -314,6 +341,16 @@ def _action_hits(tokens: Sequence[str]) -> list[str]:
     return hits
 
 
+def _topic_anchor_hits(tokens: Sequence[str]) -> list[str]:
+    return sorted({
+        token
+        for token in tokens
+        if len(token) >= 5
+        and token not in GENERIC_TOPIC_TERMS
+        and not token.isdigit()
+    })
+
+
 def _repeated_ngrams(tokens: Sequence[str], size: int = 4) -> list[dict[str, Any]]:
     counts: Counter[tuple[str, ...]] = Counter()
     for index in range(max(0, len(tokens) - size + 1)):
@@ -339,6 +376,9 @@ def audit_owner_calibrated_quality(
 
     clean = " ".join(str(text or "").split()).strip()
     tokens = words(clean)
+    generic_bridge_hits = [
+        match.group(0) for match in GENERIC_QUALITY_BRIDGE_RE.finditer(clean)
+    ]
     sentence_tokens = _sentences(clean)
     sentence_lengths = [len(value) for value in sentence_tokens]
     average_sentence_words = (
@@ -368,16 +408,25 @@ def audit_owner_calibrated_quality(
     action_hits = _action_hits(tokens)
     noun_hits = [token for token in tokens if token in CONCRETE_NOUNS]
     numeric_hits = re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?", clean)
+    topic_anchor_hits = _topic_anchor_hits(tokens)
     specificity_score = min(
         100.0,
-        25.0
-        + min(5, len(set(action_hits))) * 9.0
-        + min(4, len(set(noun_hits))) * 7.5
-        + min(2, len(numeric_hits)) * 7.5,
+        20.0
+        + min(8, len(topic_anchor_hits)) * 7.0
+        + min(3, len(set(action_hits))) * 5.0
+        + min(2, len(set(noun_hits))) * 4.0
+        + min(2, len(numeric_hits)) * 5.0,
     )
-    specificity_pass = len(set(action_hits)) >= 3 and (
-        len(set(noun_hits)) >= 2 or bool(numeric_hits)
-    )
+    specificity_pass = (
+        (
+            len(topic_anchor_hits) >= 5
+            and (bool(action_hits) or bool(numeric_hits))
+        )
+        or (
+            len(set(action_hits)) >= 3
+            and (len(set(noun_hits)) >= 2 or bool(numeric_hits))
+        )
+    ) and not generic_bridge_hits
 
     tension_positions = _token_positions(tokens, TENSION_TERMS)
     payoff_positions = _token_positions(tokens, PAYOFF_TERMS)
@@ -386,9 +435,10 @@ def audit_owner_calibrated_quality(
         and payoff_positions
         and tension_positions[0] < payoff_positions[-1]
     )
+    timeline_rows = [dict(item) for item in (timeline or ())]
     roles = [
         str(item.get("block") or item.get("beat") or "").casefold()
-        for item in (timeline or ())
+        for item in timeline_rows
     ]
     tension_role_indexes = [
         index for index, role in enumerate(roles) if role in {"problem", "stakes"}
@@ -403,18 +453,33 @@ def audit_owner_calibrated_quality(
         and payoff_role_indexes
         and tension_role_indexes[0] < payoff_role_indexes[-1]
     )
+    role_turn_text = " ".join(
+        str(item.get("text") or "")
+        for item, role in zip(timeline_rows, roles)
+        if role in {"problem", "stakes", "payoff", "takeaway", "reframe"}
+    )
+    role_topic_anchors = _topic_anchor_hits(words(role_turn_text))
+    role_turn_supported = ordered_role_turn and len(role_topic_anchors) >= 5
     contrast_hits = sorted(set(tokens) & CONTRAST_TERMS)
-    tension_score = min(
+    lexical_tension_score = min(
         100.0,
         (35.0 if ordered_lexical_turn or ordered_role_turn else 0.0)
         + min(3, len(set(tokens) & TENSION_TERMS)) * 10.0
         + min(3, len(set(tokens) & PAYOFF_TERMS)) * 8.0
         + min(2, len(contrast_hits)) * 5.5,
     )
+    tension_score = max(
+        lexical_tension_score,
+        min(100.0, 75.0 + len(contrast_hits) * 5.0)
+        if role_turn_supported else 0.0,
+    )
     tension_pass = (
-        bool(tension_positions and payoff_positions)
-        and ordered_lexical_turn
-        and tension_score >= 70.0
+        (
+            bool(tension_positions and payoff_positions)
+            and ordered_lexical_turn
+            and lexical_tension_score >= 70.0
+        )
+        or role_turn_supported
     )
 
     protected_values = tuple(
@@ -443,7 +508,9 @@ def audit_owner_calibrated_quality(
     )
 
     repeated_ngrams = _repeated_ngrams(tokens)
-    formula_hits = [phrase for phrase in FORMULA_PHRASES if phrase in clean.casefold()]
+    formula_hits = [
+        phrase for phrase in FORMULA_PHRASES if phrase in clean.casefold()
+    ] + ["generic_quality_bridge" for _match in generic_bridge_hits]
     opening = tuple(tokens[:6])
     prior_opening_matches = sum(
         1
@@ -484,6 +551,7 @@ def audit_owner_calibrated_quality(
             "concrete_action_hits": sorted(set(action_hits)),
             "concrete_noun_hits": sorted(set(noun_hits)),
             "numeric_anchors": numeric_hits,
+            "topic_anchor_hits": topic_anchor_hits,
         },
         "tension_payoff": {
             "passed": tension_pass,
@@ -493,6 +561,8 @@ def audit_owner_calibrated_quality(
             "contrast_terms": contrast_hits,
             "ordered_lexical_turn": ordered_lexical_turn,
             "ordered_role_turn": ordered_role_turn,
+            "role_turn_supported": role_turn_supported,
+            "role_topic_anchors": role_topic_anchors,
         },
         "technical_language_leakage": {
             "passed": technical_pass,
@@ -506,6 +576,7 @@ def audit_owner_calibrated_quality(
             "passed": repetition_pass,
             "score": round(repetition_score, 3),
             "formula_phrase_hits": formula_hits,
+            "generic_quality_bridge_hits": generic_bridge_hits,
             "repeated_four_word_phrases": repeated_ngrams,
             "prior_opening_matches": prior_opening_matches,
             "opening_prefix": " ".join(opening),
