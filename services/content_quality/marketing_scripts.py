@@ -30,9 +30,63 @@ from .script_quality import (
 REQUEST_CONTRACT = "reference_marketing_script_request_v1"
 PACKAGE_CONTRACT = "reference_marketing_script_package_v1"
 COMPILER_VERSION = "reference_marketing_script_compiler_v5"
+CONTENT_ROLE_POLICY_VERSION = "content-role-policy-v1.0.0"
 SPOKEN_WORDS_PER_SECOND = 2.35
 
 OBJECTIVES = ("awareness", "educate", "engage", "convert")
+CONTENT_ROLES = ("ENTERTAIN", "EDUCATE", "SELL")
+TOPIC_DISTANCE_LEVELS = {
+    5: "universal_human_topic",
+    4: "business_or_technology_adjacent",
+    3: "ai_or_software_problem",
+    2: "specific_use_case",
+    1: "product_category",
+    0: "actual_product_or_offer",
+}
+TOPIC_DISTANCE_BY_ROLE = {
+    "ENTERTAIN": {"minimum": 3, "maximum": 5, "default": 5},
+    "EDUCATE": {"minimum": 2, "maximum": 3, "default": 3},
+    "SELL": {"minimum": 0, "maximum": 1, "default": 1},
+}
+OBJECTIVE_CONTENT_ROLE = {
+    "awareness": "ENTERTAIN",
+    "engage": "ENTERTAIN",
+    "educate": "EDUCATE",
+    "convert": "SELL",
+}
+CONTENT_ROLE_LOGIC = {
+    "ENTERTAIN": {
+        "funnel_job": "earn broad attention and discovery",
+        "topic_formula": [
+            "human_desire_or_problem",
+            "culturally_relevant_observation",
+            "strong_opinion",
+        ],
+        "primary_metrics": [
+            "hook_rate", "retention", "completion_rate", "rewatches",
+            "comments", "shares",
+        ],
+    },
+    "EDUCATE": {
+        "funnel_job": "build understanding, credibility, and active interest",
+        "topic_formula": [
+            "problem", "mechanism", "explanation", "demonstration",
+        ],
+        "primary_metrics": [
+            "saves", "profile_visits", "follows", "long_form_views",
+            "site_visits",
+        ],
+    },
+    "SELL": {
+        "funnel_job": "convert existing intent with product, proof, and one CTA",
+        "topic_formula": [
+            "specific_problem", "product", "evidence", "cta",
+        ],
+        "primary_metrics": [
+            "clicks", "signups", "activations", "purchases", "revenue",
+        ],
+    },
+}
 ANGLES = ("contrast", "problem_first", "how_to", "myth")
 PROOF_TYPES = (
     "worked_example",
@@ -80,6 +134,42 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
     objective = str(payload.get("objective") or "educate").strip().lower()
     if objective not in OBJECTIVES:
         raise ValueError("objective must be awareness, educate, engage, or convert")
+    expected_content_role = OBJECTIVE_CONTENT_ROLE[objective]
+    supplied_content_role = str(payload.get("content_role") or "").strip().upper()
+    if supplied_content_role and supplied_content_role not in CONTENT_ROLES:
+        raise ValueError("content_role must be ENTERTAIN, EDUCATE, or SELL")
+    if supplied_content_role and supplied_content_role != expected_content_role:
+        raise ValueError(
+            f"content_role {supplied_content_role} conflicts with "
+            f"objective {objective}; expected {expected_content_role}"
+        )
+    content_role = supplied_content_role or expected_content_role
+    distance_bounds = TOPIC_DISTANCE_BY_ROLE[content_role]
+    raw_distance = payload.get("topic_distance_from_offer")
+    if raw_distance is None:
+        topic_distance = int(distance_bounds["default"])
+    else:
+        if isinstance(raw_distance, bool):
+            raise ValueError(
+                "topic_distance_from_offer must be an integer from 0 through 5"
+            )
+        try:
+            numeric_distance = float(raw_distance)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "topic_distance_from_offer must be an integer from 0 through 5"
+            ) from exc
+        if not numeric_distance.is_integer() or not 0 <= numeric_distance <= 5:
+            raise ValueError(
+                "topic_distance_from_offer must be an integer from 0 through 5"
+            )
+        topic_distance = int(numeric_distance)
+    if not distance_bounds["minimum"] <= topic_distance <= distance_bounds["maximum"]:
+        raise ValueError(
+            f"{content_role} content requires topic_distance_from_offer "
+            f"between {distance_bounds['minimum']} and {distance_bounds['maximum']}"
+        )
+    topic_ladder_id = str(payload.get("topic_ladder_id") or "").strip()[:160]
     angle = str(payload.get("angle") or "problem_first").strip().lower()
     if angle not in ANGLES:
         raise ValueError("angle must be contrast, problem_first, how_to, or myth")
@@ -169,6 +259,8 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
         "offer_id": str(raw_offer.get("offer_id") or "").strip()[:160],
         "name": str(raw_offer.get("name") or "").strip()[:240],
     }
+    if content_role == "SELL" and not any(offer.values()):
+        raise ValueError("SELL content requires offer.offer_id or offer.name")
 
     return {
         "contract": REQUEST_CONTRACT,
@@ -177,6 +269,9 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
         "topic": _text(payload.get("topic"), "topic", maximum=500),
         "audience": _text(payload.get("audience"), "audience", maximum=500),
         "objective": objective,
+        "content_role": content_role,
+        "topic_distance_from_offer": topic_distance,
+        "topic_ladder_id": topic_ladder_id,
         "angle": angle,
         "target_seconds": target_seconds,
         "narrative": {
@@ -562,6 +657,27 @@ class MarketingScriptCompiler:
             "request": request,
             "marketing_logic": {
                 "objective": request["objective"],
+                "content_role": request["content_role"],
+                "content_role_policy_version": CONTENT_ROLE_POLICY_VERSION,
+                "topic_distance_from_offer": request[
+                    "topic_distance_from_offer"
+                ],
+                "topic_distance_label": TOPIC_DISTANCE_LEVELS[
+                    request["topic_distance_from_offer"]
+                ],
+                "topic_distance_range": TOPIC_DISTANCE_BY_ROLE[
+                    request["content_role"]
+                ],
+                "topic_ladder_id": request["topic_ladder_id"],
+                "topic_formula": CONTENT_ROLE_LOGIC[
+                    request["content_role"]
+                ]["topic_formula"],
+                "funnel_job": CONTENT_ROLE_LOGIC[
+                    request["content_role"]
+                ]["funnel_job"],
+                "primary_metrics": CONTENT_ROLE_LOGIC[
+                    request["content_role"]
+                ]["primary_metrics"],
                 "angle": request["angle"],
                 "audience": request["audience"],
                 "value_sequence": structure["role_order"],
@@ -621,6 +737,12 @@ class MarketingScriptCompiler:
             },
             "lineage": {
                 "compiler": COMPILER_VERSION,
+                "content_role_policy_version": CONTENT_ROLE_POLICY_VERSION,
+                "content_role": request["content_role"],
+                "topic_distance_from_offer": request[
+                    "topic_distance_from_offer"
+                ],
+                "topic_ladder_id": request["topic_ladder_id"],
                 "writer_mode": "deterministic_no_model",
                 "request_sha256": request_sha,
                 "context_result_sha256": context["result_sha256"],
@@ -645,6 +767,14 @@ class MarketingScriptCompiler:
                 "metadata": {
                     "registration_source": "reference_marketing_compiler",
                     "corpus_id": request["corpus_id"],
+                    "content_role": request["content_role"],
+                    "topic_distance_from_offer": request[
+                        "topic_distance_from_offer"
+                    ],
+                    "topic_ladder_id": request["topic_ladder_id"],
+                    "content_role_policy_version": (
+                        CONTENT_ROLE_POLICY_VERSION
+                    ),
                     "copy_audit_id": audit["audit_id"],
                     "owner_quality_contract": owner_quality["contract"],
                 },
@@ -682,6 +812,10 @@ def render_package_markdown(package: dict[str, Any]) -> str:
         "",
         f"Status: `{package['status']}`",
         f"Script ID: `{package['script_id']}`",
+        f"Content role: `{package['marketing_logic']['content_role']}`",
+        "Topic distance from offer: "
+        f"`{package['marketing_logic']['topic_distance_from_offer']}` "
+        f"(`{package['marketing_logic']['topic_distance_label']}`)",
         f"Target: `{script['target_seconds']}s`",
         f"Words: `{script['word_count']}`",
         f"Marketing score: `{package['quality']['score']}`",

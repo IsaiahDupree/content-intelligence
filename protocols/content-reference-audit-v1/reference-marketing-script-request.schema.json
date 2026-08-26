@@ -23,6 +23,18 @@
     "objective": {
       "enum": ["awareness", "educate", "engage", "convert"]
     },
+    "content_role": {
+      "enum": ["ENTERTAIN", "EDUCATE", "SELL"]
+    },
+    "topic_distance_from_offer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 5
+    },
+    "topic_ladder_id": {
+      "type": "string",
+      "maxLength": 160
+    },
     "angle": {
       "enum": ["contrast", "problem_first", "how_to", "myth"]
     },

@@ -33,7 +33,66 @@
     },
     "marketing_logic": {
       "type": "object",
-      "required": ["objective", "angle", "audience", "value_sequence"]
+      "required": [
+        "objective",
+        "content_role",
+        "content_role_policy_version",
+        "topic_distance_from_offer",
+        "topic_distance_label",
+        "topic_distance_range",
+        "topic_ladder_id",
+        "topic_formula",
+        "funnel_job",
+        "primary_metrics",
+        "angle",
+        "audience",
+        "value_sequence"
+      ],
+      "properties": {
+        "content_role": {
+          "enum": ["ENTERTAIN", "EDUCATE", "SELL"]
+        },
+        "content_role_policy_version": {
+          "const": "content-role-policy-v1.0.0"
+        },
+        "topic_distance_from_offer": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "topic_distance_label": {
+          "enum": [
+            "universal_human_topic",
+            "business_or_technology_adjacent",
+            "ai_or_software_problem",
+            "specific_use_case",
+            "product_category",
+            "actual_product_or_offer"
+          ]
+        },
+        "topic_distance_range": {
+          "type": "object",
+          "required": ["minimum", "maximum", "default"],
+          "properties": {
+            "minimum": {"type": "integer", "minimum": 0, "maximum": 5},
+            "maximum": {"type": "integer", "minimum": 0, "maximum": 5},
+            "default": {"type": "integer", "minimum": 0, "maximum": 5}
+          },
+          "additionalProperties": false
+        },
+        "topic_ladder_id": {"type": "string", "maxLength": 160},
+        "topic_formula": {
+          "type": "array",
+          "minItems": 3,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "funnel_job": {"type": "string", "minLength": 1},
+        "primary_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
     },
     "script": {
       "type": "object",

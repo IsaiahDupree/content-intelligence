@@ -968,7 +968,8 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "path": "/api/reference-corpus/audit",
                     "required": ["corpus_id", "script"],
                     "optional": [
-                        "title", "objective", "target_viewer", "target_seconds",
+                        "title", "objective", "content_role", "target_viewer",
+                        "target_seconds",
                     ],
                     "rights_gate": "patterns_only_no_copy_or_identity_imitation",
                 },
@@ -978,8 +979,11 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "contract": "reference_marketing_script_request_v1",
                     "required": [
                         "corpus_id", "title", "topic", "audience",
-                        "objective", "target_seconds", "narrative",
+                        "objective", "content_role",
+                        "topic_distance_from_offer", "target_seconds",
+                        "narrative",
                     ],
+                    "optional": ["topic_ladder_id", "offer"],
                     "effect": (
                         "compile a deterministic spoken script, audit the exact "
                         "draft, and persist an immutable package receipt"

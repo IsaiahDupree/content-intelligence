@@ -112,6 +112,8 @@ def request_payload() -> dict:
         "topic": "How a software founder should choose the first workflow to automate",
         "audience": "software founders evaluating AI automation",
         "objective": "educate",
+        "topic_distance_from_offer": 2,
+        "topic_ladder_id": "automate-the-bottleneck-ladder",
         "angle": "contrast",
         "target_seconds": 60,
         "narrative": {
@@ -168,6 +170,20 @@ def test_compiler_persists_an_approved_idempotent_package(tmp_path: Path) -> Non
     assert first == second
     assert first["status"] == "approved"
     assert first["contract"] == PACKAGE_CONTRACT
+    assert first["request"]["content_role"] == "EDUCATE"
+    assert first["request"]["topic_distance_from_offer"] == 2
+    assert first["marketing_logic"]["content_role"] == "EDUCATE"
+    assert first["marketing_logic"]["topic_distance_label"] == "specific_use_case"
+    assert first["marketing_logic"]["topic_ladder_id"] == (
+        "automate-the-bottleneck-ladder"
+    )
+    assert first["marketing_logic"]["primary_metrics"] == [
+        "saves",
+        "profile_visits",
+        "follows",
+        "long_form_views",
+        "site_visits",
+    ]
     assert first["quality"]["status"] == "pass"
     assert first["corpus_audit"]["status"] == "pass"
     assert first["corpus_audit"]["copy_gate"]["passed"] is True
@@ -197,7 +213,6 @@ def test_compiler_persists_an_approved_idempotent_package(tmp_path: Path) -> Non
         "script_packages": 1,
         "extraction_states": {"complete": 6},
     }
-
     with store.connect() as connection:
         with pytest.raises(sqlite3.DatabaseError):
             connection.execute(
@@ -205,6 +220,33 @@ def test_compiler_persists_an_approved_idempotent_package(tmp_path: Path) -> Non
                 (first["script_id"],),
             )
 
+
+def test_content_role_must_match_the_script_objective(tmp_path: Path) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["content_role"] = "SELL"
+
+    with pytest.raises(ValueError, match="conflicts with objective educate"):
+        MarketingScriptCompiler(store).compile(payload)
+
+
+def test_topic_distance_must_match_the_content_role(tmp_path: Path) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["topic_distance_from_offer"] = 5
+
+    with pytest.raises(ValueError, match="between 2 and 3"):
+        MarketingScriptCompiler(store).compile(payload)
+
+
+def test_sell_role_requires_an_explicit_offer(tmp_path: Path) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["objective"] = "convert"
+    payload["content_role"] = "SELL"
+
+    with pytest.raises(ValueError, match="SELL content requires"):
+        MarketingScriptCompiler(store).compile(payload)
 
 def test_source_backed_proof_requires_a_receipt(tmp_path: Path) -> None:
     store = seed_corpus(tmp_path / "reference")

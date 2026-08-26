@@ -22,6 +22,36 @@
 
 Do not assume a creator's popularity proves a tactic. The corpus provides observed examples, not causal proof. Separate observed clip choices from claimed performance reasons.
 
+## Marketing Script Intent Contract
+
+Every new marketing script request must state both `content_role` and
+`topic_distance_from_offer`. These are separate controls:
+
+| Role | Job | Viewer thought | Allowed distance |
+|---|---|---|---:|
+| `ENTERTAIN` | broad recognition, retention, and sharing | "That's me." | 3-5 |
+| `EDUCATE` | explain a useful mechanism or demonstration | "Show me how." | 2-3 |
+| `SELL` | solve a named buyer problem with proof and one CTA | "How do I get it?" | 0-1 |
+
+Distance `5` is a universal human topic, `4` is business/technology adjacent,
+`3` is an AI/software problem, `2` is a specific use case, `1` is a product
+category, and `0` is the actual named product or offer. Contradictory role and
+distance pairs fail. `SELL` also requires `offer.offer_id` or `offer.name`.
+
+Use `topic_ladder_id` to link original rungs based on one underlying subject:
+
+```text
+ENTERTAIN: human desire/problem -> cultural observation -> strong opinion
+EDUCATE:   problem -> mechanism -> explanation -> demonstration
+SELL:      specific problem -> product -> evidence -> CTA
+```
+
+The ladder is lineage only. Never copy a reference creator's expression,
+ordered script, identity, likeness, voice, or footage into any rung. The
+immutable package returns the role, distance, distance label, ladder ID,
+funnel job, metrics, copy audit, and rights receipt agents must preserve in
+generation and scheduling.
+
 ## Write Calls
 
 `acquire` fetches bounded public source data and stores immutable receipts. The corpus limit is 240. `extract` handles at most three clips per API call, derives the transcript, visual facts, contact sheet, and typed analysis, then deletes each source clip.
