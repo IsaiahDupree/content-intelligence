@@ -146,6 +146,28 @@ def test_topic_specific_science_turn_passes_without_keyword_filler() -> None:
     ] == []
 
 
+def test_semantic_role_credit_requires_exact_timeline_projection() -> None:
+    text = (
+        "Glassfrog blood absorbs light through transparent tissue. "
+        "Reflective crystals surround the liver during sleep."
+    )
+    report = audit_owner_calibrated_quality(
+        text,
+        timeline=[
+            {"block": "problem", "text": "Words absent from the script."},
+            {"block": "takeaway", "text": "A fabricated resolution."},
+        ],
+    )
+
+    judgment = report["judgments"]["tension_payoff"]
+    assert judgment["passed"] is False
+    assert judgment["role_turn_supported"] is False
+    assert judgment["timeline_binding"]["exact_ordered_projection"] is False
+    assert judgment["timeline_binding"]["failure_codes"] == [
+        "timeline_not_exact_ordered_script_projection"
+    ]
+
+
 def test_generic_quality_bridge_family_fails_owner_judgment() -> None:
     text = " ".join((
         "The problem is hard to see, so you look at the result, then you compare "

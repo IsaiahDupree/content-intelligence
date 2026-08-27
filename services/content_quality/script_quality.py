@@ -365,6 +365,27 @@ def _repeated_ngrams(tokens: Sequence[str], size: int = 4) -> list[dict[str, Any
     ]
 
 
+def _timeline_binding(
+    text: str, timeline: Sequence[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    rows = [dict(item) for item in (timeline or ())]
+    row_texts = [" ".join(str(item.get("text") or "").split()) for item in rows]
+    projected = " ".join(value for value in row_texts if value).strip()
+    failures: list[str] = []
+    if not rows:
+        failures.append("timeline_missing")
+    if rows and any(not value for value in row_texts):
+        failures.append("timeline_row_missing_text")
+    if rows and projected != text:
+        failures.append("timeline_not_exact_ordered_script_projection")
+    return {
+        "contract": "exact_script_timeline_binding_v1",
+        "exact_ordered_projection": not failures,
+        "row_count": len(rows),
+        "failure_codes": failures,
+    }
+
+
 def audit_owner_calibrated_quality(
     text: str,
     *,
@@ -436,6 +457,7 @@ def audit_owner_calibrated_quality(
         and tension_positions[0] < payoff_positions[-1]
     )
     timeline_rows = [dict(item) for item in (timeline or ())]
+    timeline_binding = _timeline_binding(clean, timeline_rows)
     roles = [
         str(item.get("block") or item.get("beat") or "").casefold()
         for item in timeline_rows
@@ -449,7 +471,8 @@ def audit_owner_calibrated_quality(
         if role in {"payoff", "takeaway", "reframe"}
     ]
     ordered_role_turn = bool(
-        tension_role_indexes
+        timeline_binding["exact_ordered_projection"]
+        and tension_role_indexes
         and payoff_role_indexes
         and tension_role_indexes[0] < payoff_role_indexes[-1]
     )
@@ -563,6 +586,7 @@ def audit_owner_calibrated_quality(
             "ordered_role_turn": ordered_role_turn,
             "role_turn_supported": role_turn_supported,
             "role_topic_anchors": role_topic_anchors,
+            "timeline_binding": timeline_binding,
         },
         "technical_language_leakage": {
             "passed": technical_pass,

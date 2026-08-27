@@ -24,8 +24,12 @@ action remains last and each source-bound phrase remains present exactly once.
 Every draft is checked for:
 
 1. Spoken naturalness: sentence length, long-sentence share, and formal filler.
-2. Specificity: concrete actions, concrete nouns, and any verified number.
-3. Tension and payoff: both sides must exist, with tension before payoff.
+2. Specificity: domain-specific topic anchors plus concrete actions, nouns, or
+   verified numbers. Generic business nouns and known bridge formulas do not
+   create specificity by themselves.
+3. Tension and payoff: both sides must exist, with tension before payoff. A
+   semantic role timeline can supply this evidence only when its text is an
+   exact, ordered projection of the full spoken script.
 4. Technical-language leakage: internal build terms, hard internal phrases,
    and spoken corpus-count narration fail this check.
 5. Repeated phrasing: repeated four-word runs, known formulas, and a matching
@@ -34,6 +38,11 @@ Every draft is checked for:
 The style judge never grants speaker perspective. Its result says
 `perspective_authorization_evaluated: false`. First-person text is handled by
 the separate evidence gate.
+
+Timeline labels alone have no authority. Empty rows, partial timelines,
+reordered text, duplicated text, and fabricated text fail
+`exact_script_timeline_binding_v1`; their role labels cannot lift the
+tension/payoff score.
 
 ## Evidence and perspective
 
