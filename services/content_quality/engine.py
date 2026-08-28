@@ -18,6 +18,7 @@ from .ai_relatability import AIRelatabilityAdjudicator, NON_AI_PASS_DECISION
 from .contracts import is_supported_transcript_audit_contract
 from .narrative_coherence import NarrativeCoherenceService
 from .owned_content_metrics import OwnedContentMetricTelemetry
+from .owned_publication import OwnedPublicationAttributionService
 from .script_experiments import ScriptExperimentTelemetry
 from .script_intelligence import ScriptIntelligenceService
 from .script_quality import (
@@ -39,6 +40,8 @@ UTC = timezone.utc
 OWNED_ATTRIBUTION_EVENT_CONTRACT = "owned_attribution_event_v1"
 OWNED_RETENTION_SAMPLE_CONTRACT = "owned_retention_sample_v1"
 OWNED_OUTCOME_SUMMARY_CONTRACT = "owned_outcome_summary_v1"
+OWNED_PUBLICATION_RECEIPT_CONTRACT = "owned_publication_receipt_v1"
+OWNED_PUBLICATION_BINDING_CONTRACT = "owned_publication_binding_v1"
 OWNED_OUTCOME_EVENT_TYPES = ("click", "install", "trial", "purchase")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
@@ -566,6 +569,52 @@ class QualityStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cq_owned_publication_receipts (
+                    publication_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    content_id TEXT NOT NULL,
+                    campaign_id TEXT NOT NULL,
+                    offer_id TEXT NOT NULL,
+                    semantic_asset_id TEXT NOT NULL,
+                    semantic_asset_sha256 TEXT NOT NULL,
+                    local_asset_path TEXT NOT NULL,
+                    local_asset_sha256 TEXT NOT NULL,
+                    local_asset_bytes INTEGER NOT NULL CHECK(local_asset_bytes > 0),
+                    source_platform TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    publisher TEXT NOT NULL,
+                    provider_post_id TEXT NOT NULL,
+                    provider_post_url TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    provider_receipt_id TEXT NOT NULL,
+                    provider_receipt_sha256 TEXT NOT NULL,
+                    publication_receipt_sha256 TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_platform, provider_post_id),
+                    UNIQUE(content_id, source_platform, account_id)
+                );
+                CREATE TABLE IF NOT EXISTS cq_owned_outcome_publication_bindings (
+                    event_id TEXT PRIMARY KEY,
+                    publication_id TEXT NOT NULL,
+                    publication_receipt_sha256 TEXT NOT NULL,
+                    contract TEXT NOT NULL,
+                    bound_at TEXT NOT NULL,
+                    FOREIGN KEY(event_id) REFERENCES cq_owned_outcome_events(event_id),
+                    FOREIGN KEY(publication_id)
+                        REFERENCES cq_owned_publication_receipts(publication_id)
+                );
+                CREATE TABLE IF NOT EXISTS cq_owned_retention_publication_bindings (
+                    sample_id TEXT PRIMARY KEY,
+                    publication_id TEXT NOT NULL,
+                    publication_receipt_sha256 TEXT NOT NULL,
+                    contract TEXT NOT NULL,
+                    bound_at TEXT NOT NULL,
+                    FOREIGN KEY(sample_id) REFERENCES cq_owned_retention_samples(sample_id),
+                    FOREIGN KEY(publication_id)
+                        REFERENCES cq_owned_publication_receipts(publication_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_cq_receipts_type_created
                     ON cq_receipts(receipt_type, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_cq_audits_type_created
@@ -587,6 +636,18 @@ class QualityStore:
                     ON cq_owned_retention_samples(
                         content_id, campaign_id, offer_id,
                         source_platform, source_id, elapsed_ms, observed_at
+                    );
+                CREATE INDEX IF NOT EXISTS idx_cq_owned_publication_content
+                    ON cq_owned_publication_receipts(
+                        content_id, source_platform, account_id, published_at
+                    );
+                CREATE INDEX IF NOT EXISTS idx_cq_owned_event_publication
+                    ON cq_owned_outcome_publication_bindings(
+                        publication_id, event_id
+                    );
+                CREATE INDEX IF NOT EXISTS idx_cq_owned_retention_publication
+                    ON cq_owned_retention_publication_bindings(
+                        publication_id, sample_id
                     );
                 CREATE TRIGGER IF NOT EXISTS cq_receipts_no_update
                 BEFORE UPDATE ON cq_receipts
@@ -677,6 +738,36 @@ class QualityStore:
                 BEFORE DELETE ON cq_owned_retention_samples
                 BEGIN
                     SELECT RAISE(ABORT, 'owned retention samples are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_publication_receipts_no_update
+                BEFORE UPDATE ON cq_owned_publication_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned publication receipts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_publication_receipts_no_delete
+                BEFORE DELETE ON cq_owned_publication_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned publication receipts are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_outcome_publication_bindings_no_update
+                BEFORE UPDATE ON cq_owned_outcome_publication_bindings
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned outcome publication bindings are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_outcome_publication_bindings_no_delete
+                BEFORE DELETE ON cq_owned_outcome_publication_bindings
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned outcome publication bindings are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_retention_publication_bindings_no_update
+                BEFORE UPDATE ON cq_owned_retention_publication_bindings
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned retention publication bindings are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS cq_owned_retention_publication_bindings_no_delete
+                BEFORE DELETE ON cq_owned_retention_publication_bindings
+                BEGIN
+                    SELECT RAISE(ABORT, 'owned retention publication bindings are append-only');
                 END;
                 """
             )
@@ -1148,8 +1239,187 @@ class QualityStore:
             connection.commit()
         return row
 
+    @staticmethod
+    def _owned_publication_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "publication_id": str(row["publication_id"]),
+            "contract": str(row["contract"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "attribution": {
+                "content_id": str(row["content_id"]),
+                "campaign_id": str(row["campaign_id"]),
+                "offer_id": str(row["offer_id"]),
+                "source_platform": str(row["source_platform"]),
+                "source_id": str(row["provider_post_id"]),
+            },
+            "semantic_asset": {
+                "asset_id": str(row["semantic_asset_id"]),
+                "asset_sha256": str(row["semantic_asset_sha256"]),
+            },
+            "local_asset": {
+                "path": str(row["local_asset_path"]),
+                "sha256": str(row["local_asset_sha256"]),
+                "bytes": int(row["local_asset_bytes"]),
+            },
+            "account_id": str(row["account_id"]),
+            "publisher": str(row["publisher"]),
+            "provider_post_id": str(row["provider_post_id"]),
+            "provider_post_url": str(row["provider_post_url"]),
+            "published_at": str(row["published_at"]),
+            "provider_receipt_id": str(row["provider_receipt_id"]),
+            "provider_receipt_sha256": str(row["provider_receipt_sha256"]),
+            "publication_receipt_sha256": str(
+                row["publication_receipt_sha256"]
+            ),
+            "metadata": json.loads(row["payload_json"]).get("metadata", {}),
+            "created_at": str(row["created_at"]),
+        }
+
+    def put_owned_publication(
+        self, publication: dict[str, Any]
+    ) -> tuple[dict[str, Any], bool]:
+        payload_json = json.dumps(
+            publication, sort_keys=True, separators=(",", ":")
+        )
+        receipt_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        publication_id = stable_id("publication", publication["idempotency_key"])
+        created_at = utc_now()
+        with closing(self.connect()) as connection:
+            existing = connection.execute(
+                "SELECT * FROM cq_owned_publication_receipts WHERE idempotency_key=?",
+                (publication["idempotency_key"],),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["publication_receipt_sha256"]) != receipt_sha256:
+                    raise IdempotencyConflict(
+                        "idempotency_key already identifies a different publication receipt"
+                    )
+                return self._owned_publication_row(existing), False
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO cq_owned_publication_receipts(
+                        publication_id, contract, idempotency_key, content_id,
+                        campaign_id, offer_id, semantic_asset_id,
+                        semantic_asset_sha256, local_asset_path,
+                        local_asset_sha256, local_asset_bytes, source_platform,
+                        account_id, publisher, provider_post_id,
+                        provider_post_url, published_at, provider_receipt_id,
+                        provider_receipt_sha256, publication_receipt_sha256,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        publication_id, OWNED_PUBLICATION_RECEIPT_CONTRACT,
+                        publication["idempotency_key"], publication["content_id"],
+                        publication["campaign_id"], publication["offer_id"],
+                        publication["semantic_asset_id"],
+                        publication["semantic_asset_sha256"],
+                        publication["local_asset_path"],
+                        publication["local_asset_sha256"],
+                        publication["local_asset_bytes"],
+                        publication["source_platform"], publication["account_id"],
+                        publication["publisher"], publication["provider_post_id"],
+                        publication["provider_post_url"], publication["published_at"],
+                        publication["provider_receipt_id"],
+                        publication["provider_receipt_sha256"], receipt_sha256,
+                        payload_json, created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                provider = connection.execute(
+                    """SELECT 1 FROM cq_owned_publication_receipts
+                       WHERE source_platform=? AND provider_post_id=?""",
+                    (publication["source_platform"], publication["provider_post_id"]),
+                ).fetchone()
+                account = connection.execute(
+                    """SELECT 1 FROM cq_owned_publication_receipts
+                       WHERE content_id=? AND source_platform=? AND account_id=?""",
+                    (
+                        publication["content_id"], publication["source_platform"],
+                        publication["account_id"],
+                    ),
+                ).fetchone()
+                if provider is not None:
+                    raise IdempotencyConflict(
+                        "provider post is already bound to a different publication receipt"
+                    ) from exc
+                if account is not None:
+                    raise IdempotencyConflict(
+                        "content is already bound to a publication on this platform account"
+                    ) from exc
+                raise
+            row = connection.execute(
+                "SELECT * FROM cq_owned_publication_receipts WHERE publication_id=?",
+                (publication_id,),
+            ).fetchone()
+            if row is None:
+                raise sqlite3.IntegrityError(
+                    "owned publication receipt insert was not readable"
+                )
+            connection.commit()
+        return self._owned_publication_row(row), True
+
+    def owned_publication(
+        self,
+        *,
+        publication_id: str | None = None,
+        publication_receipt_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not publication_id and not publication_receipt_sha256:
+            raise ValueError(
+                "publication_id or publication_receipt_sha256 is required"
+            )
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if publication_id:
+            clauses.append("publication_id=?")
+            parameters.append(publication_id)
+        if publication_receipt_sha256:
+            clauses.append("publication_receipt_sha256=?")
+            parameters.append(publication_receipt_sha256)
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                f"""SELECT * FROM cq_owned_publication_receipts
+                    WHERE {' AND '.join(clauses)}""",
+                parameters,
+            ).fetchone()
+        return self._owned_publication_row(row) if row is not None else None
+
+    def owned_publications(
+        self, filters: dict[str, str], *, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        mapping = {
+            "content_id": "content_id",
+            "campaign_id": "campaign_id",
+            "offer_id": "offer_id",
+            "source_platform": "source_platform",
+            "source_id": "provider_post_id",
+            "account_id": "account_id",
+            "publication_id": "publication_id",
+        }
+        for name, column in mapping.items():
+            value = filters.get(name)
+            if value:
+                clauses.append(f"{column}=?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(max(1, min(int(limit), 500)))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM cq_owned_publication_receipts {where}
+                    ORDER BY published_at DESC, publication_id DESC LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [self._owned_publication_row(row) for row in rows]
+
     def put_owned_outcome_event(
-        self, event: dict[str, Any]
+        self,
+        event: dict[str, Any],
+        publication: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload_json = json.dumps(event, sort_keys=True, separators=(",", ":"))
         payload_sha256 = hashlib.sha256(payload_json.encode()).hexdigest()
@@ -1167,7 +1437,7 @@ class QualityStore:
                 ON CONFLICT(idempotency_key) DO NOTHING
                 """,
                 (
-                    event_id, OWNED_ATTRIBUTION_EVENT_CONTRACT,
+                    event_id, event["contract"],
                     event["idempotency_key"], event["event_type"],
                     event["content_id"], event["campaign_id"], event["offer_id"],
                     event["source_platform"], event["source_id"],
@@ -1177,8 +1447,43 @@ class QualityStore:
                 ),
             )
             created = cursor.rowcount == 1
+            if publication is not None:
+                connection.execute(
+                    """INSERT OR IGNORE INTO cq_owned_outcome_publication_bindings(
+                           event_id, publication_id,
+                           publication_receipt_sha256, contract, bound_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        event_id, publication["publication_id"],
+                        publication["publication_receipt_sha256"],
+                        OWNED_PUBLICATION_BINDING_CONTRACT, created_at,
+                    ),
+                )
+                binding = connection.execute(
+                    """SELECT publication_id, publication_receipt_sha256
+                       FROM cq_owned_outcome_publication_bindings
+                       WHERE event_id=?""",
+                    (event_id,),
+                ).fetchone()
+                if (
+                    binding is None
+                    or str(binding["publication_id"])
+                        != publication["publication_id"]
+                    or str(binding["publication_receipt_sha256"])
+                        != publication["publication_receipt_sha256"]
+                ):
+                    raise IdempotencyConflict(
+                        "owned outcome event is bound to a different publication receipt"
+                    )
             row = connection.execute(
-                "SELECT * FROM cq_owned_outcome_events WHERE idempotency_key=?",
+                """SELECT event.*,
+                          binding.publication_id AS bound_publication_id,
+                          binding.publication_receipt_sha256
+                           AS bound_publication_receipt_sha256
+                   FROM cq_owned_outcome_events event
+                   LEFT JOIN cq_owned_outcome_publication_bindings binding
+                     ON binding.event_id=event.event_id
+                   WHERE event.idempotency_key=?""",
                 (event["idempotency_key"],),
             ).fetchone()
             if row is None:
@@ -1191,7 +1496,9 @@ class QualityStore:
         return self._owned_event_row(row), created
 
     def put_owned_retention_sample(
-        self, sample: dict[str, Any]
+        self,
+        sample: dict[str, Any],
+        publication: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         payload_json = json.dumps(sample, sort_keys=True, separators=(",", ":"))
         payload_sha256 = hashlib.sha256(payload_json.encode()).hexdigest()
@@ -1210,7 +1517,7 @@ class QualityStore:
                 ON CONFLICT(idempotency_key) DO NOTHING
                 """,
                 (
-                    sample_id, OWNED_RETENTION_SAMPLE_CONTRACT,
+                    sample_id, sample["contract"],
                     sample["idempotency_key"], sample["content_id"],
                     sample["campaign_id"], sample["offer_id"],
                     sample["source_platform"], sample["source_id"],
@@ -1221,8 +1528,43 @@ class QualityStore:
                 ),
             )
             created = cursor.rowcount == 1
+            if publication is not None:
+                connection.execute(
+                    """INSERT OR IGNORE INTO cq_owned_retention_publication_bindings(
+                           sample_id, publication_id,
+                           publication_receipt_sha256, contract, bound_at
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        sample_id, publication["publication_id"],
+                        publication["publication_receipt_sha256"],
+                        OWNED_PUBLICATION_BINDING_CONTRACT, created_at,
+                    ),
+                )
+                binding = connection.execute(
+                    """SELECT publication_id, publication_receipt_sha256
+                       FROM cq_owned_retention_publication_bindings
+                       WHERE sample_id=?""",
+                    (sample_id,),
+                ).fetchone()
+                if (
+                    binding is None
+                    or str(binding["publication_id"])
+                        != publication["publication_id"]
+                    or str(binding["publication_receipt_sha256"])
+                        != publication["publication_receipt_sha256"]
+                ):
+                    raise IdempotencyConflict(
+                        "owned retention sample is bound to a different publication receipt"
+                    )
             row = connection.execute(
-                "SELECT * FROM cq_owned_retention_samples WHERE idempotency_key=?",
+                """SELECT sample.*,
+                          binding.publication_id AS bound_publication_id,
+                          binding.publication_receipt_sha256
+                           AS bound_publication_receipt_sha256
+                   FROM cq_owned_retention_samples sample
+                   LEFT JOIN cq_owned_retention_publication_bindings binding
+                     ON binding.sample_id=sample.sample_id
+                   WHERE sample.idempotency_key=?""",
                 (sample["idempotency_key"],),
             ).fetchone()
             if row is None:
@@ -1236,7 +1578,7 @@ class QualityStore:
 
     @staticmethod
     def _owned_event_row(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        result = {
             "event_id": row["event_id"],
             "contract": row["contract"],
             "idempotency_key": row["idempotency_key"],
@@ -1255,10 +1597,22 @@ class QualityStore:
             "payload_sha256": row["payload_sha256"],
             "created_at": row["created_at"],
         }
+        keys = set(row.keys())
+        if "bound_publication_id" in keys and row["bound_publication_id"]:
+            result["publication_binding"] = {
+                "contract": OWNED_PUBLICATION_BINDING_CONTRACT,
+                "publication_id": str(row["bound_publication_id"]),
+                "publication_receipt_sha256": str(
+                    row["bound_publication_receipt_sha256"]
+                ),
+            }
+        else:
+            result["publication_binding"] = None
+        return result
 
     @staticmethod
     def _owned_retention_row(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        result = {
             "sample_id": row["sample_id"],
             "contract": row["contract"],
             "idempotency_key": row["idempotency_key"],
@@ -1279,6 +1633,18 @@ class QualityStore:
             "payload_sha256": row["payload_sha256"],
             "created_at": row["created_at"],
         }
+        keys = set(row.keys())
+        if "bound_publication_id" in keys and row["bound_publication_id"]:
+            result["publication_binding"] = {
+                "contract": OWNED_PUBLICATION_BINDING_CONTRACT,
+                "publication_id": str(row["bound_publication_id"]),
+                "publication_receipt_sha256": str(
+                    row["bound_publication_receipt_sha256"]
+                ),
+            }
+        else:
+            result["publication_binding"] = None
+        return result
 
     @staticmethod
     def _owned_attribution_where(
@@ -1301,9 +1667,15 @@ class QualityStore:
         parameters.append(max(1, min(int(limit), 500)))
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                f"""SELECT * FROM cq_owned_outcome_events
+                f"""SELECT event.*,
+                           binding.publication_id AS bound_publication_id,
+                           binding.publication_receipt_sha256
+                            AS bound_publication_receipt_sha256
+                    FROM cq_owned_outcome_events event
+                    LEFT JOIN cq_owned_outcome_publication_bindings binding
+                      ON binding.event_id=event.event_id
                     WHERE {where}
-                    ORDER BY occurred_at, event_id LIMIT ?""",
+                    ORDER BY event.occurred_at, event.event_id LIMIT ?""",
                 parameters,
             ).fetchall()
         return [self._owned_event_row(row) for row in rows]
@@ -1315,9 +1687,16 @@ class QualityStore:
         parameters.append(max(1, min(int(limit), 2000)))
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                f"""SELECT * FROM cq_owned_retention_samples
+                f"""SELECT sample.*,
+                           binding.publication_id AS bound_publication_id,
+                           binding.publication_receipt_sha256
+                            AS bound_publication_receipt_sha256
+                    FROM cq_owned_retention_samples sample
+                    LEFT JOIN cq_owned_retention_publication_bindings binding
+                      ON binding.sample_id=sample.sample_id
                     WHERE {where}
-                    ORDER BY elapsed_ms, observed_at, sample_id LIMIT ?""",
+                    ORDER BY sample.elapsed_ms, sample.observed_at,
+                             sample.sample_id LIMIT ?""",
                 parameters,
             ).fetchall()
         return [self._owned_retention_row(row) for row in rows]
@@ -1693,6 +2072,9 @@ class QualityStore:
                     "cq_receipts", "cq_scripts", "cq_audits", "cq_retention",
                     "cq_script_briefs", "cq_workflow_runs", "cq_agent_queries",
                     "cq_owned_outcome_events", "cq_owned_retention_samples",
+                    "cq_owned_publication_receipts",
+                    "cq_owned_outcome_publication_bindings",
+                    "cq_owned_retention_publication_bindings",
                     "cq_owned_content_metric_snapshots",
                 )
             }
@@ -1798,6 +2180,45 @@ class MarketTapeReader:
         connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=15)
         connection.row_factory = sqlite3.Row
         return connection
+
+    def semantic_content_asset(self, content_id: str) -> dict[str, Any] | None:
+        """Resolve exactly one canonical semantic parent asset."""
+        if not self.path.is_file():
+            raise ValueError("market tape database is unavailable")
+        try:
+            with closing(self.connect()) as connection:
+                table = connection.execute(
+                    """SELECT 1 FROM sqlite_master
+                       WHERE type='table' AND name='mt_content_assets'"""
+                ).fetchone()
+                if table is None:
+                    raise ValueError(
+                        "market tape semantic content assets are unavailable"
+                    )
+                rows = connection.execute(
+                    """SELECT asset_id, brief_id, graph_version_id,
+                              atomic_topic_id, parent_asset_id, platform,
+                              account, content_id, asset_contract,
+                              asset_sha256, status, lineage_sha256,
+                              source_service, source_receipt_id, registered_at
+                       FROM mt_content_assets WHERE content_id=?
+                       ORDER BY registered_at DESC LIMIT 2""",
+                    (content_id,),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise ValueError(
+                f"market tape semantic asset lookup failed: {exc}"
+            ) from exc
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError(
+                "content_id resolves to more than one semantic content asset"
+            )
+        row = rows[0]
+        if row["parent_asset_id"] is not None:
+            raise ValueError("content_id must resolve to a semantic parent asset")
+        return {name: row[name] for name in row.keys()}
 
     def candidates(self, topic: str, limit: int = 20) -> list[dict[str, Any]]:
         tokens = [
@@ -4047,8 +4468,13 @@ class OwnedOutcomeAttributionService:
         "content_id", "campaign_id", "offer_id", "source_platform", "source_id",
     )
 
-    def __init__(self, store: QualityStore):
+    def __init__(
+        self,
+        store: QualityStore,
+        publications: OwnedPublicationAttributionService | None = None,
+    ):
         self.store = store
+        self.publications = publications
 
     @staticmethod
     def _required_text(
@@ -4172,6 +4598,60 @@ class OwnedOutcomeAttributionService:
             "event": stored,
         }
 
+    def _strict_publication(
+        self, payload: dict[str, Any], attribution: dict[str, str]
+    ) -> dict[str, Any]:
+        if self.publications is None:
+            raise ValueError("owned publication registry is unavailable")
+        publication = self.publications.binding(payload)
+        expected = publication["attribution"]
+        mismatches = [
+            field for field in self.ATTRIBUTION_FIELDS
+            if attribution.get(field) != expected.get(field)
+        ]
+        if mismatches:
+            raise ValueError(
+                "attribution does not match the registered publication receipt: "
+                + ", ".join(mismatches)
+            )
+        return publication
+
+    def ingest_event_strict(self, payload: dict[str, Any]) -> dict[str, Any]:
+        event_type = str(payload.get("event_type") or "").strip().lower()
+        if event_type not in OWNED_OUTCOME_EVENT_TYPES:
+            raise ValueError(
+                "event_type must be one of: " + ", ".join(OWNED_OUTCOME_EVENT_TYPES)
+            )
+        attribution = self._attribution(payload)
+        publication = self._strict_publication(payload, attribution)
+        event = {
+            "contract": "owned_attribution_event_v2",
+            "idempotency_key": self._required_text(
+                payload, "idempotency_key", maximum=300
+            ),
+            "event_type": event_type,
+            **attribution,
+            "journey_id": self._required_text(payload, "journey_id", maximum=300),
+            "occurred_at": self._timestamp(payload, "occurred_at"),
+            "provider_event_id": self._optional_text(
+                payload, "provider_event_id", maximum=300
+            ),
+            "publication_binding": {
+                "contract": OWNED_PUBLICATION_BINDING_CONTRACT,
+                "publication_id": publication["publication_id"],
+                "publication_receipt_sha256": publication[
+                    "publication_receipt_sha256"
+                ],
+            },
+            "metadata": self._metadata(payload),
+        }
+        stored, created = self.store.put_owned_outcome_event(event, publication)
+        return {
+            "status": "created" if created else "idempotent_replay",
+            "created": created,
+            "event": stored,
+        }
+
     def ingest_retention_sample(self, payload: dict[str, Any]) -> dict[str, Any]:
         retained = payload.get("retained_percent")
         if isinstance(retained, bool):
@@ -4199,6 +4679,54 @@ class OwnedOutcomeAttributionService:
             "metadata": self._metadata(payload),
         }
         stored, created = self.store.put_owned_retention_sample(sample)
+        return {
+            "status": "created" if created else "idempotent_replay",
+            "created": created,
+            "sample": stored,
+        }
+
+    def ingest_retention_sample_strict(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        retained = payload.get("retained_percent")
+        if isinstance(retained, bool):
+            raise ValueError("retained_percent must be a number from 0 to 100")
+        try:
+            retained_percent = float(retained)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "retained_percent must be a number from 0 to 100"
+            ) from exc
+        if not math.isfinite(retained_percent) or not 0 <= retained_percent <= 100:
+            raise ValueError("retained_percent must be a number from 0 to 100")
+        attribution = self._attribution(payload)
+        publication = self._strict_publication(payload, attribution)
+        sample = {
+            "contract": "owned_retention_sample_v2",
+            "idempotency_key": self._required_text(
+                payload, "idempotency_key", maximum=300
+            ),
+            **attribution,
+            "measurement_id": self._required_text(
+                payload, "measurement_id", maximum=300
+            ),
+            "journey_id": self._optional_text(payload, "journey_id", maximum=300),
+            "observed_at": self._timestamp(payload, "observed_at"),
+            "elapsed_ms": self._whole_number(payload, "elapsed_ms", minimum=0),
+            "retained_percent": round(retained_percent, 6),
+            "sample_size": self._whole_number(payload, "sample_size", minimum=1),
+            "publication_binding": {
+                "contract": OWNED_PUBLICATION_BINDING_CONTRACT,
+                "publication_id": publication["publication_id"],
+                "publication_receipt_sha256": publication[
+                    "publication_receipt_sha256"
+                ],
+            },
+            "metadata": self._metadata(payload),
+        }
+        stored, created = self.store.put_owned_retention_sample(
+            sample, publication
+        )
         return {
             "status": "created" if created else "idempotent_replay",
             "created": created,
@@ -4382,6 +4910,9 @@ class ContentQualityEngine:
         self.owned_content_metrics = OwnedContentMetricTelemetry(self.store.path)
         self.script_experiments = ScriptExperimentTelemetry(self.store.path)
         self.tape = MarketTapeReader(market_tape_path)
+        self.owned_publications = OwnedPublicationAttributionService(
+            self.store, self.tape
+        )
         self.narrative = NarrativeCoherenceService(self.store, narrative_llm_runner)
         self.viral = ViralTranscriptService(self.tape, self.store)
         self.audience = AudienceIntelligenceService(self.tape, self.store)
@@ -4395,7 +4926,9 @@ class ContentQualityEngine:
         )
         self.attention = AttentionService(self.store)
         self.retention = RetentionService(self.store)
-        self.owned_outcomes = OwnedOutcomeAttributionService(self.store)
+        self.owned_outcomes = OwnedOutcomeAttributionService(
+            self.store, self.owned_publications
+        )
         self.script_intelligence = ScriptIntelligenceService(
             tape=self.tape,
             store=self.store,
@@ -4448,6 +4981,7 @@ class ContentQualityEngine:
                 "audience-intelligence", "viral-transcripts", "evidence-first-scripts",
                 "narrative-coherence", "relatability", "attention", "retention", "learning-memory",
                 "script-intelligence", "owned-outcome-attribution",
+                "owned-publication-attribution-v2",
                 "owned-content-metrics", "transcript-style-guides",
                 "script-experiment-telemetry",
             ],

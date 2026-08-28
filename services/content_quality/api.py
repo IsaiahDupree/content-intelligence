@@ -863,6 +863,55 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                         "use an explicit deterministic fallback when AI is off"
                     ),
                 },
+                "register_owned_publication": {
+                    "method": "POST",
+                    "path": "/api/v2/owned-publications",
+                    "contract": "owned_publication_receipt_v1",
+                    "required": [
+                        "idempotency_key", "content_id", "campaign_id",
+                        "offer_id", "local_asset_path", "local_asset_sha256",
+                        "source_platform", "account_id", "publisher",
+                        "provider_post_id", "provider_post_url", "published_at",
+                        "provider_receipt_id", "provider_receipt_sha256",
+                        "provider_receipt",
+                    ],
+                    "effect": (
+                        "bind one canonical semantic asset and exact local SHA to "
+                        "one terminal native provider post receipt"
+                    ),
+                },
+                "owned_publication_readiness": {
+                    "method": "GET",
+                    "path": "/api/v2/owned-publications/{publication_id}/readiness",
+                    "required": ["publication_receipt_sha256"],
+                    "effect": (
+                        "report whether the publication has its first strictly "
+                        "bound owned click or retention fact"
+                    ),
+                },
+                "ingest_owned_outcome_event_v2": {
+                    "method": "POST",
+                    "path": "/api/v2/owned-outcomes/events",
+                    "contract": "owned_attribution_event_v2",
+                    "required": [
+                        "publication_id", "publication_receipt_sha256",
+                        "idempotency_key", "event_type", "attribution",
+                        "journey_id", "occurred_at",
+                    ],
+                    "effect": "fail closed unless attribution matches the publication receipt",
+                },
+                "ingest_owned_retention_sample_v2": {
+                    "method": "POST",
+                    "path": "/api/v2/owned-outcomes/retention-samples",
+                    "contract": "owned_retention_sample_v2",
+                    "required": [
+                        "publication_id", "publication_receipt_sha256",
+                        "idempotency_key", "attribution", "measurement_id",
+                        "observed_at", "elapsed_ms", "retained_percent",
+                        "sample_size",
+                    ],
+                    "effect": "fail closed unless attribution matches the publication receipt",
+                },
                 "ingest_owned_outcome_event": {
                     "method": "POST",
                     "path": "/api/owned-outcomes/events",
@@ -1128,6 +1177,135 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             )
             if request.args.get(field) is not None
         }
+
+    @app.post("/api/v2/owned-publications")
+    def register_owned_publication():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = engine.owned_publications.register(payload)
+        except IdempotencyConflict as error:
+            result = {
+                "status": "error",
+                "code": "IDEMPOTENCY_KEY_CONFLICT",
+                "error": str(error),
+            }
+            return audited_agent_response(
+                "register_owned_publication", payload, result, 409, started
+            )
+        except ValueError as error:
+            return audited_invalid_request(
+                "register_owned_publication", payload, error, started
+            )
+        return audited_agent_response(
+            "register_owned_publication", payload, result,
+            201 if result["created"] else 200, started,
+        )
+
+    @app.get("/api/v2/owned-publications")
+    def list_owned_publications():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        parameters = request.args.to_dict(flat=True)
+        try:
+            limit = max(1, min(500, int(request.args.get("limit", "100"))))
+            filters = {
+                field: request.args.get(field)
+                for field in (
+                    "content_id", "campaign_id", "offer_id", "source_platform",
+                    "source_id", "account_id", "publication_id",
+                )
+                if request.args.get(field) is not None
+            }
+            rows = engine.store.owned_publications(filters, limit=limit)
+        except ValueError as error:
+            return audited_invalid_request(
+                "list_owned_publications", parameters, error, started
+            )
+        result = {
+            "status": "ok",
+            "contract": "owned_publication_receipt_v1",
+            "publications": rows,
+            "count": len(rows),
+            "limit": limit,
+        }
+        return audited_agent_response(
+            "list_owned_publications", {**filters, "limit": limit}, result,
+            started_at=started,
+        )
+
+    @app.get("/api/v2/owned-publications/<publication_id>/readiness")
+    def owned_publication_readiness(publication_id: str):
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = {
+            "publication_id": publication_id,
+            "publication_receipt_sha256": request.args.get(
+                "publication_receipt_sha256"
+            ),
+        }
+        try:
+            result = engine.owned_publications.readiness(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "owned_publication_readiness", payload, error, started
+            )
+        return audited_agent_response(
+            "owned_publication_readiness", payload, result, started_at=started
+        )
+
+    def strict_owned_outcome_response(
+        *,
+        operation: str,
+        callback: Any,
+    ) -> tuple[Any, int]:
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            result = callback(payload)
+        except IdempotencyConflict as error:
+            result = {
+                "status": "error",
+                "code": "IDEMPOTENCY_KEY_CONFLICT",
+                "error": str(error),
+            }
+            return audited_agent_response(
+                operation, payload, result, 409, started
+            )
+        except ValueError as error:
+            return audited_invalid_request(
+                operation, payload, error, started
+            )
+        return audited_agent_response(
+            operation, payload, result,
+            201 if result["created"] else 200, started,
+        )
+
+    @app.post("/api/v2/owned-outcomes/events")
+    def ingest_owned_outcome_event_v2():
+        return strict_owned_outcome_response(
+            operation="ingest_owned_outcome_event_v2",
+            callback=engine.owned_outcomes.ingest_event_strict,
+        )
+
+    @app.post("/api/v2/owned-outcomes/retention-samples")
+    def ingest_owned_retention_sample_v2():
+        return strict_owned_outcome_response(
+            operation="ingest_owned_retention_sample_v2",
+            callback=engine.owned_outcomes.ingest_retention_sample_strict,
+        )
 
     @app.post("/api/owned-outcomes/events")
     def ingest_owned_outcome_event():
