@@ -20,6 +20,7 @@ from .demand_client import MarketTapeDemandClient
 from .engine import ContentQualityEngine, IdempotencyConflict
 from .marketing_scripts import MarketingScriptCompiler
 from .narrative_coherence import default_llm_runner, openai_llm_runner
+from .owned_content_metrics import register_owned_content_metric_routes
 from .reference_corpus import (
     MAX_CORPUS_ITEMS,
     MAX_ITEM_PAGE_SIZE,
@@ -75,6 +76,9 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     )
     app.extensions["market_tape_demand_client"] = demand_client
     app.extensions["content_quality_engine"] = engine
+    app.extensions["owned_content_metric_telemetry"] = (
+        engine.owned_content_metrics
+    )
     script_experiments = engine.script_experiments
     app.extensions["script_experiment_telemetry"] = script_experiments
     reference_reader = app.config.get("REFERENCE_SOURCE_READER")
@@ -124,6 +128,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             "script_intelligence": {"status": "checking", "gaps": ["health_sweep_pending"]},
             "script_language_demand_feedback": {"status": "checking"},
             "owned_retention": {"status": "checking"},
+            "owned_content_metrics": {"status": "checking"},
         },
         "ai_readiness": {
             "narrative_judge_configured": False,
@@ -357,6 +362,14 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     register_script_experiment_routes(
         app,
         script_experiments,
+        json_body=json_body,
+        require_auth=require_agent_auth,
+        audited_response=audited_agent_response,
+        invalid_response=audited_invalid_request,
+    )
+    register_owned_content_metric_routes(
+        app,
+        engine.owned_content_metrics,
         json_body=json_body,
         require_auth=require_agent_auth,
         audited_response=audited_agent_response,
@@ -894,6 +907,42 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                         "AI explanations are labelled interpretation_not_fact"
                     ),
                 },
+                "ingest_owned_content_metric": {
+                    "method": "POST",
+                    "path": "/api/owned-content-metrics/snapshots",
+                    "contract": "owned_content_metric_snapshot_v1",
+                    "required": [
+                        "idempotency_key", "measurement_status", "scope",
+                        "attribution", "provider_name", "observed_at",
+                    ],
+                    "status_semantics": {
+                        "observed": "metrics required; zero is a real value",
+                        "unavailable": "metrics forbidden; reason required",
+                        "not_supported": "metrics forbidden; reason required",
+                        "deleted": "metrics forbidden; reason required",
+                    },
+                },
+                "ingest_owned_content_metric_batch": {
+                    "method": "POST",
+                    "path": "/api/owned-content-metrics/snapshots/batch",
+                    "contract": "owned_content_metric_snapshot_batch_v1",
+                    "required": ["snapshots"],
+                    "bounds": {"snapshots": [1, 500]},
+                    "effect": "atomic append-only ingest",
+                },
+                "list_owned_content_metrics": {
+                    "method": "GET",
+                    "path": "/api/owned-content-metrics/snapshots",
+                    "bounds": {"limit": [1, 2000]},
+                },
+                "summarize_owned_content_metrics": {
+                    "method": "GET",
+                    "path": "/api/owned-content-metrics/summary",
+                    "measurement": (
+                        "latest cumulative observation per provider entity; "
+                        "unavailable is never coerced to zero"
+                    ),
+                },
                 "register_script_experiment": {
                     "method": "POST",
                     "path": "/api/script-experiments",
@@ -905,6 +954,15 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "effect": (
                         "derive and persist one immutable experiment ID from "
                         "script and workflow lineage"
+                    ),
+                    "optional_metadata_contracts": {
+                        "content_factor_vector": "content_factor_vector_v2"
+                    },
+                    "factor_sentinels": ["none", "unrealized"],
+                    "factor_lineage": (
+                        "realized vectors carry the exact planned factors and "
+                        "planned digest; semantic, audience, funnel, structure, "
+                        "format, platform, and offer dimensions are immutable"
                     ),
                 },
                 "ingest_script_experiment_metrics": {
@@ -933,6 +991,28 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                         "latest cumulative count per post and metric; "
                         "denominator-weighted descriptive rates"
                     ),
+                },
+                "rollup_script_experiment_factors": {
+                    "method": "GET",
+                    "path": "/api/v2/script-experiments/factor-rollup",
+                    "required": ["dimension"],
+                    "required_one_of": [
+                        ["experiment_id"], ["script_id"], ["workflow_id"]
+                    ],
+                    "dimensions": [
+                        "topic_id", "atomic_subject_id", "audience_id",
+                        "audience_intent_id", "funnel_stage_id", "angle_id",
+                        "central_idea_id", "evidence_set_id",
+                        "narrative_structure_id", "delivery_format_id",
+                        "platform_id", "offer_id", "hook_hypothesis_id",
+                        "hook_id", "script_body_id", "cta_id",
+                        "delivery_plan_id", "visual_plan_id"
+                    ],
+                    "causal_policy": "descriptive_observational_only",
+                    "bounds": {
+                        "maximum_experiments": 5000,
+                        "maximum_snapshots": 100000
+                    }
                 },
                 "reference_corpus_status": {
                     "method": "GET",

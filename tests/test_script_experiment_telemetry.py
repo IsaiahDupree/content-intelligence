@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from contextlib import closing
 
@@ -19,6 +20,78 @@ SCRIPT_TEXT = (
     "I lost three hours rebuilding a follow-up that should have taken ten "
     "minutes. Here is the exact handoff that fixed it."
 )
+FACTOR_NAMES = (
+    "topic_id",
+    "atomic_subject_id",
+    "audience_id",
+    "audience_intent_id",
+    "funnel_stage_id",
+    "angle_id",
+    "central_idea_id",
+    "evidence_set_id",
+    "narrative_structure_id",
+    "delivery_format_id",
+    "platform_id",
+    "offer_id",
+    "hook_hypothesis_id",
+    "hook_id",
+    "script_body_id",
+    "cta_id",
+    "delivery_plan_id",
+    "visual_plan_id",
+)
+
+
+def factor_vector(**overrides):
+    factors = {name: f"{name}-base" for name in FACTOR_NAMES}
+    factors.update(overrides)
+    core = {
+        "contract_type": "content_factor_vector_v2",
+        "factors": factors,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            core,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+    ).hexdigest()
+    return {**core, "factor_vector_sha256": digest}
+
+
+def realized_factor_vector(**overrides):
+    planned = factor_vector(
+        hook_id="unrealized",
+        script_body_id="unrealized",
+        delivery_plan_id="unrealized",
+        visual_plan_id="unrealized",
+    )
+    factors = dict(planned["factors"])
+    factors.update({
+        "hook_id": "hook-realized",
+        "script_body_id": "script-realized",
+        "delivery_plan_id": "delivery-realized",
+        "visual_plan_id": "visual-realized",
+        **overrides,
+    })
+    core = {
+        "contract_type": "content_factor_vector_v2",
+        "factors": factors,
+    }
+    return {
+        **core,
+        "planned_factors": planned["factors"],
+        "planned_factor_vector_sha256": planned["factor_vector_sha256"],
+        "factor_vector_sha256": hashlib.sha256(
+            json.dumps(
+                core,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        ).hexdigest(),
+    }
 
 
 @pytest.fixture()
@@ -409,3 +482,290 @@ def test_idempotency_and_provider_post_attribution_are_immutable(app, client):
             )
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute("DELETE FROM cq_script_experiment_posts")
+
+
+def test_factor_vector_is_validated_and_remains_immutable(client):
+    vector = factor_vector(hook_id="hook-control")
+    experiment = register(
+        client,
+        metadata={"content_factor_vector": vector},
+    )
+    assert experiment["metadata"]["content_factor_vector"] == vector
+
+    invalid = factor_vector()
+    invalid["factors"].pop("angle_id")
+    response = client.post(
+        "/api/script-experiments",
+        json=experiment_payload(
+            script_id="script-invalid-factor",
+            metadata={"content_factor_vector": invalid},
+        ),
+        headers=HEADERS,
+    )
+    assert response.status_code == 400
+    assert "missing factor dimensions" in response.get_json()["error"]
+
+    semantic_drift = realized_factor_vector(
+        central_idea_id="idea-different"
+    )
+    response = client.post(
+        "/api/script-experiments",
+        json=experiment_payload(
+            script_id="script-factor-lineage-drift",
+            metadata={"content_factor_vector": semantic_drift},
+        ),
+        headers=HEADERS,
+    )
+    assert response.status_code == 400
+    assert "immutable dimensions" in response.get_json()["error"]
+
+    changed = client.post(
+        "/api/script-experiments",
+        json=experiment_payload(
+            metadata={
+                "content_factor_vector": factor_vector(
+                    hook_id="hook-challenger"
+                )
+            },
+        ),
+        headers=HEADERS,
+    )
+    assert changed.status_code == 409
+    assert "different immutable payload" in changed.get_json()["error"]
+
+
+def test_factor_rollup_groups_latest_provider_outcomes_without_causal_claim(
+    client,
+):
+    workflow_id = "workflow-factor-rollup-001"
+    control = register(
+        client,
+        script_id="script-factor-control",
+        script_text=SCRIPT_TEXT + " Control ending.",
+        workflow_id=workflow_id,
+        metadata={
+            "content_factor_vector": factor_vector(hook_id="hook-control")
+        },
+    )
+    treatment = register(
+        client,
+        script_id="script-factor-treatment",
+        script_text=SCRIPT_TEXT + " Treatment ending.",
+        workflow_id=workflow_id,
+        metadata={
+            "content_factor_vector": factor_vector(hook_id="hook-treatment")
+        },
+    )
+    control_metric = metric_payload(
+        control["experiment_id"],
+        "factor-control-snapshot",
+        "2026-08-25T12:00:00Z",
+        {
+            "views": 100,
+            "hold_1s_views": 80,
+            "hold_3s_views": 60,
+            "completed_views": 25,
+            "shares": 4,
+            "saves": 3,
+        },
+        post_id="factor-control-post",
+    )
+    treatment_metric = metric_payload(
+        treatment["experiment_id"],
+        "factor-treatment-snapshot",
+        "2026-08-25T12:00:00Z",
+        {
+            "views": 200,
+            "hold_1s_views": 180,
+            "hold_3s_views": 150,
+            "completed_views": 100,
+            "shares": 20,
+            "saves": 12,
+        },
+        post_id="factor-treatment-post",
+    )
+    for payload in (control_metric, treatment_metric):
+        assert client.post(
+            "/api/script-experiments/metrics",
+            json=payload,
+            headers=HEADERS,
+        ).status_code == 201
+
+    response = client.get(
+        "/api/v2/script-experiments/factor-rollup"
+        f"?workflow_id={workflow_id}&dimension=hook_id",
+        headers=HEADERS,
+    )
+    assert response.status_code == 200
+    result = response.get_json()
+    assert result["contract"] == "script_factor_rollup_v2"
+    assert result["dimension"] == "hook_id"
+    assert result["group_count"] == 2
+    groups = {row["factor_value"]: row for row in result["groups"]}
+    assert groups["hook-control"]["totals"]["views"] == 100
+    assert groups["hook-control"]["rates"]["hold_3s"]["rate"] == 0.6
+    assert groups["hook-treatment"]["totals"]["views"] == 200
+    assert groups["hook-treatment"]["rates"]["hold_3s"]["rate"] == 0.75
+    assert result["causal_policy"] == {
+        "causal_claim": False,
+        "attribution_type": "descriptive_observational",
+        "note": (
+            "Factor groups describe observed outcomes only. A separate "
+            "controlled design is required to attribute lift."
+        ),
+    }
+
+    unsupported = client.get(
+        "/api/v2/script-experiments/factor-rollup"
+        f"?workflow_id={workflow_id}&dimension=unknown_factor",
+        headers=HEADERS,
+    )
+    assert unsupported.status_code == 400
+
+
+def test_factor_rollup_includes_more_than_five_hundred_experiments(app):
+    service = app.extensions["script_experiment_telemetry"]
+    workflow_id = "workflow-factor-cardinality-001"
+    for index in range(501):
+        service.register_experiment(experiment_payload(
+            script_id=f"script-factor-cardinality-{index:03d}",
+            workflow_id=workflow_id,
+            metadata={
+                "content_factor_vector": factor_vector(
+                    hook_id=f"hook-{index:03d}"
+                )
+            },
+        ))
+
+    result = service.factor_rollup({
+        "workflow_id": workflow_id,
+        "dimension": "hook_id",
+    })
+
+    assert result["experiment_count"] == 501
+    assert result["group_count"] == 501
+    assert {row["factor_value"] for row in result["groups"]} == {
+        f"hook-{index:03d}" for index in range(501)
+    }
+
+
+def test_factor_rollup_excludes_impossible_retention_rates(client):
+    experiment = register(
+        client,
+        script_id="script-factor-quality",
+        workflow_id="workflow-factor-quality",
+        metadata={
+            "content_factor_vector": factor_vector(hook_id="hook-quality")
+        },
+    )
+    older = metric_payload(
+        experiment["experiment_id"],
+        "factor-quality-older",
+        "2026-08-25T12:00:00Z",
+        {"views": 100, "hold_1s_views": 80},
+        post_id="factor-quality-post",
+    )
+    newer = metric_payload(
+        experiment["experiment_id"],
+        "factor-quality-newer",
+        "2026-08-25T13:00:00Z",
+        {"views": 50},
+        post_id="factor-quality-post",
+    )
+    for payload in (older, newer):
+        assert client.post(
+            "/api/script-experiments/metrics",
+            json=payload,
+            headers=HEADERS,
+        ).status_code == 201
+
+    result = client.get(
+        "/api/v2/script-experiments/factor-rollup"
+        "?workflow_id=workflow-factor-quality&dimension=hook_id",
+        headers=HEADERS,
+    ).get_json()
+    group = result["groups"][0]
+
+    assert group["rates"]["hold_1s"]["status"] == "invalid_metric_counts"
+    assert group["rates"]["hold_1s"]["rate"] is None
+    assert group["rates"]["hold_1s"][
+        "posts_excluded_for_invalid_counts"
+    ] == 1
+    assert group["data_quality"]["status"] == "review"
+    assert group["data_quality"]["warnings"][0]["code"] == (
+        "RETENTION_COUNT_EXCEEDS_VIEWS"
+    )
+
+
+def test_factor_rollup_reports_invalid_legacy_vectors_without_failing(app):
+    service = app.extensions["script_experiment_telemetry"]
+    script_id = "script-legacy-factor"
+    workflow_id = "workflow-legacy-factor"
+    script_sha256 = hashlib.sha256(SCRIPT_TEXT.encode()).hexdigest()
+    experiment_id = stable_experiment_id(
+        brief_id="brief-legacy-factor",
+        script_id=script_id,
+        script_sha256=script_sha256,
+        workflow_seed=workflow_id,
+    )
+    record = {
+        "contract": "script_experiment_v1",
+        "experiment_id": experiment_id,
+        "brief_id": "brief-legacy-factor",
+        "script_id": script_id,
+        "script_sha256": script_sha256,
+        "workflow_seed": workflow_id,
+        "workflow_id": workflow_id,
+        "generation_contract": "legacy_contract",
+        "metadata": {
+            "content_factor_vector": {
+                "contract_type": "content_factor_vector_v1"
+            }
+        },
+    }
+    payload_json = json.dumps(
+        record,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    with closing(sqlite3.connect(service.path)) as connection:
+        connection.execute(
+            """
+            INSERT INTO cq_script_experiments(
+                experiment_id, contract, brief_id, script_id,
+                script_sha256, workflow_seed, workflow_id,
+                generation_contract, identity_sha256, payload_sha256,
+                payload_json, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                experiment_id,
+                "script_experiment_v1",
+                "brief-legacy-factor",
+                script_id,
+                script_sha256,
+                workflow_id,
+                workflow_id,
+                "legacy_contract",
+                "0" * 64,
+                hashlib.sha256(payload_json.encode()).hexdigest(),
+                payload_json,
+                "2026-08-25T12:00:00+00:00",
+            ),
+        )
+        connection.commit()
+
+    result = service.factor_rollup({
+        "workflow_id": workflow_id,
+        "dimension": "hook_id",
+    })
+
+    assert result["status"] == "ok"
+    assert result["groups"] == []
+    assert result["invalid_factor_experiments"] == [{
+        "experiment_id": experiment_id,
+        "reason": (
+            "content factor contract must be content_factor_vector_v2"
+        ),
+    }]

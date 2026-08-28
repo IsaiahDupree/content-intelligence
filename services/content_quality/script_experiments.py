@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Append-only transcript experiment identity and outcome telemetry."""
+
+from __future__ import annotations
 
 import hashlib
 import json
@@ -19,7 +19,39 @@ UTC = timezone.utc
 EXPERIMENT_CONTRACT = "script_experiment_v1"
 METRIC_SNAPSHOT_CONTRACT = "script_metric_snapshot_v1"
 METRIC_ROLLUP_CONTRACT = "script_metric_rollup_v1"
+FACTOR_VECTOR_CONTRACT = "content_factor_vector_v2"
+FACTOR_ROLLUP_CONTRACT = "script_factor_rollup_v2"
 IDENTITY_CONTRACT = "script_experiment_identity_v1"
+FACTOR_DIMENSIONS = (
+    "topic_id",
+    "atomic_subject_id",
+    "audience_id",
+    "audience_intent_id",
+    "funnel_stage_id",
+    "angle_id",
+    "central_idea_id",
+    "evidence_set_id",
+    "narrative_structure_id",
+    "delivery_format_id",
+    "platform_id",
+    "offer_id",
+    "hook_hypothesis_id",
+    "hook_id",
+    "script_body_id",
+    "cta_id",
+    "delivery_plan_id",
+    "visual_plan_id",
+)
+REALIZED_FACTOR_DIMENSIONS = {
+    "hook_id",
+    "script_body_id",
+    "cta_id",
+    "delivery_plan_id",
+    "visual_plan_id",
+}
+IMMUTABLE_FACTOR_DIMENSIONS = set(FACTOR_DIMENSIONS).difference(
+    REALIZED_FACTOR_DIMENSIONS
+)
 SUPPORTED_PLATFORMS = (
     "facebook",
     "instagram",
@@ -62,6 +94,8 @@ DENOMINATOR_BASES = (
     "video_starts",
 )
 RATE_ELIGIBLE_DENOMINATOR_BASIS = "video_starts"
+MAX_FACTOR_ROLLUP_EXPERIMENTS = 5_000
+MAX_FACTOR_ROLLUP_SNAPSHOTS = 100_000
 PLATFORM_ALIASES = {
     "facebook_reels": "facebook",
     "instagram_reels": "instagram",
@@ -194,6 +228,108 @@ def _metadata(payload: dict[str, Any]) -> dict[str, Any]:
     if len(_canonical_json(value).encode("utf-8")) > 32_768:
         raise ValueError("metadata must be at most 32768 encoded bytes")
     return value
+
+
+def _content_factor_vector(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    raw = metadata.get("content_factor_vector")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("metadata.content_factor_vector must be an object")
+    allowed = {
+        "contract_type",
+        "factors",
+        "factor_vector_sha256",
+        "planned_factors",
+        "planned_factor_vector_sha256",
+    }
+    unknown_fields = sorted(set(raw) - allowed)
+    if unknown_fields:
+        raise ValueError(
+            "unknown content factor vector fields: "
+            + ", ".join(unknown_fields)
+        )
+    if raw.get("contract_type") != FACTOR_VECTOR_CONTRACT:
+        raise ValueError(
+            f"content factor contract must be {FACTOR_VECTOR_CONTRACT}"
+        )
+    factors = raw.get("factors")
+    if not isinstance(factors, dict):
+        raise ValueError("content factor vector factors must be an object")
+    unknown = sorted(set(factors) - set(FACTOR_DIMENSIONS))
+    missing = sorted(set(FACTOR_DIMENSIONS) - set(factors))
+    if unknown:
+        raise ValueError("unsupported factor dimensions: " + ", ".join(unknown))
+    if missing:
+        raise ValueError("missing factor dimensions: " + ", ".join(missing))
+    normalized: dict[str, str] = {}
+    for name in FACTOR_DIMENSIONS:
+        value = factors[name]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"factor {name} must be a non-empty string")
+        if len(value.strip()) > 240:
+            raise ValueError(f"factor {name} must be at most 240 characters")
+        normalized[name] = value.strip()
+    core = {
+        "contract_type": FACTOR_VECTOR_CONTRACT,
+        "factors": normalized,
+    }
+    expected = _canonical_sha256(core)
+    supplied = _validated_sha256(
+        raw.get("factor_vector_sha256"), "factor_vector_sha256"
+    )
+    if supplied != expected:
+        raise ValueError("factor_vector_sha256 does not match factors")
+    result = {**core, "factor_vector_sha256": expected}
+    planned = raw.get("planned_factor_vector_sha256")
+    planned_factors = raw.get("planned_factors")
+    if (planned in (None, "")) != (planned_factors is None):
+        raise ValueError(
+            "planned factors and their SHA-256 must be supplied together"
+        )
+    if planned_factors is not None:
+        if not isinstance(planned_factors, dict):
+            raise ValueError("planned_factors must be an object")
+        if set(planned_factors) != set(FACTOR_DIMENSIONS):
+            raise ValueError(
+                "planned_factors must contain the exact factor dimensions"
+            )
+        normalized_planned: dict[str, str] = {}
+        for name in FACTOR_DIMENSIONS:
+            value = planned_factors[name]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"planned factor {name} must be a non-empty string"
+                )
+            if len(value.strip()) > 240:
+                raise ValueError(
+                    f"planned factor {name} must be at most 240 characters"
+                )
+            normalized_planned[name] = value.strip()
+        planned_sha256 = _validated_sha256(
+            planned, "planned_factor_vector_sha256"
+        )
+        planned_core = {
+            "contract_type": FACTOR_VECTOR_CONTRACT,
+            "factors": normalized_planned,
+        }
+        if _canonical_sha256(planned_core) != planned_sha256:
+            raise ValueError(
+                "planned factor SHA-256 does not match planned_factors"
+            )
+        changed_immutable = sorted(
+            dimension
+            for dimension in IMMUTABLE_FACTOR_DIMENSIONS
+            if normalized[dimension] != normalized_planned[dimension]
+        )
+        if changed_immutable:
+            raise ValueError(
+                "realized factors changed immutable dimensions: "
+                + ", ".join(changed_immutable)
+            )
+        result["planned_factors"] = normalized_planned
+        result["planned_factor_vector_sha256"] = planned_sha256
+    return result
 
 
 def _snake_case(value: str) -> str:
@@ -556,6 +692,39 @@ class ScriptExperimentTelemetry:
             raise ValueError(
                 "experiment_id does not match immutable script/workflow lineage"
             )
+        metadata = _metadata(payload)
+        generation_contract = _optional_text(
+            payload, "generation_contract", maximum=160
+        )
+        raw_record = {
+            "contract": EXPERIMENT_CONTRACT,
+            "experiment_id": experiment_id,
+            "brief_id": identity["brief_id"],
+            "script_id": identity["script_id"],
+            "script_sha256": identity["script_sha256"],
+            "workflow_seed": identity["workflow_seed"],
+            "workflow_id": identity["workflow_id"] or None,
+            "generation_contract": generation_contract,
+            "metadata": metadata,
+        }
+        raw_payload_sha256 = _sha256_text(_canonical_json(raw_record))
+        with closing(self.connect()) as connection:
+            current = connection.execute(
+                "SELECT * FROM cq_script_experiments WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+        if (
+            current is not None
+            and str(current["payload_sha256"]) == raw_payload_sha256
+        ):
+            return {
+                "status": "idempotent_replay",
+                "created": False,
+                "experiment": self._decode_experiment(current),
+            }
+        factor_vector = _content_factor_vector(metadata)
+        if factor_vector is not None:
+            metadata = {**metadata, "content_factor_vector": factor_vector}
         record = {
             "contract": EXPERIMENT_CONTRACT,
             "experiment_id": experiment_id,
@@ -564,10 +733,8 @@ class ScriptExperimentTelemetry:
             "script_sha256": identity["script_sha256"],
             "workflow_seed": identity["workflow_seed"],
             "workflow_id": identity["workflow_id"] or None,
-            "generation_contract": _optional_text(
-                payload, "generation_contract", maximum=160
-            ),
-            "metadata": _metadata(payload),
+            "generation_contract": generation_contract,
+            "metadata": metadata,
         }
         identity_sha256 = _canonical_sha256(
             {
@@ -879,9 +1046,17 @@ class ScriptExperimentTelemetry:
             for key, values in posts.items()
             if numerator_metric in values and denominator_metric in values
         ]
+        invalid_counts = [
+            (key, values)
+            for key, values in candidates
+            if numerator_metric in RETENTION_METRICS
+            and values[numerator_metric] > values[denominator_metric]
+        ]
+        invalid_keys = {key for key, _ in invalid_counts}
         eligible = [
             values
             for key, values in candidates
+            if key not in invalid_keys
             if bases.get(key, {}).get(numerator_metric)
             == RATE_ELIGIBLE_DENOMINATOR_BASIS
             and bases.get(key, {}).get(denominator_metric)
@@ -893,22 +1068,29 @@ class ScriptExperimentTelemetry:
             status = "observed"
         elif eligible:
             status = "zero_eligible_denominator"
+        elif invalid_counts:
+            status = "invalid_metric_counts"
         elif candidates:
             status = "denominator_basis_not_eligible"
         else:
             status = "metric_not_reported_with_denominator"
-        return {
+        result = {
             "status": status,
             "numerator": numerator,
             "eligible_denominator": denominator,
             "denominator_metric": denominator_metric,
             "rate": round(numerator / denominator, 6) if denominator else None,
             "posts_with_numerator_and_denominator": len(eligible),
-            "posts_excluded_for_denominator_basis": len(candidates) - len(eligible),
+            "posts_excluded_for_denominator_basis": (
+                len(candidates) - len(invalid_counts) - len(eligible)
+            ),
             "required_denominator_basis": RATE_ELIGIBLE_DENOMINATOR_BASIS,
             "aggregation": "denominator_weighted",
             "causal_claim": False,
         }
+        if invalid_counts:
+            result["posts_excluded_for_invalid_counts"] = len(invalid_counts)
+        return result
 
     def rollup(self, filters: dict[str, Any]) -> dict[str, Any]:
         scope = self._filters(filters)
@@ -1037,6 +1219,230 @@ class ScriptExperimentTelemetry:
                 "note": (
                     "These are descriptive observed outcomes. Attribute causal "
                     "lift only through a separately designed experiment."
+                ),
+            },
+        }
+
+    def factor_rollup(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """Group descriptive outcomes by one immutable content factor."""
+
+        if not isinstance(filters, dict):
+            raise ValueError("factor rollup filters must be an object")
+        dimension = _required_text(filters, "dimension", maximum=80)
+        if dimension not in FACTOR_DIMENSIONS:
+            raise ValueError(
+                "dimension must be one of: " + ", ".join(FACTOR_DIMENSIONS)
+            )
+        scope = self._filters(
+            {key: value for key, value in filters.items() if key != "dimension"}
+        )
+        experiment_clauses: list[str] = []
+        experiment_values: list[str] = []
+        for field in (
+            "experiment_id", "script_id", "brief_id", "workflow_id"
+        ):
+            if field in scope:
+                experiment_clauses.append(f"{field}=?")
+                experiment_values.append(scope[field])
+        with closing(self.connect()) as connection:
+            experiment_rows = connection.execute(
+                f"""SELECT * FROM cq_script_experiments
+                    WHERE {' AND '.join(experiment_clauses)}
+                    ORDER BY created_at DESC
+                    LIMIT ?""",
+                (*experiment_values, MAX_FACTOR_ROLLUP_EXPERIMENTS + 1),
+            ).fetchall()
+        if len(experiment_rows) > MAX_FACTOR_ROLLUP_EXPERIMENTS:
+            raise ValueError(
+                "factor rollup scope exceeds the experiment limit; "
+                "narrow the workflow, script, or experiment scope"
+            )
+        experiments = [
+            self._decode_experiment(row) for row in experiment_rows
+        ]
+        factor_by_experiment: dict[str, str] = {}
+        missing_factor_experiment_ids: list[str] = []
+        invalid_factor_experiments: list[dict[str, str]] = []
+        for experiment in experiments:
+            experiment_id = str(experiment["experiment_id"])
+            try:
+                vector = _content_factor_vector(
+                    experiment.get("metadata") or {}
+                )
+            except ValueError as exc:
+                invalid_factor_experiments.append({
+                    "experiment_id": experiment_id,
+                    "reason": str(exc),
+                })
+                continue
+            if vector is None:
+                missing_factor_experiment_ids.append(experiment_id)
+                continue
+            factor_by_experiment[experiment_id] = vector["factors"][dimension]
+
+        where, values = self._snapshot_query(scope)
+        with closing(self.connect()) as connection:
+            snapshot_count = int(connection.execute(
+                f"""SELECT COUNT(*)
+                    FROM cq_script_metric_snapshots snapshots
+                    JOIN cq_script_experiments experiments
+                      ON experiments.experiment_id=snapshots.experiment_id
+                    WHERE {where}""",
+                values,
+            ).fetchone()[0])
+            if snapshot_count > MAX_FACTOR_ROLLUP_SNAPSHOTS:
+                raise ValueError(
+                    "factor rollup scope exceeds the snapshot limit; "
+                    "narrow the workflow, script, or experiment scope"
+                )
+            rows = connection.execute(
+                f"""SELECT snapshots.*
+                    FROM cq_script_metric_snapshots snapshots
+                    JOIN cq_script_experiments experiments
+                      ON experiments.experiment_id=snapshots.experiment_id
+                    WHERE {where}
+                    ORDER BY snapshots.observed_at ASC,
+                             snapshots.created_at ASC,
+                             snapshots.snapshot_id ASC""",
+                values,
+            ).fetchall()
+
+        latest_by_post: dict[tuple[str, str, str], dict[str, int]] = {}
+        latest_at_by_metric: dict[tuple[str, str, str], dict[str, str]] = {}
+        latest_basis_by_metric: dict[
+            tuple[str, str, str], dict[str, str]
+        ] = {}
+        for row in rows:
+            experiment_id = str(row["experiment_id"])
+            if experiment_id not in factor_by_experiment:
+                continue
+            key = (
+                experiment_id,
+                str(row["source_platform"]),
+                str(row["provider_post_id"]),
+            )
+            values_by_metric = latest_by_post.setdefault(key, {})
+            timestamps = latest_at_by_metric.setdefault(key, {})
+            bases = latest_basis_by_metric.setdefault(key, {})
+            observed_at = str(row["observed_at"])
+            for metric, value in json.loads(str(row["metrics_json"])).items():
+                if observed_at >= timestamps.get(metric, ""):
+                    values_by_metric[metric] = int(value)
+                    timestamps[metric] = observed_at
+                    bases[metric] = str(row["view_denominator_basis"])
+
+        grouped_experiments: dict[str, list[str]] = {}
+        for experiment_id, factor_value in factor_by_experiment.items():
+            grouped_experiments.setdefault(factor_value, []).append(experiment_id)
+        groups: list[dict[str, Any]] = []
+        for factor_value in sorted(grouped_experiments):
+            experiment_ids = sorted(grouped_experiments[factor_value])
+            selected_ids = set(experiment_ids)
+            posts = {
+                key: value
+                for key, value in latest_by_post.items()
+                if key[0] in selected_ids
+            }
+            bases = {
+                key: value
+                for key, value in latest_basis_by_metric.items()
+                if key[0] in selected_ids
+            }
+            totals = {
+                metric: sum(
+                    item.get(metric, 0) for item in posts.values()
+                )
+                for metric in COUNT_METRICS
+            }
+            quality_warnings: list[dict[str, str]] = []
+            for key, item in posts.items():
+                views = item.get("views")
+                if views is None:
+                    continue
+                for metric in RETENTION_METRICS:
+                    if item.get(metric, 0) > views:
+                        quality_warnings.append({
+                            "experiment_id": key[0],
+                            "source_platform": key[1],
+                            "provider_post_id": key[2],
+                            "metric": metric,
+                            "code": "RETENTION_COUNT_EXCEEDS_VIEWS",
+                        })
+            groups.append(
+                {
+                    "factor_value": factor_value,
+                    "experiment_ids": experiment_ids,
+                    "experiment_count": len(experiment_ids),
+                    "metric_snapshot_count": sum(
+                        str(row["experiment_id"]) in selected_ids for row in rows
+                    ),
+                    "post_count": len(posts),
+                    "totals": totals,
+                    "rates": {
+                        "hold_1s": self._rate(
+                            posts, bases, "hold_1s_views"
+                        ),
+                        "hold_3s": self._rate(
+                            posts, bases, "hold_3s_views"
+                        ),
+                        "hold_3s_from_1s": self._rate(
+                            posts,
+                            bases,
+                            "hold_3s_views",
+                            "hold_1s_views",
+                        ),
+                        "completion": self._rate(
+                            posts, bases, "completed_views"
+                        ),
+                        "cta": {
+                            metric.removeprefix("cta_"): self._rate(
+                                posts, bases, metric
+                            )
+                            for metric in CTA_METRICS
+                        },
+                    },
+                    "coverage": {
+                        metric: {
+                            "posts_reporting": sum(
+                                metric in item for item in posts.values()
+                            ),
+                            "total_posts": len(posts),
+                        }
+                        for metric in COUNT_METRICS
+                    },
+                    "data_quality": {
+                        "status": (
+                            "pass" if not quality_warnings else "review"
+                        ),
+                        "warnings": quality_warnings,
+                    },
+                }
+            )
+        return {
+            "status": "ok",
+            "contract": FACTOR_ROLLUP_CONTRACT,
+            "scope": scope,
+            "dimension": dimension,
+            "measurement": (
+                "latest_lifetime_cumulative_snapshot_per_post_and_metric"
+            ),
+            "groups": groups,
+            "group_count": len(groups),
+            "experiment_count": len(experiments),
+            "missing_factor_experiment_ids": sorted(
+                missing_factor_experiment_ids
+            ),
+            "invalid_factor_experiments": invalid_factor_experiments,
+            "limits": {
+                "maximum_experiments": MAX_FACTOR_ROLLUP_EXPERIMENTS,
+                "maximum_snapshots": MAX_FACTOR_ROLLUP_SNAPSHOTS,
+            },
+            "causal_policy": {
+                "causal_claim": False,
+                "attribution_type": "descriptive_observational",
+                "note": (
+                    "Factor groups describe observed outcomes only. A separate "
+                    "controlled design is required to attribute lift."
                 ),
             },
         }
@@ -1221,6 +1627,20 @@ def register_script_experiment_routes(
             "script_experiment_rollup", parameters, result, started_at=started
         )
 
+    def script_factor_rollup():
+        denied = require_auth()
+        if denied:
+            return denied
+        started = clock()
+        parameters = request.args.to_dict(flat=True)
+        try:
+            result = service.factor_rollup(parameters)
+        except ValueError as error:
+            return reject("script_factor_rollup", parameters, error, started)
+        return emit(
+            "script_factor_rollup", parameters, result, started_at=started
+        )
+
     routes = (
         (
             "/api/script-experiments/health",
@@ -1262,6 +1682,12 @@ def register_script_experiment_routes(
             "/api/script-experiments/rollup",
             "script_experiment_rollup",
             script_experiment_rollup,
+            ["GET"],
+        ),
+        (
+            "/api/v2/script-experiments/factor-rollup",
+            "script_factor_rollup",
+            script_factor_rollup,
             ["GET"],
         ),
     )

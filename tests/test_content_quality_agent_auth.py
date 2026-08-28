@@ -16,6 +16,12 @@ AGENT_ENDPOINTS = (
     ("GET", "/api/script-intelligence/briefs/missing-brief", None),
     ("GET", "/api/script-intelligence/scripts/missing-script", None),
     (
+        "GET",
+        "/api/v2/script-experiments/factor-rollup"
+        "?workflow_id=test&dimension=hook_id",
+        None,
+    ),
+    (
         "POST",
         "/api/script-intelligence/generate-and-audit",
         {"brief_id": "missing-brief"},
@@ -114,6 +120,24 @@ def test_successful_agent_reads_append_hash_only_query_audits(tmp_path):
     assert {row[4] for row in rows} == {"success"}
     assert all(len(row[2]) == 64 and len(row[3]) == 64 for row in rows)
     assert all(CONTROL_TOKEN not in str(row) for row in rows)
+
+
+def test_agent_catalog_describes_factor_rollup_contract(tmp_path):
+    client = _production_app(tmp_path).test_client()
+    response = client.get(
+        "/api/agent/catalog",
+        headers={"Authorization": f"Bearer {CONTROL_TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    actions = response.get_json()["oper" + "ations"]
+    factor = actions["rollup_script_experiment_factors"]
+    assert factor["path"] == "/api/v2/script-experiments/factor-rollup"
+    assert factor["causal_policy"] == "descriptive_observational_only"
+    assert factor["bounds"] == {
+        "maximum_experiments": 5000,
+        "maximum_snapshots": 100000,
+    }
 
 
 def test_invalid_qualitative_audit_gets_an_agent_receipt(tmp_path):
