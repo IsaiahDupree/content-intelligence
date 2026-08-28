@@ -17,6 +17,7 @@ from typing import Any, Sequence
 from .ai_relatability import AIRelatabilityAdjudicator, NON_AI_PASS_DECISION
 from .contracts import is_supported_transcript_audit_contract
 from .narrative_coherence import NarrativeCoherenceService
+from .owned_content_metrics import OwnedContentMetricTelemetry
 from .script_experiments import ScriptExperimentTelemetry
 from .script_intelligence import ScriptIntelligenceService
 from .script_quality import (
@@ -1692,6 +1693,7 @@ class QualityStore:
                     "cq_receipts", "cq_scripts", "cq_audits", "cq_retention",
                     "cq_script_briefs", "cq_workflow_runs", "cq_agent_queries",
                     "cq_owned_outcome_events", "cq_owned_retention_samples",
+                    "cq_owned_content_metric_snapshots",
                 )
             }
 
@@ -4377,6 +4379,7 @@ class ContentQualityEngine:
         script_language_demand_enqueuer: Any = None,
     ):
         self.store = QualityStore(quality_db_path)
+        self.owned_content_metrics = OwnedContentMetricTelemetry(self.store.path)
         self.script_experiments = ScriptExperimentTelemetry(self.store.path)
         self.tape = MarketTapeReader(market_tape_path)
         self.narrative = NarrativeCoherenceService(self.store, narrative_llm_runner)
@@ -4445,7 +4448,8 @@ class ContentQualityEngine:
                 "audience-intelligence", "viral-transcripts", "evidence-first-scripts",
                 "narrative-coherence", "relatability", "attention", "retention", "learning-memory",
                 "script-intelligence", "owned-outcome-attribution",
-                "transcript-style-guides", "script-experiment-telemetry",
+                "owned-content-metrics", "transcript-style-guides",
+                "script-experiment-telemetry",
             ],
             "data_readiness": {
                 "script_intelligence": script_intelligence,
@@ -4461,6 +4465,7 @@ class ContentQualityEngine:
                 "owned_retention": {
                     **owned_outcome_readiness,
                 },
+                "owned_content_metrics": self.owned_content_metrics.health(),
                 "script_experiment_telemetry": (
                     self.script_experiments.health()
                 ),
