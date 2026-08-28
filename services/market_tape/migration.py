@@ -17,16 +17,17 @@ from .config import REPO_ROOT, load_runtime_environment
 from .sources.base import sanitize
 
 
-MIGRATION_NAME = "market_tape_v5"
+MIGRATION_NAME = "market_tape_v6"
 MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v1.sql",
     REPO_ROOT / "migrations" / "market_tape_v2_discovery_attributions.sql",
     REPO_ROOT / "migrations" / "market_tape_v3_query_attempts.sql",
     REPO_ROOT / "migrations" / "market_tape_v4_trend_activity.sql",
     REPO_ROOT / "migrations" / "market_tape_v5_observation_quality.sql",
+    REPO_ROOT / "migrations" / "market_tape_v6_semantic_topics.sql",
 )
 MIGRATION_PATH = MIGRATION_PATHS[-1]
-VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v2.sql"
+VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v6.sql"
 MANAGEMENT_API_URL = "https://api.supabase.com"
 
 # The probe columns are deliberately the conflict keys used by the outbox sink.
@@ -49,6 +50,22 @@ MARKET_TAPE_TABLES: Dict[str, str] = {
     "actp_market_source_receipts": "receipt_key",
     "actp_market_source_health": "source_id",
     "actp_market_predictions": "prediction_key",
+    "actp_semantic_topic_graph_versions": "graph_version_id,graph_sha256",
+    "actp_semantic_topic_nodes": "graph_version_id,topic_id",
+    "actp_semantic_topic_edges": "graph_version_id,edge_id",
+    "actp_semantic_signal_candidates": "signal_id",
+    "actp_semantic_signal_bindings": "binding_id",
+    "actp_semantic_resolution_runs": "resolution_run_id",
+    "actp_semantic_topic_observations": "topic_observation_key",
+    "actp_semantic_atomic_topic_selections": "selection_id",
+    "actp_semantic_atomic_selection_sources": (
+        "selection_id,binding_id,topic_observation_key"
+    ),
+    "actp_semantic_content_evidence_receipts": "receipt_id",
+    "actp_semantic_lineage_registrations": "registration_id",
+    "actp_semantic_content_briefs": "brief_id",
+    "actp_semantic_content_assets": "asset_id",
+    "actp_semantic_content_lineage": "lineage_link_id",
 }
 
 APPEND_ONLY_TABLES = {
@@ -57,6 +74,20 @@ APPEND_ONLY_TABLES = {
     "actp_market_discovery_attributions",
     "actp_market_query_attempts",
     "actp_trend_observations",
+    "actp_semantic_topic_graph_versions",
+    "actp_semantic_topic_nodes",
+    "actp_semantic_topic_edges",
+    "actp_semantic_signal_candidates",
+    "actp_semantic_signal_bindings",
+    "actp_semantic_resolution_runs",
+    "actp_semantic_topic_observations",
+    "actp_semantic_atomic_topic_selections",
+    "actp_semantic_atomic_selection_sources",
+    "actp_semantic_content_evidence_receipts",
+    "actp_semantic_lineage_registrations",
+    "actp_semantic_content_briefs",
+    "actp_semantic_content_assets",
+    "actp_semantic_content_lineage",
 }
 
 APPEND_ONLY_TRIGGERS = {
@@ -67,6 +98,76 @@ APPEND_ONLY_TRIGGERS = {
     "actp_market_discovery_attributions": "actp_market_discovery_attributions_no_update",
     "actp_market_query_attempts": "actp_market_query_attempts_no_update",
     "actp_trend_observations": "actp_trend_observations_no_update",
+    "actp_semantic_topic_graph_versions": (
+        "actp_semantic_graph_versions_no_update"
+    ),
+    "actp_semantic_topic_nodes": "actp_semantic_topic_nodes_no_update",
+    "actp_semantic_topic_edges": "actp_semantic_topic_edges_no_update",
+    "actp_semantic_signal_candidates": (
+        "actp_semantic_signal_candidates_no_update"
+    ),
+    "actp_semantic_signal_bindings": (
+        "actp_semantic_signal_bindings_no_update"
+    ),
+    "actp_semantic_resolution_runs": (
+        "actp_semantic_resolution_runs_no_update"
+    ),
+    "actp_semantic_topic_observations": (
+        "actp_semantic_topic_observations_no_update"
+    ),
+    "actp_semantic_atomic_topic_selections": (
+        "actp_semantic_atomic_selections_no_update"
+    ),
+    "actp_semantic_atomic_selection_sources": (
+        "actp_semantic_atomic_sources_no_update"
+    ),
+    "actp_semantic_content_evidence_receipts": (
+        "actp_semantic_evidence_receipts_no_update"
+    ),
+    "actp_semantic_lineage_registrations": (
+        "actp_semantic_lineage_registrations_no_update"
+    ),
+    "actp_semantic_content_briefs": (
+        "actp_semantic_content_briefs_no_update"
+    ),
+    "actp_semantic_content_assets": (
+        "actp_semantic_content_assets_no_update"
+    ),
+    "actp_semantic_content_lineage": (
+        "actp_semantic_content_lineage_no_update"
+    ),
+}
+
+# Cover the semantic foreign-key/access paths flagged by Supabase's index
+# advisor.  These names are deployment invariants checked by verify_database.
+REQUIRED_INDEXES: Dict[str, str] = {
+    "actp_semantic_atomic_sources_observation_idx": (
+        "actp_semantic_atomic_selection_sources"
+    ),
+    "actp_semantic_atomic_sources_signal_idx": (
+        "actp_semantic_atomic_selection_sources"
+    ),
+    "actp_semantic_assets_graph_atomic_idx": "actp_semantic_content_assets",
+    "actp_semantic_assets_parent_idx": "actp_semantic_content_assets",
+    "actp_semantic_briefs_selection_idx": "actp_semantic_content_briefs",
+    "actp_semantic_briefs_registration_idx": "actp_semantic_content_briefs",
+    "actp_semantic_lineage_graph_atomic_idx": "actp_semantic_content_lineage",
+    "actp_semantic_lineage_signal_graph_idx": "actp_semantic_content_lineage",
+    "actp_semantic_lineage_observation_idx": "actp_semantic_content_lineage",
+    "actp_semantic_resolution_graph_selected_idx": (
+        "actp_semantic_resolution_runs"
+    ),
+    "actp_semantic_resolution_signal_graph_idx": (
+        "actp_semantic_resolution_runs"
+    ),
+    "actp_semantic_bindings_signal_graph_idx": "actp_semantic_signal_bindings",
+    "actp_semantic_signals_source_trend_idx": "actp_semantic_signal_candidates",
+    "actp_semantic_observations_binding_fk_idx": (
+        "actp_semantic_topic_observations"
+    ),
+    "actp_semantic_observations_signal_graph_idx": (
+        "actp_semantic_topic_observations"
+    ),
 }
 
 
@@ -113,12 +214,23 @@ def validate_migration(sql: Optional[str] = None) -> Dict[str, Any]:
             lowered,
         )
     )
+    declared_indexes = set(re.findall(
+        r"create\s+index\s+if\s+not\s+exists\s+([a-z0-9_]+)",
+        lowered,
+    ))
+    missing_required_indexes = sorted(set(REQUIRED_INDEXES) - declared_indexes)
     destructive_statements = sorted(set(re.findall(
         r"\b(drop\s+table|truncate\s+table|delete\s+from)\b",
         lowered,
     )))
     state = "ready" if not any(
-        (missing_tables, missing_rls, missing_append_only, destructive_statements)
+        (
+            missing_tables,
+            missing_rls,
+            missing_append_only,
+            missing_required_indexes,
+            destructive_statements,
+        )
     ) else "invalid"
     return {
         "state": state,
@@ -130,6 +242,8 @@ def validate_migration(sql: Optional[str] = None) -> Dict[str, Any]:
         "missing_tables": missing_tables,
         "missing_rls": missing_rls,
         "missing_append_only": missing_append_only,
+        "required_indexes_expected": len(REQUIRED_INDEXES),
+        "missing_required_indexes": missing_required_indexes,
         "destructive_statements": destructive_statements,
     }
 
@@ -311,12 +425,29 @@ class SupabaseMigrationManager:
                     names = []
             if trigger_name not in names:
                 missing_append_only_triggers.append(table)
+        index_names_by_table: Dict[str, set[str]] = {}
+        for table in MARKET_TAPE_TABLES:
+            names = by_table.get(table, {}).get("index_names") or []
+            if isinstance(names, str):
+                try:
+                    names = json.loads(names)
+                except ValueError:
+                    names = []
+            index_names_by_table[table] = {
+                str(name) for name in names if isinstance(name, str)
+            }
+        missing_required_indexes = sorted(
+            index_name
+            for index_name, table in REQUIRED_INDEXES.items()
+            if index_name not in index_names_by_table.get(table, set())
+        )
 
         violations = (
             missing_tables,
             rls_disabled,
             unexpected_rls_policies,
             missing_append_only_triggers,
+            missing_required_indexes,
         )
         return {
             "state": "ready" if not any(violations) else "incomplete",
@@ -330,6 +461,8 @@ class SupabaseMigrationManager:
             "rls_disabled": rls_disabled,
             "unexpected_rls_policies": unexpected_rls_policies,
             "missing_append_only_triggers": missing_append_only_triggers,
+            "required_indexes_expected": len(REQUIRED_INDEXES),
+            "missing_required_indexes": missing_required_indexes,
         }
 
     def remote_counts(self, expected_project_ref: str) -> Dict[str, Any]:

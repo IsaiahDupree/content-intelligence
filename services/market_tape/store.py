@@ -29,7 +29,7 @@ from .predictor import (
 )
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 COUNTER_REGRESSION_FLAG_PREFIX = "counter-regression:"
 ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT = (
     "market_tape_accepted_observation_evidence_v1"
@@ -1152,6 +1152,737 @@ class MarketTapeStore:
                     );
                 END;
 
+                -- V16: durable semantic trend-to-topic graph and audit
+                -- lineage. Raw market labels remain immutable evidence;
+                -- these tables record interpretation without mutating trends
+                -- or collapsing treatments into topics.
+                CREATE TABLE IF NOT EXISTS mt_topic_graph_versions (
+                    graph_version_id TEXT PRIMARY KEY,
+                    graph_contract TEXT NOT NULL,
+                    graph_schema_version TEXT NOT NULL,
+                    graph_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(graph_sha256) = 64
+                    ),
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    imported_by TEXT NOT NULL,
+                    imported_at TEXT NOT NULL,
+                    node_count INTEGER NOT NULL CHECK(node_count > 0),
+                    edge_count INTEGER NOT NULL CHECK(edge_count >= 0),
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    migration_json TEXT NOT NULL DEFAULT '{}',
+                    graph_json TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_graph_versions_time_idx
+                    ON mt_topic_graph_versions(imported_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_topic_graph_versions_no_update
+                BEFORE UPDATE ON mt_topic_graph_versions
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic graph versions are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_topic_graph_versions_no_delete
+                BEFORE DELETE ON mt_topic_graph_versions
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic graph versions are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_topic_nodes (
+                    graph_version_id TEXT NOT NULL,
+                    topic_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    definition TEXT NOT NULL,
+                    level TEXT NOT NULL CHECK(level IN (
+                        'strategic_territory', 'content_domain', 'pillar',
+                        'topic', 'subtopic', 'atomic_subject'
+                    )),
+                    canonical_parent_id TEXT,
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL CHECK(status IN (
+                        'active', 'deprecated', 'proposed'
+                    )),
+                    strategic_priority INTEGER NOT NULL CHECK(
+                        strategic_priority BETWEEN 0 AND 100
+                    ),
+                    imported_at TEXT NOT NULL,
+                    PRIMARY KEY(graph_version_id, topic_id),
+                    UNIQUE(graph_version_id, level, normalized_name),
+                    FOREIGN KEY(graph_version_id)
+                        REFERENCES mt_topic_graph_versions(graph_version_id),
+                    FOREIGN KEY(graph_version_id, canonical_parent_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_nodes_level_idx
+                    ON mt_topic_nodes(graph_version_id, level, status);
+                CREATE INDEX IF NOT EXISTS mt_topic_nodes_parent_idx
+                    ON mt_topic_nodes(graph_version_id, canonical_parent_id);
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_nodes_no_update
+                BEFORE UPDATE ON mt_topic_nodes
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic nodes are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_nodes_no_delete
+                BEFORE DELETE ON mt_topic_nodes
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic nodes are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_topic_edges (
+                    graph_version_id TEXT NOT NULL,
+                    edge_id TEXT NOT NULL,
+                    source_topic_id TEXT NOT NULL,
+                    target_topic_id TEXT NOT NULL,
+                    relationship_type TEXT NOT NULL CHECK(
+                        relationship_type IN (
+                            'is_a', 'part_of', 'applied_to', 'used_by',
+                            'solves', 'implemented_with', 'compared_with',
+                            'depends_on', 'related_to'
+                        )
+                    ),
+                    imported_at TEXT NOT NULL,
+                    PRIMARY KEY(graph_version_id, edge_id),
+                    UNIQUE(
+                        graph_version_id, source_topic_id,
+                        target_topic_id, relationship_type
+                    ),
+                    CHECK(source_topic_id != target_topic_id),
+                    FOREIGN KEY(graph_version_id)
+                        REFERENCES mt_topic_graph_versions(graph_version_id),
+                    FOREIGN KEY(graph_version_id, source_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id),
+                    FOREIGN KEY(graph_version_id, target_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_edges_source_idx
+                    ON mt_topic_edges(
+                        graph_version_id, source_topic_id, relationship_type
+                    );
+                CREATE INDEX IF NOT EXISTS mt_topic_edges_target_idx
+                    ON mt_topic_edges(
+                        graph_version_id, target_topic_id, relationship_type
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_edges_no_update
+                BEFORE UPDATE ON mt_topic_edges
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic edges are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_edges_no_delete
+                BEFORE DELETE ON mt_topic_edges
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic edges are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_topic_signal_candidates (
+                    signal_id TEXT PRIMARY KEY,
+                    graph_version_id TEXT NOT NULL,
+                    signal_type TEXT NOT NULL CHECK(signal_type IN (
+                        'topic', 'keyword', 'query', 'question', 'problem',
+                        'objection', 'claim', 'angle', 'hook', 'title',
+                        'format', 'platform', 'offer', 'hashtag', 'audio',
+                        'opportunity', 'other'
+                    )),
+                    source_kind TEXT NOT NULL CHECK(source_kind IN (
+                        'market_tape_trend', 'market_tape_keyword',
+                        'market_tape_query', 'market_tape_opportunity',
+                        'transcript_phrase', 'external_signal'
+                    )),
+                    source_entity_id TEXT NOT NULL,
+                    source_trend_id TEXT,
+                    source_observed_at TEXT NOT NULL,
+                    signal_text TEXT NOT NULL,
+                    normalized_signal_text TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL CHECK(
+                        length(evidence_sha256) = 64
+                    ),
+                    evidence_json TEXT NOT NULL,
+                    ingested_at TEXT NOT NULL,
+                    UNIQUE(signal_id, graph_version_id),
+                    UNIQUE(
+                        graph_version_id, source_kind, source_entity_id,
+                        source_observed_at, signal_type, evidence_sha256
+                    ),
+                    FOREIGN KEY(graph_version_id)
+                        REFERENCES mt_topic_graph_versions(graph_version_id),
+                    FOREIGN KEY(source_trend_id)
+                        REFERENCES mt_trends(trend_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_signals_graph_type_idx
+                    ON mt_topic_signal_candidates(
+                        graph_version_id, signal_type, ingested_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS mt_topic_signals_source_idx
+                    ON mt_topic_signal_candidates(
+                        source_kind, source_entity_id, source_observed_at DESC
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_topic_signal_candidates_no_update
+                BEFORE UPDATE ON mt_topic_signal_candidates
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'topic signal candidates are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_topic_signal_candidates_no_delete
+                BEFORE DELETE ON mt_topic_signal_candidates
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'topic signal candidates are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_topic_signal_bindings (
+                    binding_id TEXT PRIMARY KEY,
+                    signal_id TEXT NOT NULL,
+                    graph_version_id TEXT NOT NULL,
+                    topic_id TEXT,
+                    decision TEXT NOT NULL CHECK(decision IN (
+                        'approved', 'rejected', 'review_required',
+                        'revoked', 'out_of_scope'
+                    )),
+                    binding_method TEXT NOT NULL,
+                    confidence REAL NOT NULL CHECK(
+                        confidence BETWEEN 0.0 AND 1.0
+                    ),
+                    rationale TEXT NOT NULL,
+                    reviewer_type TEXT NOT NULL CHECK(reviewer_type IN (
+                        'human', 'rules', 'ai', 'system'
+                    )),
+                    reviewed_by TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    review_receipt_id TEXT NOT NULL,
+                    exclusion_reason TEXT NOT NULL DEFAULT '',
+                    resolver_version TEXT NOT NULL,
+                    model_version TEXT NOT NULL DEFAULT '',
+                    output_schema_version TEXT NOT NULL,
+                    input_sha256 TEXT NOT NULL CHECK(length(input_sha256) = 64),
+                    output_sha256 TEXT NOT NULL CHECK(length(output_sha256) = 64),
+                    audit_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(binding_id, graph_version_id, signal_id, topic_id),
+                    CHECK(
+                        (decision = 'out_of_scope'
+                         AND topic_id IS NULL
+                         AND reviewer_type = 'human'
+                         AND length(exclusion_reason) > 0
+                         AND length(review_receipt_id) > 0)
+                        OR decision != 'out_of_scope'
+                    ),
+                    CHECK(
+                        decision IN ('out_of_scope', 'review_required')
+                        OR topic_id IS NOT NULL
+                    ),
+                    CHECK(
+                        reviewer_type != 'ai'
+                        OR decision = 'review_required'
+                    ),
+                    FOREIGN KEY(signal_id, graph_version_id)
+                        REFERENCES mt_topic_signal_candidates(
+                            signal_id, graph_version_id
+                        ),
+                    FOREIGN KEY(graph_version_id, topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_bindings_signal_time_idx
+                    ON mt_topic_signal_bindings(
+                        signal_id, reviewed_at DESC, binding_id DESC
+                    );
+                CREATE INDEX IF NOT EXISTS mt_topic_bindings_topic_time_idx
+                    ON mt_topic_signal_bindings(
+                        graph_version_id, topic_id, reviewed_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS mt_topic_bindings_decision_time_idx
+                    ON mt_topic_signal_bindings(
+                        graph_version_id, decision, reviewed_at DESC
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_signal_bindings_no_update
+                BEFORE UPDATE ON mt_topic_signal_bindings
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'topic signal bindings are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_signal_bindings_no_delete
+                BEFORE DELETE ON mt_topic_signal_bindings
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'topic signal bindings are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_topic_resolution_runs (
+                    resolution_run_id TEXT PRIMARY KEY,
+                    signal_id TEXT NOT NULL,
+                    graph_version_id TEXT NOT NULL,
+                    resolver_version TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    output_schema_version TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'completed', 'failed', 'blocked_credential',
+                        'no_candidates', 'deterministic'
+                    )),
+                    input_sha256 TEXT NOT NULL CHECK(length(input_sha256) = 64),
+                    output_sha256 TEXT NOT NULL CHECK(length(output_sha256) = 64),
+                    candidate_set_json TEXT NOT NULL,
+                    selected_topic_id TEXT,
+                    provider_decision TEXT NOT NULL,
+                    confidence REAL NOT NULL CHECK(
+                        confidence BETWEEN 0.0 AND 1.0
+                    ),
+                    rationale TEXT NOT NULL,
+                    response_id TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(
+                        input_tokens >= 0
+                    ),
+                    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK(
+                        output_tokens >= 0
+                    ),
+                    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK(
+                        total_tokens >= 0
+                    ),
+                    error_code TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(
+                        resolution_run_id, graph_version_id,
+                        signal_id, selected_topic_id
+                    ),
+                    FOREIGN KEY(signal_id, graph_version_id)
+                        REFERENCES mt_topic_signal_candidates(
+                            signal_id, graph_version_id
+                        ),
+                    FOREIGN KEY(graph_version_id, selected_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_resolution_signal_time_idx
+                    ON mt_topic_resolution_runs(
+                        signal_id, created_at DESC, resolution_run_id DESC
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_resolution_runs_no_update
+                BEFORE UPDATE ON mt_topic_resolution_runs
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'topic resolution runs are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_resolution_runs_no_delete
+                BEFORE DELETE ON mt_topic_resolution_runs
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'topic resolution runs are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_topic_observations (
+                    topic_observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic_observation_key TEXT NOT NULL UNIQUE,
+                    graph_version_id TEXT NOT NULL,
+                    topic_id TEXT NOT NULL,
+                    signal_id TEXT NOT NULL,
+                    binding_id TEXT NOT NULL UNIQUE,
+                    source_kind TEXT NOT NULL,
+                    source_entity_id TEXT NOT NULL,
+                    source_observed_at TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    signal_type TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL CHECK(
+                        length(evidence_sha256) = 64
+                    ),
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(signal_id, graph_version_id)
+                        REFERENCES mt_topic_signal_candidates(
+                            signal_id, graph_version_id
+                        ),
+                    FOREIGN KEY(
+                        binding_id, graph_version_id, signal_id, topic_id
+                    ) REFERENCES mt_topic_signal_bindings(
+                        binding_id, graph_version_id, signal_id, topic_id
+                    ),
+                    FOREIGN KEY(graph_version_id, topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_topic_observations_topic_time_idx
+                    ON mt_topic_observations(
+                        graph_version_id, topic_id, observed_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS mt_topic_observations_signal_idx
+                    ON mt_topic_observations(signal_id, observed_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_observations_no_update
+                BEFORE UPDATE ON mt_topic_observations
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic observations are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_topic_observations_no_delete
+                BEFORE DELETE ON mt_topic_observations
+                BEGIN
+                    SELECT RAISE(ABORT, 'topic observations are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_atomic_topic_selections (
+                    selection_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK(status = 'approved'),
+                    graph_version_id TEXT NOT NULL,
+                    graph_sha256 TEXT NOT NULL CHECK(length(graph_sha256) = 64),
+                    atomic_topic_id TEXT NOT NULL,
+                    reviewer_type TEXT NOT NULL CHECK(
+                        reviewer_type IN ('human', 'rules')
+                    ),
+                    reviewer_id TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL,
+                    review_receipt_id TEXT NOT NULL UNIQUE,
+                    review_receipt_sha256 TEXT NOT NULL CHECK(
+                        length(review_receipt_sha256) = 64
+                    ),
+                    rationale TEXT NOT NULL,
+                    selection_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(selection_sha256) = 64
+                    ),
+                    selection_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(graph_version_id)
+                        REFERENCES mt_topic_graph_versions(graph_version_id),
+                    FOREIGN KEY(graph_version_id, atomic_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_atomic_selections_topic_time_idx
+                    ON mt_atomic_topic_selections(
+                        graph_version_id, atomic_topic_id, reviewed_at DESC
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS mt_atomic_topic_selections_no_update
+                BEFORE UPDATE ON mt_atomic_topic_selections
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'atomic topic selections are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_atomic_topic_selections_no_delete
+                BEFORE DELETE ON mt_atomic_topic_selections
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'atomic topic selections are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_atomic_topic_selection_sources (
+                    selection_id TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    topic_observation_key TEXT NOT NULL,
+                    signal_id TEXT NOT NULL,
+                    PRIMARY KEY(selection_id, binding_id, topic_observation_key),
+                    FOREIGN KEY(selection_id)
+                        REFERENCES mt_atomic_topic_selections(selection_id),
+                    FOREIGN KEY(binding_id)
+                        REFERENCES mt_topic_signal_bindings(binding_id),
+                    FOREIGN KEY(topic_observation_key)
+                        REFERENCES mt_topic_observations(topic_observation_key),
+                    FOREIGN KEY(signal_id)
+                        REFERENCES mt_topic_signal_candidates(signal_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_atomic_selection_sources_binding_idx
+                    ON mt_atomic_topic_selection_sources(binding_id, selection_id);
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_atomic_topic_selection_sources_no_update
+                BEFORE UPDATE ON mt_atomic_topic_selection_sources
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'atomic topic selection sources are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_atomic_topic_selection_sources_no_delete
+                BEFORE DELETE ON mt_atomic_topic_selection_sources
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'atomic topic selection sources are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_content_evidence_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    selection_id TEXT NOT NULL,
+                    evidence_type TEXT NOT NULL CHECK(evidence_type IN (
+                        'transcript_receipt', 'audience_evidence',
+                        'human_moment', 'conversion_evidence',
+                        'external_reference'
+                    )),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'ready', 'verified', 'accepted'
+                    )),
+                    source_system TEXT NOT NULL,
+                    source_record_id TEXT NOT NULL,
+                    source_record_sha256 TEXT NOT NULL CHECK(
+                        length(source_record_sha256) = 64
+                    ),
+                    observation_ids_json TEXT NOT NULL,
+                    claim TEXT,
+                    source_uri TEXT,
+                    receipt_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(receipt_sha256) = 64
+                    ),
+                    receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(selection_id)
+                        REFERENCES mt_atomic_topic_selections(selection_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_content_evidence_selection_idx
+                    ON mt_content_evidence_receipts(
+                        selection_id, evidence_type, created_at
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_content_evidence_receipts_no_update
+                BEFORE UPDATE ON mt_content_evidence_receipts
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'content evidence receipts are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_content_evidence_receipts_no_delete
+                BEFORE DELETE ON mt_content_evidence_receipts
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'content evidence receipts are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_semantic_lineage_registrations (
+                    registration_id TEXT PRIMARY KEY,
+                    registration_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(registration_sha256) = 64
+                    ),
+                    lineage_sha256 TEXT NOT NULL CHECK(
+                        length(lineage_sha256) = 64
+                    ),
+                    canonical_plan_sha256 TEXT NOT NULL CHECK(
+                        length(canonical_plan_sha256) = 64
+                    ),
+                    status TEXT NOT NULL CHECK(status = 'ready'),
+                    identifiers_json TEXT NOT NULL,
+                    registration_json TEXT NOT NULL,
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    registered_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS
+                    mt_semantic_registrations_lineage_idx
+                    ON mt_semantic_lineage_registrations(
+                        lineage_sha256, registered_at DESC
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_semantic_lineage_registrations_no_update
+                BEFORE UPDATE ON mt_semantic_lineage_registrations
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'semantic lineage registrations are append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_semantic_lineage_registrations_no_delete
+                BEFORE DELETE ON mt_semantic_lineage_registrations
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'semantic lineage registrations are append-only'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_content_briefs (
+                    brief_id TEXT PRIMARY KEY,
+                    graph_version_id TEXT NOT NULL,
+                    atomic_topic_id TEXT NOT NULL,
+                    brief_contract TEXT NOT NULL,
+                    brief_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(brief_sha256) = 64
+                    ),
+                    status TEXT NOT NULL,
+                    atomic_selection_id TEXT NOT NULL,
+                    atomic_selection_sha256 TEXT NOT NULL CHECK(
+                        length(atomic_selection_sha256) = 64
+                    ),
+                    source_binding_ids_json TEXT NOT NULL,
+                    lineage_sha256 TEXT NOT NULL CHECK(
+                        length(lineage_sha256) = 64
+                    ),
+                    registration_id TEXT NOT NULL,
+                    brief_json TEXT NOT NULL,
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    registered_at TEXT NOT NULL,
+                    FOREIGN KEY(graph_version_id)
+                        REFERENCES mt_topic_graph_versions(graph_version_id),
+                    FOREIGN KEY(graph_version_id, atomic_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id),
+                    FOREIGN KEY(atomic_selection_id)
+                        REFERENCES mt_atomic_topic_selections(selection_id),
+                    FOREIGN KEY(registration_id)
+                        REFERENCES mt_semantic_lineage_registrations(
+                            registration_id
+                        )
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_content_briefs_topic_time_idx
+                    ON mt_content_briefs(
+                        graph_version_id, atomic_topic_id, registered_at DESC
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS mt_content_briefs_no_update
+                BEFORE UPDATE ON mt_content_briefs
+                BEGIN
+                    SELECT RAISE(ABORT, 'content briefs are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_content_briefs_no_delete
+                BEFORE DELETE ON mt_content_briefs
+                BEGIN
+                    SELECT RAISE(ABORT, 'content briefs are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_content_assets (
+                    asset_id TEXT PRIMARY KEY,
+                    brief_id TEXT NOT NULL,
+                    graph_version_id TEXT NOT NULL,
+                    atomic_topic_id TEXT NOT NULL,
+                    parent_asset_id TEXT,
+                    derivative_type TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    account TEXT,
+                    content_id TEXT NOT NULL DEFAULT '',
+                    asset_contract TEXT NOT NULL,
+                    asset_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(asset_sha256) = 64
+                    ),
+                    status TEXT NOT NULL,
+                    lineage_sha256 TEXT NOT NULL CHECK(
+                        length(lineage_sha256) = 64
+                    ),
+                    asset_json TEXT NOT NULL,
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    registered_at TEXT NOT NULL,
+                    FOREIGN KEY(brief_id) REFERENCES mt_content_briefs(brief_id),
+                    FOREIGN KEY(parent_asset_id)
+                        REFERENCES mt_content_assets(asset_id),
+                    FOREIGN KEY(graph_version_id, atomic_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_content_assets_brief_idx
+                    ON mt_content_assets(brief_id, registered_at, asset_id);
+                CREATE INDEX IF NOT EXISTS mt_content_assets_content_idx
+                    ON mt_content_assets(content_id, registered_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_content_assets_no_update
+                BEFORE UPDATE ON mt_content_assets
+                BEGIN
+                    SELECT RAISE(ABORT, 'content assets are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_content_assets_no_delete
+                BEFORE DELETE ON mt_content_assets
+                BEGIN
+                    SELECT RAISE(ABORT, 'content assets are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_semantic_content_lineage (
+                    lineage_link_id TEXT PRIMARY KEY,
+                    lineage_sha256 TEXT NOT NULL,
+                    graph_version_id TEXT NOT NULL,
+                    signal_id TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    topic_id TEXT NOT NULL,
+                    topic_observation_key TEXT NOT NULL,
+                    brief_id TEXT NOT NULL,
+                    atomic_topic_id TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    content_id TEXT NOT NULL DEFAULT '',
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    linked_at TEXT NOT NULL,
+                    link_json TEXT NOT NULL,
+                    UNIQUE(binding_id, brief_id, asset_id),
+                    FOREIGN KEY(signal_id, graph_version_id)
+                        REFERENCES mt_topic_signal_candidates(
+                            signal_id, graph_version_id
+                        ),
+                    FOREIGN KEY(binding_id)
+                        REFERENCES mt_topic_signal_bindings(binding_id),
+                    FOREIGN KEY(topic_observation_key)
+                        REFERENCES mt_topic_observations(topic_observation_key),
+                    FOREIGN KEY(brief_id) REFERENCES mt_content_briefs(brief_id),
+                    FOREIGN KEY(asset_id) REFERENCES mt_content_assets(asset_id),
+                    FOREIGN KEY(graph_version_id, topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id),
+                    FOREIGN KEY(graph_version_id, atomic_topic_id)
+                        REFERENCES mt_topic_nodes(graph_version_id, topic_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_semantic_lineage_signal_idx
+                    ON mt_semantic_content_lineage(signal_id, linked_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_semantic_lineage_topic_idx
+                    ON mt_semantic_content_lineage(
+                        graph_version_id, topic_id, linked_at DESC
+                    );
+                CREATE INDEX IF NOT EXISTS mt_semantic_lineage_brief_idx
+                    ON mt_semantic_content_lineage(brief_id, linked_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_semantic_lineage_asset_idx
+                    ON mt_semantic_content_lineage(asset_id, linked_at DESC);
+                CREATE INDEX IF NOT EXISTS mt_semantic_lineage_content_idx
+                    ON mt_semantic_content_lineage(content_id, linked_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_semantic_content_lineage_no_update
+                BEFORE UPDATE ON mt_semantic_content_lineage
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'semantic content lineage is append-only'
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS
+                    mt_semantic_content_lineage_no_delete
+                BEFORE DELETE ON mt_semantic_content_lineage
+                BEGIN
+                    SELECT RAISE(
+                        ABORT, 'semantic content lineage is append-only'
+                    );
+                END;
+
                 CREATE TABLE IF NOT EXISTS mt_sync_outbox (
                     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_type TEXT NOT NULL,
@@ -1167,6 +1898,9 @@ class MarketTapeStore:
 
                 CREATE INDEX IF NOT EXISTS mt_sync_outbox_pending_idx
                     ON mt_sync_outbox(synced_at, next_attempt_at, outbox_id);
+
+                CREATE INDEX IF NOT EXISTS mt_sync_outbox_entity_type_idx
+                    ON mt_sync_outbox(entity_type, synced_at, outbox_id);
 
                 CREATE TABLE IF NOT EXISTS mt_sink_health (
                     sink_id TEXT PRIMARY KEY,
@@ -1872,6 +2606,73 @@ class MarketTapeStore:
             for row in connection.execute("SELECT * FROM mt_source_health").fetchall():
                 payload = dict(row)
                 add("source_health", payload["source_id"], payload)
+            semantic_specs = (
+                (
+                    "semantic_graph_version", "mt_topic_graph_versions",
+                    lambda row: row["graph_version_id"],
+                ),
+                (
+                    "semantic_topic_node", "mt_topic_nodes",
+                    lambda row: f"{row['graph_version_id']}|{row['topic_id']}",
+                ),
+                (
+                    "semantic_topic_edge", "mt_topic_edges",
+                    lambda row: f"{row['graph_version_id']}|{row['edge_id']}",
+                ),
+                (
+                    "semantic_signal_candidate", "mt_topic_signal_candidates",
+                    lambda row: row["signal_id"],
+                ),
+                (
+                    "semantic_signal_binding", "mt_topic_signal_bindings",
+                    lambda row: row["binding_id"],
+                ),
+                (
+                    "semantic_resolution_run", "mt_topic_resolution_runs",
+                    lambda row: row["resolution_run_id"],
+                ),
+                (
+                    "semantic_topic_observation", "mt_topic_observations",
+                    lambda row: row["topic_observation_key"],
+                ),
+                (
+                    "semantic_atomic_selection", "mt_atomic_topic_selections",
+                    lambda row: row["selection_id"],
+                ),
+                (
+                    "semantic_atomic_selection_source",
+                    "mt_atomic_topic_selection_sources",
+                    lambda row: "|".join(str(row[field]) for field in (
+                        "selection_id", "binding_id", "topic_observation_key",
+                    )),
+                ),
+                (
+                    "semantic_evidence_receipt", "mt_content_evidence_receipts",
+                    lambda row: row["receipt_id"],
+                ),
+                (
+                    "semantic_lineage_registration",
+                    "mt_semantic_lineage_registrations",
+                    lambda row: row["registration_id"],
+                ),
+                (
+                    "semantic_content_brief", "mt_content_briefs",
+                    lambda row: row["brief_id"],
+                ),
+                (
+                    "semantic_content_asset", "mt_content_assets",
+                    lambda row: row["asset_id"],
+                ),
+                (
+                    "semantic_content_lineage", "mt_semantic_content_lineage",
+                    lambda row: row["lineage_link_id"],
+                ),
+            )
+            for entity_type, table, identity in semantic_specs:
+                for row in connection.execute(f"SELECT * FROM {table}").fetchall():
+                    payload = dict(row)
+                    payload.pop("topic_observation_id", None)
+                    add(entity_type, str(identity(payload)), payload)
 
             connection.executemany(
                 """INSERT INTO mt_sync_outbox(
@@ -6604,6 +7405,36 @@ class MarketTapeStore:
                 ).fetchone()[0],
                 "script_language_demand_events": connection.execute(
                     "SELECT COUNT(*) FROM mt_script_language_demand_events"
+                ).fetchone()[0],
+                "semantic_graph_versions": connection.execute(
+                    "SELECT COUNT(*) FROM mt_topic_graph_versions"
+                ).fetchone()[0],
+                "semantic_topic_nodes": connection.execute(
+                    "SELECT COUNT(*) FROM mt_topic_nodes"
+                ).fetchone()[0],
+                "semantic_topic_edges": connection.execute(
+                    "SELECT COUNT(*) FROM mt_topic_edges"
+                ).fetchone()[0],
+                "semantic_signal_candidates": connection.execute(
+                    "SELECT COUNT(*) FROM mt_topic_signal_candidates"
+                ).fetchone()[0],
+                "semantic_signal_bindings": connection.execute(
+                    "SELECT COUNT(*) FROM mt_topic_signal_bindings"
+                ).fetchone()[0],
+                "semantic_topic_observations": connection.execute(
+                    "SELECT COUNT(*) FROM mt_topic_observations"
+                ).fetchone()[0],
+                "semantic_atomic_selections": connection.execute(
+                    "SELECT COUNT(*) FROM mt_atomic_topic_selections"
+                ).fetchone()[0],
+                "semantic_lineage_registrations": connection.execute(
+                    "SELECT COUNT(*) FROM mt_semantic_lineage_registrations"
+                ).fetchone()[0],
+                "semantic_content_briefs": connection.execute(
+                    "SELECT COUNT(*) FROM mt_content_briefs"
+                ).fetchone()[0],
+                "semantic_content_assets": connection.execute(
+                    "SELECT COUNT(*) FROM mt_content_assets"
                 ).fetchone()[0],
                 "due_polls": connection.execute("SELECT COUNT(*) FROM mt_poll_queue WHERE due_at <= ?", (isoformat(utc_now()),)).fetchone()[0],
             }

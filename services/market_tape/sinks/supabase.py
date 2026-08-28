@@ -15,6 +15,50 @@ from ..store import MarketTapeStore
 
 
 ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
+    "semantic_graph_version": (
+        "actp_semantic_topic_graph_versions", "graph_version_id", False,
+    ),
+    "semantic_topic_node": (
+        "actp_semantic_topic_nodes", "graph_version_id,topic_id", False,
+    ),
+    "semantic_topic_edge": (
+        "actp_semantic_topic_edges", "graph_version_id,edge_id", False,
+    ),
+    "semantic_signal_candidate": (
+        "actp_semantic_signal_candidates", "signal_id", False,
+    ),
+    "semantic_signal_binding": (
+        "actp_semantic_signal_bindings", "binding_id", False,
+    ),
+    "semantic_resolution_run": (
+        "actp_semantic_resolution_runs", "resolution_run_id", False,
+    ),
+    "semantic_topic_observation": (
+        "actp_semantic_topic_observations", "topic_observation_key", False,
+    ),
+    "semantic_atomic_selection": (
+        "actp_semantic_atomic_topic_selections", "selection_id", False,
+    ),
+    "semantic_atomic_selection_source": (
+        "actp_semantic_atomic_selection_sources",
+        "selection_id,binding_id,topic_observation_key",
+        False,
+    ),
+    "semantic_evidence_receipt": (
+        "actp_semantic_content_evidence_receipts", "receipt_id", False,
+    ),
+    "semantic_lineage_registration": (
+        "actp_semantic_lineage_registrations", "registration_id", False,
+    ),
+    "semantic_content_brief": (
+        "actp_semantic_content_briefs", "brief_id", False,
+    ),
+    "semantic_content_asset": (
+        "actp_semantic_content_assets", "asset_id", False,
+    ),
+    "semantic_content_lineage": (
+        "actp_semantic_content_lineage", "lineage_link_id", False,
+    ),
     "creator": ("actp_market_creators", "creator_id", True),
     "video": ("actp_market_videos", "video_id", True),
     "discovery_attribution": (
@@ -38,6 +82,20 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
 # A batch can begin in the middle of a run's outbox records. Always process parent
 # tables before dependent tables instead of relying on the first row's entity type.
 ENTITY_SYNC_ORDER = (
+    "semantic_graph_version",
+    "semantic_topic_node",
+    "semantic_topic_edge",
+    "semantic_signal_candidate",
+    "semantic_signal_binding",
+    "semantic_resolution_run",
+    "semantic_topic_observation",
+    "semantic_atomic_selection",
+    "semantic_atomic_selection_source",
+    "semantic_evidence_receipt",
+    "semantic_lineage_registration",
+    "semantic_content_brief",
+    "semantic_content_asset",
+    "semantic_content_lineage",
     "creator",
     "trend",
     "run",

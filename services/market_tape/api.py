@@ -18,6 +18,7 @@ from .full_pipeline import run_full_pipeline
 from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
 from .script_demand import ScriptLanguageDemandWorker
+from .semantic import SemanticContractError, SemanticTopicService
 from .store import MarketTapeStore, ScriptLanguageDemandClaimConflict
 from .sinks import SupabaseSink
 
@@ -30,6 +31,7 @@ def register_market_tape_routes(
 ) -> MarketTapeStore:
     resolved = config or MarketTapeConfig.from_environment()
     store = MarketTapeStore(resolved)
+    semantic = SemanticTopicService(store)
     operation_lock = threading.Lock()
 
     def run_exclusive(operation: Callable[[], Dict[str, Any]]):
@@ -162,6 +164,169 @@ def register_market_tape_routes(
             "candles": store.social_candles(window, limit, request.args.get("platform")),
         })
 
+    @app.get("/api/market-tape/semantic/mapping-health")
+    def market_tape_semantic_mapping_health():
+        try:
+            return jsonify(semantic.mapping_health(
+                graph_version_id=request.args.get("graph_version_id"),
+                signal_type=request.args.get("signal_type"),
+                limit=_limit(request.args.get("limit"), 25, maximum=100),
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/semantic/graph-summary")
+    def market_tape_semantic_graph_summary():
+        try:
+            return jsonify(semantic.graph_summary(
+                request.args.get("graph_version_id")
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/semantic/lineage")
+    def market_tape_semantic_lineage():
+        try:
+            return jsonify(semantic.lineage(
+                signal_id=request.args.get("signal_id"),
+                topic_id=request.args.get("topic_id"),
+                brief_id=request.args.get("brief_id"),
+                asset_id=request.args.get("asset_id"),
+                content_id=request.args.get("content_id"),
+                limit=_limit(request.args.get("limit"), 100, maximum=500),
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/semantic/bindings")
+    def market_tape_semantic_bindings():
+        try:
+            return jsonify(semantic.list_bindings(
+                limit=_limit(request.args.get("limit"), 100, maximum=500),
+                signal_id=request.args.get("signal_id"),
+                topic_id=request.args.get("topic_id"),
+                decision=request.args.get("decision"),
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/semantic/generation-handoff")
+    def market_tape_semantic_generation_handoff():
+        try:
+            return jsonify(semantic.generation_handoff(
+                request.args.get("selection_id") or ""
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc), "state": "incomplete"}), 409
+
+    @app.get("/api/market-tape/semantic/generation-context")
+    def market_tape_semantic_generation_context():
+        try:
+            return jsonify(semantic.generation_context(
+                request.args.get("selection_id") or ""
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc), "state": "incomplete"}), 409
+
+    @app.post("/api/market-tape/semantic/graphs/import")
+    def market_tape_semantic_import_graph():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.import_graph(request.get_json(silent=True))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("imported") else 200
+
+    @app.post("/api/market-tape/semantic/signals")
+    def market_tape_semantic_ingest_signal():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.ingest_signal(request.get_json(silent=True))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("created") else 200
+
+    @app.post("/api/market-tape/semantic/signals/materialize")
+    def market_tape_semantic_materialize_signals():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "JSON object body required"}), 400
+        try:
+            return jsonify(semantic.materialize_trend_signals(
+                graph_version_id=body.get("graph_version_id"),
+                limit=_limit(body.get("limit"), 100, maximum=500),
+                state=body.get("state"),
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/market-tape/semantic/signals/<path:signal_id>/resolve")
+    def market_tape_semantic_resolve_signal(signal_id: str):
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "JSON object body required"}), 400
+        use_ai = body.get("use_ai", True)
+        if not isinstance(use_ai, bool):
+            return jsonify({"error": "use_ai must be boolean"}), 400
+        try:
+            return jsonify(semantic.resolve_signal(
+                signal_id,
+                use_ai=use_ai,
+                max_candidates=_limit(
+                    body.get("max_candidates"), 8, maximum=12
+                ),
+            ))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/market-tape/semantic/bindings")
+    def market_tape_semantic_record_binding():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.record_binding(request.get_json(silent=True))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("created") else 200
+
+    @app.post("/api/market-tape/semantic/atomic-selections")
+    def market_tape_semantic_record_atomic_selection():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.record_atomic_selection(request.get_json(silent=True))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("created") else 200
+
+    @app.post("/api/market-tape/semantic/evidence-receipts")
+    def market_tape_semantic_record_evidence():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.record_evidence_receipt(request.get_json(silent=True))
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("created") else 200
+
+    @app.post("/api/market-tape/semantic/content-lineage")
+    def market_tape_semantic_register_content_lineage():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.register_content_lineage(
+                request.get_json(silent=True)
+            )
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result), 201 if result.get("created") else 200
+
     @app.get("/api/market-tape/agent/catalog")
     def market_tape_agent_catalog():
         if not _authorized():
@@ -183,6 +348,59 @@ def register_market_tape_routes(
                 "keyword_intelligence": {
                     "method": "GET", "path": "/api/market-tape/keywords",
                     "bounds": {"limit": [1, 1000]},
+                },
+                "semantic_mapping_health": {
+                    "method": "GET",
+                    "path": "/api/market-tape/semantic/mapping-health",
+                    "bounds": {"limit": [1, 100]},
+                },
+                "semantic_graph_summary": {
+                    "method": "GET",
+                    "path": "/api/market-tape/semantic/graph-summary",
+                },
+                "semantic_lineage": {
+                    "method": "GET",
+                    "path": "/api/market-tape/semantic/lineage",
+                    "requires_exactly_one": [
+                        "signal_id", "topic_id", "brief_id", "asset_id",
+                        "content_id",
+                    ],
+                },
+                "semantic_generation_handoff": {
+                    "method": "GET",
+                    "path": "/api/market-tape/semantic/generation-handoff",
+                    "required": ["selection_id"],
+                },
+                "import_semantic_graph": {
+                    "method": "POST",
+                    "path": "/api/market-tape/semantic/graphs/import",
+                    "effect": "append_only_content_addressed_import",
+                },
+                "materialize_semantic_signals": {
+                    "method": "POST",
+                    "path": "/api/market-tape/semantic/signals/materialize",
+                    "bounds": {"limit": [1, 500]},
+                },
+                "resolve_semantic_signal": {
+                    "method": "POST",
+                    "path": (
+                        "/api/market-tape/semantic/signals/{signal_id}/resolve"
+                    ),
+                    "ai_authority": "review_required_only",
+                },
+                "review_semantic_binding": {
+                    "method": "POST",
+                    "path": "/api/market-tape/semantic/bindings",
+                },
+                "review_atomic_topic_selection": {
+                    "method": "POST",
+                    "path": "/api/market-tape/semantic/atomic-selections",
+                    "ai_authority": "forbidden",
+                },
+                "register_semantic_content_lineage": {
+                    "method": "POST",
+                    "path": "/api/market-tape/semantic/content-lineage",
+                    "effect": "atomic_idempotent_registration",
                 },
                 "enqueue_script_language_demand": {
                     "method": "POST",

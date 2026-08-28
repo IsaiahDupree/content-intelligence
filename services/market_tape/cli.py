@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any
 
 from .collector import MarketTapeCollector
@@ -12,6 +13,15 @@ from .daemon import MarketTapeDaemon
 from .dataset import MarketTapeDatasetManager
 from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
+from .models import stable_hash
+from .semantic import (
+    GRAPH_IMPORT_CONTRACT,
+    SemanticContractError,
+    SemanticTopicService,
+    canonical_json,
+    normalize_text,
+    validate_topic_graph,
+)
 from .sources import build_sources
 from .sinks import SupabaseSink
 from .store import MarketTapeStore
@@ -79,10 +89,37 @@ def main() -> int:
     candles.add_argument("--platform")
     candles.add_argument("--window-minutes", type=int, default=15)
     candles.add_argument("--limit", type=int, default=96)
+    semantic_graph = subparsers.add_parser("semantic-graph-import")
+    semantic_graph.add_argument("--path", required=True)
+    semantic_graph.add_argument("--source-service", required=True)
+    semantic_graph.add_argument("--source-receipt-id", required=True)
+    semantic_graph.add_argument("--imported-by", required=True)
+    semantic_graph.add_argument("--apply", action="store_true")
+    semantic_extract = subparsers.add_parser("semantic-extract")
+    semantic_extract.add_argument("--graph-version-id")
+    semantic_extract.add_argument("--state")
+    semantic_extract.add_argument("--limit", type=int, default=100)
+    semantic_extract.add_argument("--apply", action="store_true")
+    semantic_resolve = subparsers.add_parser("semantic-resolve")
+    semantic_resolve.add_argument("--signal-id", required=True)
+    semantic_resolve.add_argument("--max-candidates", type=int, default=8)
+    semantic_resolve.add_argument("--ai", action="store_true")
+    semantic_resolve.add_argument("--apply", action="store_true")
+    semantic_review = subparsers.add_parser("semantic-review")
+    semantic_review.add_argument(
+        "--kind", choices=["binding", "atomic-selection"], required=True
+    )
+    semantic_review.add_argument("--path", required=True)
+    semantic_review.add_argument("--apply", action="store_true")
+    semantic_status = subparsers.add_parser("semantic-status")
+    semantic_status.add_argument("--graph-version-id")
+    semantic_status.add_argument("--signal-type")
+    semantic_status.add_argument("--limit", type=int, default=25)
     args = parser.parse_args()
 
     config = MarketTapeConfig.from_environment()
     store = MarketTapeStore(config)
+    semantic = SemanticTopicService(store)
     if args.command == "init":
         return _print({"state": "initialized", "status": store.status()})
     if args.command == "cycle":
@@ -167,6 +204,93 @@ def main() -> int:
         return _print(MarketTapeDatasetManager(config, store).status())
     if args.command == "candles":
         return _print({"candles": store.social_candles(args.window_minutes, args.limit, args.platform)})
+    if args.command == "semantic-graph-import":
+        raw = _load_json(args.path)
+        graph = raw.get("graph") if isinstance(raw, dict) and "graph" in raw else raw
+        validated = validate_topic_graph(graph)
+        payload = {
+            "contract": GRAPH_IMPORT_CONTRACT,
+            "source_service": args.source_service,
+            "source_receipt_id": args.source_receipt_id,
+            "imported_by": args.imported_by,
+            "graph": validated,
+        }
+        if args.apply:
+            return _print(semantic.import_graph(payload))
+        return _print({
+            "status": "ok",
+            "contract": "market_tape_semantic_cli_dry_run_v1",
+            "operation": "graph_import",
+            "dry_run": True,
+            "mutation_applied": False,
+            "graph_version_id": "topic-graph:" + validated["graph_sha256"][:24],
+            "graph_sha256": validated["graph_sha256"],
+            "node_count": validated["inventory"]["node_count"],
+            "edge_count": validated["inventory"]["relationship_count"],
+        })
+    if args.command == "semantic-extract":
+        limit = min(500, max(1, int(args.limit)))
+        if args.apply:
+            return _print(semantic.materialize_trend_signals(
+                graph_version_id=args.graph_version_id,
+                limit=limit,
+                state=args.state,
+            ))
+        return _print(_semantic_extract_preview(
+            store,
+            semantic,
+            graph_version_id=args.graph_version_id,
+            limit=limit,
+            state=args.state,
+        ))
+    if args.command == "semantic-resolve":
+        maximum = min(12, max(2, int(args.max_candidates)))
+        if args.apply:
+            return _print(semantic.resolve_signal(
+                args.signal_id,
+                use_ai=bool(args.ai),
+                max_candidates=maximum,
+            ))
+        preview = semantic.preview_resolution(
+            args.signal_id, max_candidates=maximum
+        )
+        preview["ai_requested_on_apply"] = bool(args.ai)
+        return _print(preview)
+    if args.command == "semantic-review":
+        payload = _load_json(args.path)
+        if not isinstance(payload, dict):
+            raise SemanticContractError("review payload must be an object")
+        if args.apply:
+            result = (
+                semantic.record_binding(payload)
+                if args.kind == "binding"
+                else semantic.record_atomic_selection(payload)
+            )
+            return _print(result)
+        return _print({
+            "status": "ok",
+            "contract": "market_tape_semantic_cli_dry_run_v1",
+            "operation": args.kind,
+            "dry_run": True,
+            "mutation_applied": False,
+            "input_sha256": stable_hash(payload),
+            "signal_id": payload.get("signal_id"),
+            "topic_id": payload.get("topic_id") or payload.get("atomic_topic_id"),
+            "binding_ids": payload.get("binding_ids") or [],
+            "reviewer_type": payload.get("reviewer_type"),
+            "decision": payload.get("decision"),
+        })
+    if args.command == "semantic-status":
+        return _print({
+            "status": "ok",
+            "contract": "market_tape_semantic_cli_status_v1",
+            "graph_summary": semantic.graph_summary(args.graph_version_id),
+            "mapping_health": semantic.mapping_health(
+                graph_version_id=args.graph_version_id,
+                signal_type=args.signal_type,
+                limit=min(100, max(1, int(args.limit))),
+            ),
+        })
     if args.command == "doctor":
         sources = build_sources(config, "doctor", store.remaining_request_budget)
         try:
@@ -198,6 +322,113 @@ def main() -> int:
 def _print(value: Any) -> int:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
     return 0
+
+
+def _load_json(path: str) -> Any:
+    source = Path(path).expanduser()
+    if not source.is_file():
+        raise SemanticContractError(f"JSON file does not exist: {source}")
+    try:
+        return json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SemanticContractError(f"JSON file could not be read: {source}") from exc
+
+
+def _semantic_extract_preview(
+    store: MarketTapeStore,
+    semantic: SemanticTopicService,
+    *,
+    graph_version_id: str | None,
+    limit: int,
+    state: str | None,
+) -> dict[str, Any]:
+    graph = semantic.graph_summary(graph_version_id)
+    if graph["state"] != "ready":
+        raise SemanticContractError("no semantic topic graph has been imported")
+    graph_id = str(graph["graph"]["graph_version_id"])
+    where = " WHERE observation.state = ?" if state else ""
+    parameters: list[Any] = [state] if state else []
+    parameters.append(min(500, max(1, int(limit))))
+    with store.connect() as connection:
+        rows = [dict(row) for row in connection.execute(
+            """SELECT trend.trend_id, trend.trend_type, trend.canonical_key,
+                      trend.display_name, trend.status, trend.first_seen_at,
+                      trend.last_seen_at, observation.trend_observation_id,
+                      observation.observed_at, observation.videos_total,
+                      observation.creators_total, observation.platforms_total,
+                      observation.views_total, observation.likes_total,
+                      observation.comments_total, observation.shares_total,
+                      observation.trend_strength,
+                      observation.state AS observed_state,
+                      observation.index_version,
+                      observation.observation_quality_contract
+               FROM mt_trends trend
+               JOIN mt_trend_observations observation
+                 ON observation.trend_observation_id = (
+                     SELECT nested.trend_observation_id
+                     FROM mt_trend_observations nested
+                     WHERE nested.trend_id = trend.trend_id
+                     ORDER BY nested.observed_at DESC,
+                              nested.trend_observation_id DESC LIMIT 1
+                 )""" + where +
+            " ORDER BY observation.observed_at DESC LIMIT ?",
+            parameters,
+        )]
+    candidates = []
+    for row in rows:
+        raw_type = str(row["trend_type"] or "").lower()
+        signal_type = raw_type if raw_type in {
+            "topic", "keyword", "query", "question", "problem", "objection",
+            "claim", "angle", "hook", "title", "format", "platform", "offer",
+            "hashtag", "audio", "opportunity", "other",
+        } else "other"
+        evidence = {
+            "contract": "market_tape_semantic_trend_evidence_v1",
+            "trend": {key: row[key] for key in (
+                "trend_id", "trend_type", "canonical_key", "display_name",
+                "status", "first_seen_at", "last_seen_at",
+            )},
+            "observation": {key: row[key] for key in (
+                "trend_observation_id", "observed_at", "videos_total",
+                "creators_total", "platforms_total", "views_total",
+                "likes_total", "comments_total", "shares_total",
+                "trend_strength", "observed_state", "index_version",
+                "observation_quality_contract",
+            )},
+            "metrics": {key: row[key] for key in (
+                "videos_total", "creators_total", "platforms_total",
+                "views_total", "likes_total", "comments_total", "shares_total",
+                "trend_strength",
+            )},
+        }
+        evidence_sha = stable_hash(evidence)
+        identity = {
+            "graph_version_id": graph_id,
+            "signal_type": signal_type,
+            "source_kind": "market_tape_trend",
+            "source_entity_id": row["trend_id"],
+            "source_observed_at": row["observed_at"],
+            "normalized_signal_text": normalize_text(row["display_name"]),
+            "evidence_sha256": evidence_sha,
+        }
+        candidates.append({
+            "signal_id": "topic-signal:" + stable_hash(identity),
+            "source_trend_id": row["trend_id"],
+            "trend_observation_id": row["trend_observation_id"],
+            "signal_type": signal_type,
+            "signal_text": row["display_name"],
+            "evidence_sha256": evidence_sha,
+        })
+    return {
+        "status": "ok",
+        "contract": "market_tape_semantic_signal_extraction_preview_v1",
+        "dry_run": True,
+        "mutation_applied": False,
+        "graph_version_id": graph_id,
+        "limit": limit,
+        "count": len(candidates),
+        "candidates": candidates,
+    }
 
 
 if __name__ == "__main__":

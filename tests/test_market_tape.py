@@ -22,7 +22,9 @@ from services.market_tape.collector import MarketTapeCollector
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.math import age_bucket, concentration, counter_motion, log_velocity, poll_interval_seconds
 from services.market_tape.migration import (
+    APPEND_ONLY_TRIGGERS,
     MARKET_TAPE_TABLES,
+    REQUIRED_INDEXES,
     SupabaseMigrationManager,
     migration_sql,
     project_ref_from_url,
@@ -154,25 +156,22 @@ class ProviderTestHandler(BaseHTTPRequestHandler):
                 return
             rows = []
             for table in MARKET_TAPE_TABLES:
-                trigger_names = []
-                if table == "actp_market_observations":
-                    trigger_names.append("actp_market_observations_no_update")
-                if table == "actp_market_observation_quality_flags":
-                    trigger_names.append(
-                        "actp_market_observation_quality_flags_no_update"
-                    )
-                if table == "actp_market_discovery_attributions":
-                    trigger_names.append("actp_market_discovery_attributions_no_update")
-                if table == "actp_market_query_attempts":
-                    trigger_names.append("actp_market_query_attempts_no_update")
-                if table == "actp_trend_observations":
-                    trigger_names.append("actp_trend_observations_no_update")
+                trigger_names = (
+                    [APPEND_ONLY_TRIGGERS[table]]
+                    if table in APPEND_ONLY_TRIGGERS
+                    else []
+                )
                 rows.append({
                     "table_name": table,
                     "relation_exists": True,
                     "rls_enabled": True,
                     "policy_count": 0,
                     "trigger_names": trigger_names,
+                    "index_names": [
+                        index_name
+                        for index_name, index_table in REQUIRED_INDEXES.items()
+                        if index_table == table
+                    ],
                 })
             self._json(rows)
             return
@@ -775,6 +774,8 @@ def test_market_tape_migration_verifies_security_invariants_over_real_http(provi
     assert result["rls_disabled"] == []
     assert result["unexpected_rls_policies"] == {}
     assert result["missing_append_only_triggers"] == []
+    assert result["required_indexes_expected"] == len(REQUIRED_INDEXES)
+    assert result["missing_required_indexes"] == []
     assert posts[0]["path"] == f"/v1/projects/{project_ref}/database/query"
     assert posts[0]["body"]["read_only"] is True
     assert "pg_catalog.pg_policies" in posts[0]["body"]["query"]
