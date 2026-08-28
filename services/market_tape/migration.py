@@ -17,7 +17,7 @@ from .config import REPO_ROOT, load_runtime_environment
 from .sources.base import sanitize
 
 
-MIGRATION_NAME = "market_tape_v6"
+MIGRATION_NAME = "market_tape_v7"
 MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v1.sql",
     REPO_ROOT / "migrations" / "market_tape_v2_discovery_attributions.sql",
@@ -25,6 +25,7 @@ MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v4_trend_activity.sql",
     REPO_ROOT / "migrations" / "market_tape_v5_observation_quality.sql",
     REPO_ROOT / "migrations" / "market_tape_v6_semantic_topics.sql",
+    REPO_ROOT / "migrations" / "market_tape_v7_software_repository_changes.sql",
 )
 MIGRATION_PATH = MIGRATION_PATHS[-1]
 VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v6.sql"

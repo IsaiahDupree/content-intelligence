@@ -38,6 +38,9 @@ BINDINGS_LIST_CONTRACT = "market_tape_semantic_bindings_v1"
 ATOMIC_SELECTION_CONTRACT = "reviewed_atomic_topic_selection_v1"
 ATOMIC_SELECTION_WRITE_CONTRACT = "market_tape_atomic_topic_selection_write_v1"
 EVIDENCE_RECEIPT_CONTRACT = "canonical_content_evidence_receipt_v1"
+SOFTWARE_CHANGE_RECEIPT_TYPE = "software_change_receipt"
+SOFTWARE_REPOSITORY_CHANGE_SOURCE_KIND = "software_repository_change"
+FRESH_SOFTWARE_SOURCE_POLICY = "fresh_software_evidence_only_v1"
 GENERATION_CONTEXT_CONTRACT = "semantic_trend_generation_context_v1"
 GENERATION_HANDOFF_CONTRACT = "semantic_trend_generation_handoff_v1"
 SEMANTIC_LINEAGE_CONTRACT = "semantic_trend_content_lineage_v1"
@@ -88,6 +91,7 @@ SOURCE_KINDS = {
     "market_tape_opportunity",
     "transcript_phrase",
     "external_signal",
+    SOFTWARE_REPOSITORY_CHANGE_SOURCE_KIND,
 }
 BINDING_DECISIONS = {
     "approved",
@@ -137,6 +141,26 @@ def canonical_json(value: Any) -> str:
         separators=(",", ":"),
         ensure_ascii=False,
         default=str,
+    )
+
+
+def _generation_handoff_evidence_ready(
+    *,
+    transcript_receipts: int,
+    software_change_receipts: int,
+    human_moments: int,
+    external_references: int,
+    fresh_software_only: bool,
+) -> bool:
+    source_ready = (
+        software_change_receipts >= 1 and transcript_receipts == 0
+        if fresh_software_only
+        else transcript_receipts >= 1
+    )
+    return (
+        source_ready
+        and human_moments == 1
+        and external_references == 0
     )
 
 
@@ -1636,10 +1660,26 @@ class SemanticTopicService:
                           selection.selection_sha256,
                           SUM(CASE WHEN receipt.evidence_type='transcript_receipt'
                               THEN 1 ELSE 0 END) AS transcript_receipts,
+                          SUM(CASE WHEN receipt.evidence_type='software_change_receipt'
+                              THEN 1 ELSE 0 END) AS software_change_receipts,
                           SUM(CASE WHEN receipt.evidence_type='human_moment'
                               THEN 1 ELSE 0 END) AS human_moments,
                           SUM(CASE WHEN receipt.evidence_type='external_reference'
-                              THEN 1 ELSE 0 END) AS external_references
+                              THEN 1 ELSE 0 END) AS external_references,
+                          CASE WHEN EXISTS (
+                              SELECT 1
+                              FROM mt_atomic_topic_selection_sources source
+                              JOIN mt_topic_signal_candidates signal
+                                ON signal.signal_id = source.signal_id
+                              WHERE source.selection_id = selection.selection_id
+                          ) AND NOT EXISTS (
+                              SELECT 1
+                              FROM mt_atomic_topic_selection_sources source
+                              JOIN mt_topic_signal_candidates signal
+                                ON signal.signal_id = source.signal_id
+                              WHERE source.selection_id = selection.selection_id
+                                AND signal.source_kind <> 'software_repository_change'
+                          ) THEN 1 ELSE 0 END AS fresh_software_only
                    FROM mt_atomic_topic_selections selection
                    LEFT JOIN mt_content_evidence_receipts receipt
                      ON receipt.selection_id = selection.selection_id
@@ -1747,9 +1787,15 @@ class SemanticTopicService:
             else "partial"
         )
         handoff_ready = sum(
-            int(row["transcript_receipts"] or 0) >= 1
-            and int(row["human_moments"] or 0) == 1
-            and int(row["external_references"] or 0) == 0
+            _generation_handoff_evidence_ready(
+                transcript_receipts=int(row["transcript_receipts"] or 0),
+                software_change_receipts=int(
+                    row["software_change_receipts"] or 0
+                ),
+                human_moments=int(row["human_moments"] or 0),
+                external_references=int(row["external_references"] or 0),
+                fresh_software_only=bool(row["fresh_software_only"]),
+            )
             for row in selection_rows
         )
         approved_selections = sum(
@@ -1930,10 +1976,20 @@ class SemanticTopicService:
                         "reviewed_at": row["reviewed_at"],
                         "review_receipt_id": row["review_receipt_id"],
                         "selection_sha256": row["selection_sha256"],
-                        "generation_handoff_ready": (
-                            int(row["transcript_receipts"] or 0) >= 1
-                            and int(row["human_moments"] or 0) == 1
-                            and int(row["external_references"] or 0) == 0
+                        "generation_handoff_ready": _generation_handoff_evidence_ready(
+                            transcript_receipts=int(
+                                row["transcript_receipts"] or 0
+                            ),
+                            software_change_receipts=int(
+                                row["software_change_receipts"] or 0
+                            ),
+                            human_moments=int(row["human_moments"] or 0),
+                            external_references=int(
+                                row["external_references"] or 0
+                            ),
+                            fresh_software_only=bool(
+                                row["fresh_software_only"]
+                            ),
                         ),
                     }
                     for row in selection_rows[:bounded]
@@ -2237,6 +2293,7 @@ class SemanticTopicService:
         )
         allowed_types = {
             "transcript_receipt",
+            SOFTWARE_CHANGE_RECEIPT_TYPE,
             "audience_evidence",
             "human_moment",
             "conversion_evidence",
@@ -2264,6 +2321,15 @@ class SemanticTopicService:
             if source_uri not in (None, "")
             else None
         )
+        if evidence_type == SOFTWARE_CHANGE_RECEIPT_TYPE:
+            if claim is None:
+                raise SemanticContractError(
+                    "software_change_receipt requires a claim describing the change"
+                )
+            if source_uri is None:
+                raise SemanticContractError(
+                    "software_change_receipt requires a source_uri"
+                )
         with self.store.connect() as connection:
             selection_row = connection.execute(
                 "SELECT * FROM mt_atomic_topic_selections WHERE selection_id = ?",
@@ -2272,6 +2338,15 @@ class SemanticTopicService:
             if selection_row is None:
                 raise SemanticContractError("selection_id does not exist")
             selection = json.loads(selection_row["selection_json"])
+            if evidence_type == SOFTWARE_CHANGE_RECEIPT_TYPE and not (
+                self._selection_uses_only_software_repository_changes(
+                    connection, selection_id
+                )
+            ):
+                raise SemanticContractError(
+                    "software_change_receipt requires a selection sourced only "
+                    "from software_repository_change bindings"
+                )
             allowed_observations = set(selection["observation_ids"])
             raw_observation_ids = payload.get("observation_ids")
             observation_ids = (
@@ -2382,6 +2457,9 @@ class SemanticTopicService:
                 raise SemanticContractError(
                     "atomic selection has no binding/observation lineage"
                 )
+            source_kinds = self._selection_source_kinds(
+                connection, canonical_selection_id
+            )
             bindings: List[Dict[str, Any]] = []
             observations: List[Dict[str, Any]] = []
             for source in source_rows:
@@ -2423,7 +2501,20 @@ class SemanticTopicService:
                 )
             ]
         by_type = Counter(row["evidence_type"] for row in evidence)
-        if by_type["transcript_receipt"] < 1:
+        fresh_software_only = source_kinds == (
+            SOFTWARE_REPOSITORY_CHANGE_SOURCE_KIND,
+        )
+        if fresh_software_only:
+            if by_type[SOFTWARE_CHANGE_RECEIPT_TYPE] < 1:
+                raise SemanticContractError(
+                    "fresh software generation handoff requires at least one "
+                    "software_change_receipt"
+                )
+            if by_type["transcript_receipt"]:
+                raise SemanticContractError(
+                    "fresh software generation handoff cannot include transcript receipts"
+                )
+        elif by_type["transcript_receipt"] < 1:
             raise SemanticContractError(
                 "generation handoff requires at least one transcript receipt"
             )
@@ -2435,23 +2526,28 @@ class SemanticTopicService:
             raise SemanticContractError(
                 "external references cannot authorize generation"
             )
-        return {
+        plan_request_base = {
+            "contract_type": "semantic_trend_plan_request_v1",
+            "topic_bindings": bindings,
+            "atomic_topic_selection": selection,
+            "topic_observations": observations,
+            "evidence_receipts": evidence,
+        }
+        result = {
             "status": "ok",
             "contract": GENERATION_HANDOFF_CONTRACT,
             "state": "ready",
             "selection_id": canonical_selection_id,
             "target_contract": "semantic_trend_plan_request_v1",
-            "plan_request_base": {
-                "contract_type": "semantic_trend_plan_request_v1",
-                "topic_bindings": bindings,
-                "atomic_topic_selection": selection,
-                "topic_observations": observations,
-                "evidence_receipts": evidence,
-            },
+            "plan_request_base": plan_request_base,
             "completion_required": ["content_spec"],
             "ready_for_foundry_plan_request": True,
             "generation_authorized_by_ai": False,
         }
+        if fresh_software_only:
+            plan_request_base["source_policy"] = FRESH_SOFTWARE_SOURCE_POLICY
+            result["source_policy"] = FRESH_SOFTWARE_SOURCE_POLICY
+        return result
 
     def register_content_lineage(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, Mapping):
@@ -3105,13 +3201,26 @@ class SemanticTopicService:
                         (selection_id,),
                     )
                 }
+                fresh_software_only = (
+                    self._selection_uses_only_software_repository_changes(
+                        connection, selection_id
+                    )
+                )
                 selection.update({
                     "review_state": "approved",
                     "reviewer_type": selection_row["reviewer_type"],
-                    "generation_handoff_ready": (
-                        receipt_counts.get("transcript_receipt", 0) >= 1
-                        and receipt_counts.get("human_moment", 0) == 1
-                        and receipt_counts.get("external_reference", 0) == 0
+                    "generation_handoff_ready": _generation_handoff_evidence_ready(
+                        transcript_receipts=receipt_counts.get(
+                            "transcript_receipt", 0
+                        ),
+                        software_change_receipts=receipt_counts.get(
+                            SOFTWARE_CHANGE_RECEIPT_TYPE, 0
+                        ),
+                        human_moments=receipt_counts.get("human_moment", 0),
+                        external_references=receipt_counts.get(
+                            "external_reference", 0
+                        ),
+                        fresh_software_only=fresh_software_only,
                     ),
                     "generation_authorized_by_ai": False,
                 })
@@ -3576,6 +3685,32 @@ class SemanticTopicService:
         ]
 
     @staticmethod
+    def _selection_source_kinds(
+        connection: sqlite3.Connection, selection_id: str
+    ) -> tuple[str, ...]:
+        return tuple(
+            sorted({
+                str(row["source_kind"])
+                for row in connection.execute(
+                    """SELECT signal.source_kind
+                       FROM mt_atomic_topic_selection_sources source
+                       JOIN mt_topic_signal_candidates signal
+                         ON signal.signal_id = source.signal_id
+                       WHERE source.selection_id = ?""",
+                    (selection_id,),
+                )
+            })
+        )
+
+    @classmethod
+    def _selection_uses_only_software_repository_changes(
+        cls, connection: sqlite3.Connection, selection_id: str
+    ) -> bool:
+        return cls._selection_source_kinds(connection, selection_id) == (
+            SOFTWARE_REPOSITORY_CHANGE_SOURCE_KIND,
+        )
+
+    @staticmethod
     def _current_out_of_scope(
         connection: sqlite3.Connection, signal_id: str
     ) -> bool:
@@ -3635,6 +3770,8 @@ class SemanticTopicService:
             "source_system": "market-tape",
             "source_receipt_sha256": signal["evidence_sha256"],
         }
+        if signal["source_kind"] == SOFTWARE_REPOSITORY_CHANGE_SOURCE_KIND:
+            core["source_kind"] = SOFTWARE_REPOSITORY_CHANGE_SOURCE_KIND
         return {**core, "binding_sha256": stable_hash(core)}
 
     def _export_observation(

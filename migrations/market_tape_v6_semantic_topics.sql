@@ -86,7 +86,8 @@ create table if not exists public.actp_semantic_signal_candidates (
   )),
   source_kind text not null check (source_kind in (
     'market_tape_trend', 'market_tape_keyword', 'market_tape_query',
-    'market_tape_opportunity', 'transcript_phrase', 'external_signal'
+    'market_tape_opportunity', 'transcript_phrase', 'external_signal',
+    'software_repository_change'
   )),
   source_entity_id text not null,
   source_trend_id text,
@@ -301,7 +302,7 @@ create table if not exists public.actp_semantic_content_evidence_receipts (
   selection_id text not null,
   evidence_type text not null check (evidence_type in (
     'transcript_receipt', 'audience_evidence', 'human_moment',
-    'conversion_evidence', 'external_reference'
+    'conversion_evidence', 'external_reference', 'software_change_receipt'
   )),
   status text not null check (status in ('ready', 'verified', 'accepted')),
   source_system text not null,

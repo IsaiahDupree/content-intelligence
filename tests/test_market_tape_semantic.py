@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -125,12 +126,13 @@ def _signal(
     graph_version_id: str,
     text: str,
     source_id: str,
+    source_kind: str = "external_signal",
 ) -> dict:
     return service.ingest_signal({
         "contract": SIGNAL_CONTRACT,
         "graph_version_id": graph_version_id,
         "signal_type": "keyword",
-        "source_kind": "external_signal",
+        "source_kind": source_kind,
         "source_entity_id": source_id,
         "source_observed_at": "2026-08-28T18:05:00Z",
         "signal_text": text,
@@ -160,7 +162,7 @@ def _evidence(
     evidence_type: str,
     ordinal: int,
 ) -> dict:
-    return service.record_evidence_receipt({
+    payload = {
         "selection_id": selection_id,
         "evidence_type": evidence_type,
         "status": "ready" if evidence_type == "transcript_receipt" else "verified",
@@ -168,7 +170,16 @@ def _evidence(
         "source_record_id": f"{evidence_type.replace('_', '.')}.{ordinal}",
         "source_record_sha256": f"{ordinal:x}" * 64,
         "created_at": f"2026-08-28T18:{20 + ordinal:02d}:00Z",
-    })
+    }
+    if evidence_type == "software_change_receipt":
+        payload.update({
+            "claim": "The current repository change adds a verified workflow.",
+            "source_uri": (
+                "https://github.com/IsaiahDupree/storyrail/commit/"
+                + f"{ordinal:x}" * 40
+            ),
+        })
+    return service.record_evidence_receipt(payload)
 
 
 def _content_spec() -> dict:
@@ -475,6 +486,16 @@ def test_atomic_selection_evidence_gates_and_foundry_registration_are_durable(
     assert selected["generation_handoff_ready"] is False
     assert selected["ai_selected"] is False
 
+    with pytest.raises(
+        SemanticContractError,
+        match="selection sourced only from software_repository_change",
+    ):
+        _evidence(
+            service,
+            selection["selection_id"],
+            "software_change_receipt",
+            3,
+        )
     with pytest.raises(SemanticContractError, match="transcript receipt"):
         service.generation_handoff(selection["selection_id"])
     _evidence(service, selection["selection_id"], "transcript_receipt", 1)
@@ -486,6 +507,9 @@ def test_atomic_selection_evidence_gates_and_foundry_registration_are_durable(
     assert handoff["state"] == "ready"
     assert handoff["ready_for_foundry_plan_request"] is True
     assert handoff["generation_authorized_by_ai"] is False
+    assert "source_policy" not in handoff
+    assert "source_policy" not in handoff["plan_request_base"]
+    assert "source_kind" not in handoff["plan_request_base"]["topic_bindings"][0]
     request = {**handoff["plan_request_base"], "content_spec": _content_spec()}
     foundry_plan = build_semantic_trend_content_plan(ontology, request)
     registration = foundry_plan["persistence_registration"]
@@ -640,6 +664,106 @@ def test_atomic_selection_evidence_gates_and_foundry_registration_are_durable(
     assert attributed["causal_effect"] is None
 
 
+def test_fresh_software_change_handoff_uses_repository_receipt_without_transcript(
+    tmp_path: Path,
+):
+    store = MarketTapeStore(_config(tmp_path))
+    service = SemanticTopicService(store)
+    imported = _import(service)
+    graph_id = imported["graph"]["graph_version_id"]
+    signal = _signal(
+        service,
+        graph_id,
+        "AI avatar",
+        "storyrail-current-commit",
+        source_kind="software_repository_change",
+    )
+    binding = service.resolve_signal(
+        signal["signal_id"], use_ai=False
+    )["binding"]
+
+    def select(ordinal: int) -> dict:
+        return service.record_atomic_selection({
+            "graph_version_id": graph_id,
+            "atomic_topic_id": "atomic_subject.avatar-test",
+            "binding_ids": [binding["binding_id"]],
+            "reviewer_type": "human",
+            "reviewer_id": "reviewer.test-owner",
+            "reviewed_at": f"2026-08-28T19:0{ordinal}:00Z",
+            "review_receipt_id": f"receipt.software.review.{ordinal}",
+            "rationale": "The current code change supports this reviewed subject.",
+        })["selection"]
+
+    selection = select(1)
+    with pytest.raises(
+        SemanticContractError, match="software_change_receipt requires a claim"
+    ):
+        service.record_evidence_receipt({
+            "selection_id": selection["selection_id"],
+            "evidence_type": "software_change_receipt",
+            "status": "verified",
+            "source_system": "github",
+            "source_record_id": "commit.current.1",
+            "source_record_sha256": "1" * 64,
+            "source_uri": "https://github.com/IsaiahDupree/storyrail/commit/one",
+        })
+    with pytest.raises(SemanticContractError, match="software_change_receipt"):
+        service.generation_handoff(selection["selection_id"])
+    software_receipt = _evidence(
+        service, selection["selection_id"], "software_change_receipt", 1
+    )["receipt"]
+    with pytest.raises(SemanticContractError, match="human moment"):
+        service.generation_handoff(selection["selection_id"])
+    _evidence(service, selection["selection_id"], "human_moment", 2)
+
+    handoff = service.generation_handoff(selection["selection_id"])
+
+    assert handoff["state"] == "ready"
+    assert handoff["source_policy"] == "fresh_software_evidence_only_v1"
+    assert (
+        handoff["plan_request_base"]["source_policy"]
+        == "fresh_software_evidence_only_v1"
+    )
+    assert handoff["plan_request_base"]["topic_bindings"][0]["source_kind"] == (
+        "software_repository_change"
+    )
+    assert software_receipt["evidence_type"] == "software_change_receipt"
+    assert {
+        receipt["evidence_type"]
+        for receipt in handoff["plan_request_base"]["evidence_receipts"]
+    } == {"software_change_receipt", "human_moment"}
+    health = service.mapping_health(graph_version_id=graph_id)
+    assert health["atomic_selection_reviews"]["generation_handoff_ready"] == 1
+
+    _evidence(service, selection["selection_id"], "transcript_receipt", 3)
+    with pytest.raises(
+        SemanticContractError, match="cannot include transcript receipts"
+    ):
+        service.generation_handoff(selection["selection_id"])
+
+    external_selection = select(2)
+    _evidence(
+        service,
+        external_selection["selection_id"],
+        "software_change_receipt",
+        4,
+    )
+    _evidence(service, external_selection["selection_id"], "human_moment", 5)
+    _evidence(
+        service,
+        external_selection["selection_id"],
+        "external_reference",
+        6,
+    )
+    with pytest.raises(
+        SemanticContractError, match="external references cannot authorize"
+    ):
+        service.generation_handoff(external_selection["selection_id"])
+    _evidence(service, external_selection["selection_id"], "human_moment", 7)
+    with pytest.raises(SemanticContractError, match="exactly one human moment"):
+        service.generation_handoff(external_selection["selection_id"])
+
+
 def test_semantic_read_apis_are_stable_and_writes_require_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -792,7 +916,7 @@ def test_v15_upgrade_preserves_existing_rows_and_self_heals_semantic_tables(
     with store.connect() as connection:
         assert connection.execute(
             "SELECT value FROM mt_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "16"
+        ).fetchone()[0] == "17"
         assert connection.execute(
             "SELECT payload FROM pre_upgrade_sentinel WHERE sentinel_id='sentinel-1'"
         ).fetchone()[0] == "must survive"
@@ -819,3 +943,99 @@ def test_v15_upgrade_preserves_existing_rows_and_self_heals_semantic_tables(
             "mt_semantic_content_lineage",
         }.issubset(tables)
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_v16_semantic_enum_upgrade_archives_and_preserves_existing_lineage(
+    tmp_path: Path,
+):
+    config = _config(tmp_path, "semantic-v16-upgrade.sqlite3")
+    store = MarketTapeStore(config)
+    service = SemanticTopicService(store)
+    imported, _signal_row, binding = _approved_binding(service)
+    selection = service.record_atomic_selection({
+        "graph_version_id": imported["graph"]["graph_version_id"],
+        "atomic_topic_id": "atomic_subject.avatar-test",
+        "binding_ids": [binding["binding_id"]],
+        "reviewer_type": "human",
+        "reviewer_id": "reviewer.test-owner",
+        "reviewed_at": "2026-08-28T20:00:00Z",
+        "review_receipt_id": "receipt.semantic-v16-upgrade",
+        "rationale": "Seed durable lineage before the enum-only upgrade.",
+    })["selection"]
+    _evidence(service, selection["selection_id"], "transcript_receipt", 1)
+    _evidence(service, selection["selection_id"], "human_moment", 2)
+
+    with sqlite3.connect(config.db_path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("PRAGMA legacy_alter_table = ON")
+        source_sql = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='mt_topic_signal_candidates'"""
+        ).fetchone()[0]
+        receipt_sql = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='mt_content_evidence_receipts'"""
+        ).fetchone()[0]
+        source_columns = ", ".join(
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(mt_topic_signal_candidates)"
+            )
+        )
+        receipt_columns = ", ".join(
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(mt_content_evidence_receipts)"
+            )
+        )
+        connection.execute(
+            """ALTER TABLE mt_topic_signal_candidates
+               RENAME TO mt_topic_signal_candidates_v17_seed"""
+        )
+        connection.execute(
+            re.sub(r",\s*'software_repository_change'", "", source_sql)
+        )
+        connection.execute(
+            f"""INSERT INTO mt_topic_signal_candidates({source_columns})
+                SELECT {source_columns}
+                FROM mt_topic_signal_candidates_v17_seed"""
+        )
+        connection.execute(
+            """ALTER TABLE mt_content_evidence_receipts
+               RENAME TO mt_content_evidence_receipts_v17_seed"""
+        )
+        connection.execute(
+            re.sub(r",\s*'software_change_receipt'", "", receipt_sql)
+        )
+        connection.execute(
+            f"""INSERT INTO mt_content_evidence_receipts({receipt_columns})
+                SELECT {receipt_columns}
+                FROM mt_content_evidence_receipts_v17_seed"""
+        )
+        connection.commit()
+
+    upgraded = MarketTapeStore(config)
+    with upgraded.connect() as connection:
+        source_table_sql = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='mt_topic_signal_candidates'"""
+        ).fetchone()[0]
+        receipt_table_sql = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='mt_content_evidence_receipts'"""
+        ).fetchone()[0]
+        assert "software_repository_change" in source_table_sql
+        assert "software_change_receipt" in receipt_table_sql
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_topic_signal_candidates"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_topic_signal_candidates_v16_archive"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_content_evidence_receipts"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_content_evidence_receipts_v16_archive"
+        ).fetchone()[0] == 2
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

@@ -29,7 +29,7 @@ from .predictor import (
 )
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 COUNTER_REGRESSION_FLAG_PREFIX = "counter-regression:"
 ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT = (
     "market_tape_accepted_observation_evidence_v1"
@@ -73,6 +73,208 @@ SCRIPT_LANGUAGE_DEMAND_FINAL_EVENTS = {
     "blocked",
     "failed",
 }
+
+
+def _migrate_semantic_repository_change_constraints(
+    connection: sqlite3.Connection,
+) -> None:
+    """Expand semantic enums while preserving the prior tables as archives."""
+
+    table_sql = {
+        str(row["name"]): str(row["sql"] or "")
+        for row in connection.execute(
+            """SELECT name, sql FROM sqlite_master
+               WHERE type = 'table' AND name IN (
+                   'mt_topic_signal_candidates',
+                   'mt_content_evidence_receipts'
+               )"""
+        )
+    }
+    migrate_signals = (
+        "software_repository_change"
+        not in table_sql.get("mt_topic_signal_candidates", "")
+    )
+    migrate_receipts = (
+        "software_change_receipt"
+        not in table_sql.get("mt_content_evidence_receipts", "")
+    )
+    if not migrate_signals and not migrate_receipts:
+        return
+
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute("PRAGMA legacy_alter_table = ON")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if migrate_signals:
+            connection.execute(
+                """ALTER TABLE mt_topic_signal_candidates
+                   RENAME TO mt_topic_signal_candidates_v16_archive"""
+            )
+            connection.execute(
+                """CREATE TABLE mt_topic_signal_candidates (
+                    signal_id TEXT PRIMARY KEY,
+                    graph_version_id TEXT NOT NULL,
+                    signal_type TEXT NOT NULL CHECK(signal_type IN (
+                        'topic', 'keyword', 'query', 'question', 'problem',
+                        'objection', 'claim', 'angle', 'hook', 'title',
+                        'format', 'platform', 'offer', 'hashtag', 'audio',
+                        'opportunity', 'other'
+                    )),
+                    source_kind TEXT NOT NULL CHECK(source_kind IN (
+                        'market_tape_trend', 'market_tape_keyword',
+                        'market_tape_query', 'market_tape_opportunity',
+                        'transcript_phrase', 'external_signal',
+                        'software_repository_change'
+                    )),
+                    source_entity_id TEXT NOT NULL,
+                    source_trend_id TEXT,
+                    source_observed_at TEXT NOT NULL,
+                    signal_text TEXT NOT NULL,
+                    normalized_signal_text TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL CHECK(
+                        length(evidence_sha256) = 64
+                    ),
+                    evidence_json TEXT NOT NULL,
+                    ingested_at TEXT NOT NULL,
+                    UNIQUE(signal_id, graph_version_id),
+                    UNIQUE(
+                        graph_version_id, source_kind, source_entity_id,
+                        source_observed_at, signal_type, evidence_sha256
+                    ),
+                    FOREIGN KEY(graph_version_id)
+                        REFERENCES mt_topic_graph_versions(graph_version_id),
+                    FOREIGN KEY(source_trend_id)
+                        REFERENCES mt_trends(trend_id)
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO mt_topic_signal_candidates(
+                    signal_id, graph_version_id, signal_type, source_kind,
+                    source_entity_id, source_trend_id, source_observed_at,
+                    signal_text, normalized_signal_text, source_receipt_id,
+                    evidence_sha256, evidence_json, ingested_at
+                ) SELECT
+                    signal_id, graph_version_id, signal_type, source_kind,
+                    source_entity_id, source_trend_id, source_observed_at,
+                    signal_text, normalized_signal_text, source_receipt_id,
+                    evidence_sha256, evidence_json, ingested_at
+                  FROM mt_topic_signal_candidates_v16_archive"""
+            )
+            connection.execute(
+                """CREATE INDEX mt_topic_signals_graph_type_v17_idx
+                   ON mt_topic_signal_candidates(
+                       graph_version_id, signal_type, ingested_at DESC
+                   )"""
+            )
+            connection.execute(
+                """CREATE INDEX mt_topic_signals_source_v17_idx
+                   ON mt_topic_signal_candidates(
+                       source_kind, source_entity_id, source_observed_at DESC
+                   )"""
+            )
+            connection.execute(
+                """CREATE TRIGGER mt_topic_signal_candidates_v17_no_update
+                   BEFORE UPDATE ON mt_topic_signal_candidates
+                   BEGIN
+                       SELECT RAISE(
+                           ABORT, 'topic signal candidates are append-only'
+                       );
+                   END"""
+            )
+            connection.execute(
+                """CREATE TRIGGER mt_topic_signal_candidates_v17_no_delete
+                   BEFORE DELETE ON mt_topic_signal_candidates
+                   BEGIN
+                       SELECT RAISE(
+                           ABORT, 'topic signal candidates are append-only'
+                       );
+                   END"""
+            )
+        if migrate_receipts:
+            connection.execute(
+                """ALTER TABLE mt_content_evidence_receipts
+                   RENAME TO mt_content_evidence_receipts_v16_archive"""
+            )
+            connection.execute(
+                """CREATE TABLE mt_content_evidence_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    selection_id TEXT NOT NULL,
+                    evidence_type TEXT NOT NULL CHECK(evidence_type IN (
+                        'transcript_receipt', 'audience_evidence',
+                        'human_moment', 'conversion_evidence',
+                        'external_reference', 'software_change_receipt'
+                    )),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'ready', 'verified', 'accepted'
+                    )),
+                    source_system TEXT NOT NULL,
+                    source_record_id TEXT NOT NULL,
+                    source_record_sha256 TEXT NOT NULL CHECK(
+                        length(source_record_sha256) = 64
+                    ),
+                    observation_ids_json TEXT NOT NULL,
+                    claim TEXT,
+                    source_uri TEXT,
+                    receipt_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(receipt_sha256) = 64
+                    ),
+                    receipt_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(selection_id)
+                        REFERENCES mt_atomic_topic_selections(selection_id)
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO mt_content_evidence_receipts(
+                    receipt_id, selection_id, evidence_type, status,
+                    source_system, source_record_id, source_record_sha256,
+                    observation_ids_json, claim, source_uri,
+                    receipt_sha256, receipt_json, created_at
+                ) SELECT
+                    receipt_id, selection_id, evidence_type, status,
+                    source_system, source_record_id, source_record_sha256,
+                    observation_ids_json, claim, source_uri,
+                    receipt_sha256, receipt_json, created_at
+                  FROM mt_content_evidence_receipts_v16_archive"""
+            )
+            connection.execute(
+                """CREATE INDEX mt_content_evidence_selection_v17_idx
+                   ON mt_content_evidence_receipts(
+                       selection_id, evidence_type, created_at
+                   )"""
+            )
+            connection.execute(
+                """CREATE TRIGGER mt_content_evidence_receipts_v17_no_update
+                   BEFORE UPDATE ON mt_content_evidence_receipts
+                   BEGIN
+                       SELECT RAISE(
+                           ABORT, 'content evidence receipts are append-only'
+                       );
+                   END"""
+            )
+            connection.execute(
+                """CREATE TRIGGER mt_content_evidence_receipts_v17_no_delete
+                   BEFORE DELETE ON mt_content_evidence_receipts
+                   BEGIN
+                       SELECT RAISE(
+                           ABORT, 'content evidence receipts are append-only'
+                       );
+                   END"""
+            )
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(
+                "semantic repository-change migration violated foreign keys"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA legacy_alter_table = OFF")
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 class ScriptLanguageDemandClaimConflict(ValueError):
@@ -1295,7 +1497,8 @@ class MarketTapeStore:
                     source_kind TEXT NOT NULL CHECK(source_kind IN (
                         'market_tape_trend', 'market_tape_keyword',
                         'market_tape_query', 'market_tape_opportunity',
-                        'transcript_phrase', 'external_signal'
+                        'transcript_phrase', 'external_signal',
+                        'software_repository_change'
                     )),
                     source_entity_id TEXT NOT NULL,
                     source_trend_id TEXT,
@@ -1634,7 +1837,7 @@ class MarketTapeStore:
                     evidence_type TEXT NOT NULL CHECK(evidence_type IN (
                         'transcript_receipt', 'audience_evidence',
                         'human_moment', 'conversion_evidence',
-                        'external_reference'
+                        'external_reference', 'software_change_receipt'
                     )),
                     status TEXT NOT NULL CHECK(status IN (
                         'ready', 'verified', 'accepted'
@@ -1912,6 +2115,7 @@ class MarketTapeStore:
                 );
                 """
             )
+            _migrate_semantic_repository_change_constraints(connection)
             _backfill_script_language_demand_lineage(connection)
             transcript_attempt_columns = {
                 row[1]
