@@ -27,6 +27,7 @@ from .reference_corpus import (
     ReferenceCorpusService,
     instagram_source_reader_from_env,
 )
+from .reference_script_binding import ReferenceScriptQualityBinder
 from .script_experiments import register_script_experiment_routes
 
 
@@ -95,6 +96,10 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         script_experiments=script_experiments,
     )
     app.extensions["marketing_script_compiler"] = marketing_script_compiler
+    reference_script_quality_binder = ReferenceScriptQualityBinder(engine.store)
+    app.extensions["reference_script_quality_binder"] = (
+        reference_script_quality_binder
+    )
 
     @app.errorhandler(ValueError)
     def invalid_request(error: ValueError):
@@ -610,6 +615,49 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         return audited_agent_response(
             "reference_corpus_script",
             {"script_id": script_id},
+            result,
+            started_at=started,
+        )
+
+    @app.post("/api/reference-corpus/scripts/<script_id>/bind-quality")
+    def reference_corpus_bind_quality(script_id: str):
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            package = marketing_script_compiler.get(script_id)
+            if package is None:
+                return audited_agent_response(
+                    "reference_corpus_bind_quality",
+                    {"script_id": script_id, **payload},
+                    {
+                        "status": "error",
+                        "code": "REFERENCE_SCRIPT_NOT_FOUND",
+                        "script_id": script_id,
+                    },
+                    404,
+                    started,
+                )
+            result = reference_script_quality_binder.bind(
+                package,
+                source_receipt_ids=payload.get("source_receipt_ids") or [],
+                source_moment_receipt_id=str(
+                    payload.get("source_moment_receipt_id") or ""
+                ),
+                source_moment_id=str(payload.get("source_moment_id") or ""),
+            )
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_bind_quality",
+                {"script_id": script_id, **payload},
+                error,
+                started,
+            )
+        return audited_agent_response(
+            "reference_corpus_bind_quality",
+            {"script_id": script_id, **payload},
             result,
             started_at=started,
         )
@@ -1590,8 +1638,13 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
     @app.post("/api/narrative-coherence/audit")
     def narrative_coherence_audit():
         payload = json_body()
-        if not payload.get("timeline"):
-            raise ValueError("a semantic timeline is required to audit narrative coherence")
+        if not payload.get("timeline") and not str(
+            payload.get("script_id") or ""
+        ).strip():
+            raise ValueError(
+                "script_id or a semantic timeline is required to audit "
+                "narrative coherence"
+            )
         return jsonify(engine.narrative.audit(payload))
 
     @app.get("/api/scripts/<script_id>")

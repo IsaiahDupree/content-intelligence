@@ -68,7 +68,18 @@ def _beat_texts_before(timeline: list[dict[str, Any]], index: int) -> str:
 
 
 def _has_evidence(evidence_summary: dict[str, Any] | None) -> bool:
-    return bool(evidence_summary) and any(
+    if (
+        not evidence_summary
+        or evidence_summary.get("requires_in_timeline_attribution") is False
+        or (
+            evidence_summary.get("contract")
+            == "reference_script_performance_evidence_v1"
+            and evidence_summary.get("requires_in_timeline_attribution")
+            is not True
+        )
+    ):
+        return False
+    return any(
         int(evidence_summary.get(key) or 0) > 0
         for key in ("viral_transcript_patterns", "creator_count", "observed_views_snapshot")
     )

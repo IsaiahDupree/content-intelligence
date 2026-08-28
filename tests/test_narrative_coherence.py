@@ -142,6 +142,34 @@ class RulesAuditTests(unittest.TestCase):
         ]
         self.assertEqual(rules_audit(timeline, None), [])
 
+    def test_relatability_only_evidence_does_not_force_meta_narration(self):
+        timeline = [
+            {"start": 0.0, "end": 3.0, "beat": "human_hook", "text": "Your lead waits."},
+            {"start": 3.0, "end": 8.0, "beat": "proof", "text": "A quote form records the lead."},
+            {"start": 8.0, "end": 12.0, "beat": "payoff", "text": "Now the wait is measurable."},
+            {"start": 12.0, "end": 15.0, "beat": "cta", "text": "Score one task today."},
+        ]
+        evidence = {
+            **EVIDENCE,
+            "requires_in_timeline_attribution": False,
+            "performance_evidence_scope": "relatability_prediction_only",
+        }
+        self.assertEqual(rules_audit(timeline, evidence), [])
+
+    def test_reference_performance_evidence_v1_defaults_to_relatability_scope(self):
+        timeline = [
+            {"start": 0.0, "end": 3.0, "beat": "human_hook", "text": "Your lead waits."},
+            {"start": 3.0, "end": 8.0, "beat": "proof", "text": "A quote form records the lead."},
+            {"start": 8.0, "end": 12.0, "beat": "payoff", "text": "Now the wait is measurable."},
+            {"start": 12.0, "end": 15.0, "beat": "cta", "text": "Score one task today."},
+        ]
+        evidence = {
+            "contract": "reference_script_performance_evidence_v1",
+            "creator_count": 5,
+            "observed_views_snapshot": 150000,
+        }
+        self.assertEqual(rules_audit(timeline, evidence), [])
+
     def test_empty_timeline_fails_closed(self):
         self.assertEqual(rules_audit([], EVIDENCE)[0]["code"], "EMPTY_TIMELINE")
 

@@ -172,6 +172,8 @@ def stable_id(prefix: str, *parts: Any) -> str:
 SCRIPT_IDENTITY_FIELDS = (
     "topic", "audience", "objective", "brief_id", "trend_id",
     "parent_script_id", "variant_index", "variant_selection_contract",
+    "content_role", "topic_distance_from_offer", "topic_ladder_id",
+    "reference_package_binding",
     "source_receipt_ids", "evidence_binding_receipt_ids", "human_moment",
     "style_guide_id",
     "style_guide_receipt_id", "style_application",
