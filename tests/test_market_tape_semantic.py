@@ -555,6 +555,90 @@ def test_atomic_selection_evidence_gates_and_foundry_registration_are_durable(
     assert lineage["owned_outcomes"]["state"] == "no_owned_outcomes"
     assert lineage["owned_outcomes"]["attribution_readiness"] == "no_owned_outcomes"
 
+    content_id = first["content_id"]
+    with sqlite3.connect(empty_owned_db) as connection:
+        connection.executemany(
+            """INSERT INTO cq_owned_outcome_events (
+                   event_id, event_type, content_id, campaign_id, offer_id,
+                   source_platform, source_id, journey_id, occurred_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    "event:click",
+                    "click",
+                    content_id,
+                    "campaign:semantic",
+                    "offer:creator-system",
+                    "instagram",
+                    "post:semantic-parent",
+                    "journey:one",
+                    "2026-08-28T18:40:00Z",
+                ),
+                (
+                    "event:install",
+                    "install",
+                    content_id,
+                    "campaign:semantic",
+                    "offer:creator-system",
+                    "instagram",
+                    "post:semantic-parent",
+                    "journey:one",
+                    "2026-08-28T18:41:00Z",
+                ),
+                (
+                    "event:trial",
+                    "trial",
+                    content_id,
+                    "campaign:semantic",
+                    "offer:creator-system",
+                    "instagram",
+                    "post:semantic-parent",
+                    "journey:one",
+                    "2026-08-28T18:42:00Z",
+                ),
+                (
+                    "event:purchase",
+                    "purchase",
+                    content_id,
+                    "campaign:semantic",
+                    "offer:creator-system",
+                    "instagram",
+                    "post:semantic-parent",
+                    "journey:one",
+                    "2026-08-28T18:43:00Z",
+                ),
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO cq_owned_retention_samples (
+                   sample_id, content_id, measurement_id, elapsed_ms, observed_at
+               ) VALUES (?, ?, ?, ?, ?)""",
+            [
+                (
+                    "retention:zero",
+                    content_id,
+                    "measurement:one",
+                    0,
+                    "2026-08-28T18:44:00Z",
+                ),
+                (
+                    "retention:two-seconds",
+                    content_id,
+                    "measurement:one",
+                    2000,
+                    "2026-08-28T18:44:00Z",
+                ),
+            ],
+        )
+
+    attributed = service.lineage(content_id=content_id)["owned_outcomes"]
+    assert attributed["state"] == "ready"
+    assert attributed["event_count"] == 4
+    assert attributed["retention_sample_count"] == 2
+    assert attributed["complete_ordered_exact_scope_journeys"] == 1
+    assert attributed["attribution_readiness"] == "outcome_and_retention_ready"
+    assert attributed["causal_effect"] is None
+
 
 def test_semantic_read_apis_are_stable_and_writes_require_token(
     tmp_path: Path,
