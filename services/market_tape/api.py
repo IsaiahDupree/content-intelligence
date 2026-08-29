@@ -327,6 +327,18 @@ def register_market_tape_routes(
             return jsonify({"error": str(exc)}), 400
         return jsonify(result), 201 if result.get("created") else 200
 
+    @app.get("/api/market-tape/semantic/content-lineage/receipt")
+    def market_tape_semantic_content_lineage_receipt():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        try:
+            result = semantic.content_lineage_registration_receipt(
+                request.args.get("content_id") or ""
+            )
+        except SemanticContractError as exc:
+            return jsonify({"error": str(exc)}), 404
+        return jsonify(result)
+
     @app.get("/api/market-tape/agent/catalog")
     def market_tape_agent_catalog():
         if not _authorized():

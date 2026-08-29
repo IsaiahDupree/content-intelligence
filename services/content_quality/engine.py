@@ -10,7 +10,7 @@ import subprocess
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -42,6 +42,19 @@ OWNED_RETENTION_SAMPLE_CONTRACT = "owned_retention_sample_v1"
 OWNED_OUTCOME_SUMMARY_CONTRACT = "owned_outcome_summary_v1"
 OWNED_PUBLICATION_RECEIPT_CONTRACT = "owned_publication_receipt_v1"
 OWNED_PUBLICATION_BINDING_CONTRACT = "owned_publication_binding_v1"
+QUALITY_STORE_SCRIPT_GATE_RECEIPT_CONTRACT = (
+    "quality_store_script_gate_receipt_v1"
+)
+QUALITY_STORE_SCRIPT_GATE_RECEIPT_TTL_SECONDS = 600
+QUALITY_STORE_SCRIPT_GATE_RECEIPT_MAX_TTL_SECONDS = 900
+LIVE_ADMISSION_SCRIPT_AUDITS = (
+    "narrative_coherence",
+    "attention_script",
+    "attention_video_preflight",
+    "relatability_script",
+    "relatability_ai_qualitative",
+    "relatability_transcript_cohort",
+)
 OWNED_OUTCOME_EVENT_TYPES = ("click", "install", "trial", "purchase")
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’-]*")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
@@ -1017,23 +1030,15 @@ class QualityStore:
             "script_sha256": self.script_audit_sha256(stored),
         }
 
-    def script_gate_summary(self, script_id: str) -> dict[str, Any]:
-        stored_script = self.script(script_id)
+    def _script_gate_summary_from_snapshot(
+        self,
+        stored_script: dict[str, Any] | None,
+        rows: Sequence[sqlite3.Row],
+    ) -> dict[str, Any]:
         expected_script_sha256 = (
             self.script_audit_sha256(stored_script)
             if isinstance(stored_script, dict) else None
         )
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                """
-                SELECT audit_type, decision, score, audit_id, findings_json,
-                       created_at
-                FROM cq_audits
-                WHERE subject_id=?
-                ORDER BY created_at DESC, rowid DESC
-                """,
-                (script_id,),
-            ).fetchall()
         latest: dict[str, dict[str, Any]] = {}
         for row in rows:
             if row["audit_type"] not in latest:
@@ -1080,6 +1085,261 @@ class QualityStore:
             },
             "latest_audits": latest,
         }
+
+    def script_gate_summary(self, script_id: str) -> dict[str, Any]:
+        with closing(self.connect()) as connection:
+            connection.execute("BEGIN")
+            stored_row = connection.execute(
+                "SELECT script_json FROM cq_scripts WHERE script_id=?",
+                (script_id,),
+            ).fetchone()
+            stored_script = (
+                json.loads(stored_row["script_json"]) if stored_row else None
+            )
+            rows = connection.execute(
+                """SELECT audit_type, decision, score, audit_id, findings_json,
+                          created_at
+                   FROM cq_audits
+                   WHERE subject_id=?
+                   ORDER BY created_at DESC, rowid DESC""",
+                (script_id,),
+            ).fetchall()
+        return self._script_gate_summary_from_snapshot(stored_script, rows)
+
+    @staticmethod
+    def _canonical_receipt_sha256(payload: Any) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def script_gate_receipt(
+        self,
+        script_id: str,
+        *,
+        issued_at: datetime | None = None,
+        ttl_seconds: int = QUALITY_STORE_SCRIPT_GATE_RECEIPT_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        """Export the latest render gates as one short-lived immutable receipt.
+
+        This is deliberately stricter than ``script_gate_summary``.  A live
+        admission receipt requires a real AI relatability PASS (not the
+        non-AI fallback) and carries the canonical hash of every exact audit
+        row selected from QualityStore.
+        """
+
+        script_key = str(script_id or "").strip()
+        try:
+            ttl = int(ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ttl_seconds must be an integer") from exc
+        if ttl < 60 or ttl > QUALITY_STORE_SCRIPT_GATE_RECEIPT_MAX_TTL_SECONDS:
+            raise ValueError("ttl_seconds must be between 60 and 900")
+        current = issued_at or datetime.now(UTC)
+        if current.tzinfo is None:
+            raise ValueError("issued_at must include a timezone")
+        current = current.astimezone(UTC)
+
+        with closing(self.connect()) as connection:
+            # Mint and persist from one write-locked snapshot so no newer FAIL
+            # can race between selecting the latest gates and storing the
+            # admission receipt.
+            connection.execute("BEGIN IMMEDIATE")
+            stored_row = connection.execute(
+                "SELECT script_json FROM cq_scripts WHERE script_id=?",
+                (script_key,),
+            ).fetchone()
+            if stored_row is None:
+                raise ValueError("script_id was not found")
+            stored = json.loads(stored_row["script_json"])
+            reference_binding = stored.get("reference_package_binding") or {}
+            if not isinstance(reference_binding, dict) or not reference_binding.get(
+                "package_result_sha256"
+            ):
+                raise ValueError(
+                    "stored script has no immutable reference package binding"
+                )
+            reference_receipt_row = connection.execute(
+                """SELECT receipt_id, payload_json FROM cq_receipts
+                   WHERE receipt_type='reference_script_quality_binding'
+                         AND source_id=?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (script_key,),
+            ).fetchone()
+            if reference_receipt_row is None:
+                raise ValueError(
+                    "stored script has no durable reference binding receipt"
+                )
+            reference_receipt_payload = json.loads(
+                reference_receipt_row["payload_json"]
+            )
+            if (
+                reference_receipt_payload.get("script_id") != script_key
+                or reference_receipt_payload.get("script_sha256")
+                != self.script_audit_sha256(stored)
+                or reference_receipt_payload.get("package_result_sha256")
+                != reference_binding.get("package_result_sha256")
+            ):
+                raise ValueError("reference binding receipt differs from stored script")
+            rows = connection.execute(
+                """SELECT rowid, audit_id, audit_type, subject_id, decision,
+                          score, findings_json, created_at
+                   FROM cq_audits
+                   WHERE subject_id=?
+                   ORDER BY created_at DESC, rowid DESC""",
+                (script_key,),
+            ).fetchall()
+            summary = self._script_gate_summary_from_snapshot(stored, rows)
+            if summary.get("ready_for_render") is not True:
+                raise ValueError("script is not ready_for_render")
+            latest = summary.get("latest_audits") or {}
+            selected: dict[str, dict[str, Any]] = {}
+            rows_by_id = {str(row["audit_id"]): row for row in rows}
+            required_audit_types = tuple(dict.fromkeys((
+                *LIVE_ADMISSION_SCRIPT_AUDITS,
+                *(summary.get("required_decisions") or {}).keys(),
+            )))
+            for audit_type in required_audit_types:
+                gate = latest.get(audit_type)
+                if not isinstance(gate, dict):
+                    raise ValueError(
+                        f"required live admission audit is missing: {audit_type}"
+                    )
+                if gate.get("decision") != "PASS":
+                    raise ValueError(
+                        f"required live admission audit did not PASS: {audit_type}"
+                    )
+                if gate.get("stored_script_binding_valid") is not True:
+                    raise ValueError(
+                        f"required live admission audit is not script-bound: {audit_type}"
+                    )
+                row = rows_by_id.get(str(gate["audit_id"]))
+                if row is None or row["audit_type"] != audit_type:
+                    raise RuntimeError(
+                        f"QualityStore lost the selected audit row: {audit_type}"
+                    )
+                audit_core = {
+                    "audit_id": row["audit_id"],
+                    "audit_type": row["audit_type"],
+                    "subject_id": row["subject_id"],
+                    "decision": row["decision"],
+                    "score": round(float(row["score"]), 1),
+                    "findings": json.loads(row["findings_json"] or "{}"),
+                    "created_at": row["created_at"],
+                }
+                if audit_type == "relatability_ai_qualitative":
+                    verdict = audit_core["findings"].get(
+                        "qualitative_verdict"
+                    ) or {}
+                    consensus = verdict.get("judge_consensus") or {}
+                    if (
+                        verdict.get("decision") != "PASS"
+                        or verdict.get("evaluation_mode") != "ai"
+                        or verdict.get("ai_evaluated") is not True
+                        or consensus.get("consensus_reached") is not True
+                        or consensus.get("status") != "pass_consensus"
+                    ):
+                        raise ValueError(
+                            "AI relatability audit lacks a passing AI consensus"
+                        )
+                selected[audit_type] = {
+                    "audit_id": audit_core["audit_id"],
+                    "audit_type": audit_type,
+                    "subject_id": audit_core["subject_id"],
+                    "decision": audit_core["decision"],
+                    "score": audit_core["score"],
+                    "created_at": audit_core["created_at"],
+                    "stored_script_binding_valid": True,
+                    "stored_script_sha256": self.script_audit_sha256(stored),
+                    "audit_sha256": self._canonical_receipt_sha256(audit_core),
+                }
+                if audit_type == "relatability_ai_qualitative":
+                    verdict = audit_core["findings"]["qualitative_verdict"]
+                    selected[audit_type]["ai_evaluation"] = {
+                        "evaluation_mode": verdict["evaluation_mode"],
+                        "ai_evaluated": verdict["ai_evaluated"],
+                        "decision": verdict["decision"],
+                        "consensus_reached": verdict["judge_consensus"][
+                            "consensus_reached"
+                        ],
+                        "consensus_status": verdict["judge_consensus"][
+                            "status"
+                        ],
+                    }
+
+            gate_summary_sha256 = self._canonical_receipt_sha256(summary)
+            audit_set_sha256 = self._canonical_receipt_sha256(selected)
+            text = str(stored.get("text") or "")
+            receipt_id = "qgate_" + self._canonical_receipt_sha256({
+                "script_id": script_key,
+                "stored_script_sha256": self.script_audit_sha256(stored),
+                "gate_summary_sha256": gate_summary_sha256,
+                "audit_set_sha256": audit_set_sha256,
+                "issued_at": current.isoformat(),
+            })[:32]
+            core = {
+                "schema_version": "1.0",
+                "contract": QUALITY_STORE_SCRIPT_GATE_RECEIPT_CONTRACT,
+                "status": "pass",
+                "source_system": "content_intelligence_quality_store",
+                "receipt_id": receipt_id,
+                "script_id": script_key,
+                "stored_script_sha256": self.script_audit_sha256(stored),
+                "script_text_sha256": hashlib.sha256(
+                    text.encode("utf-8")
+                ).hexdigest(),
+                "reference_binding_receipt_id": reference_receipt_row[
+                    "receipt_id"
+                ],
+                "reference_package_contract": reference_binding.get(
+                    "package_contract"
+                ),
+                "reference_package_result_sha256": reference_binding[
+                    "package_result_sha256"
+                ],
+                "ready_for_render": True,
+                "required_audit_types": list(required_audit_types),
+                "gate_summary": summary,
+                "gate_summary_sha256": gate_summary_sha256,
+                "audits": selected,
+                "audit_set_sha256": audit_set_sha256,
+                "issued_at": current.isoformat(),
+                "expires_at": (current + timedelta(seconds=ttl)).isoformat(),
+            }
+            receipt = {
+                **core,
+                "receipt_sha256": self._canonical_receipt_sha256(core),
+            }
+            connection.execute(
+                """INSERT INTO cq_receipts(
+                       receipt_id, receipt_type, source_type, source_id,
+                       source_url, payload_json, created_at
+                   ) VALUES (?, ?, ?, ?, NULL, ?, ?)
+                   ON CONFLICT(receipt_id) DO NOTHING""",
+                (
+                    receipt_id,
+                    "quality_store_script_gate_receipt",
+                    "content_intelligence_quality_store",
+                    script_key,
+                    json.dumps(receipt, sort_keys=True),
+                    current.isoformat(),
+                ),
+            )
+            stored_receipt = connection.execute(
+                "SELECT payload_json FROM cq_receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if stored_receipt is None:
+                raise RuntimeError("script gate receipt was not durable")
+            connection.commit()
+        durable = json.loads(stored_receipt["payload_json"])
+        if durable != receipt:
+            raise RuntimeError("script gate receipt identity conflict")
+        return durable
 
     def put_audit(
         self,

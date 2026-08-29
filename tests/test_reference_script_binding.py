@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -294,6 +295,130 @@ def test_binds_package_and_is_idempotent(tmp_path):
     assert [item["beat"] for item in stored["timeline"]] == [
         "human_hook", "human_problem", "stakes", "proof", "payoff", "cta"
     ]
+
+
+def _put_live_admission_audits(
+    store: QualityStore,
+    script_id: str,
+    *,
+    ai_decision: str = "PASS",
+    include_ai_consensus: bool = True,
+) -> dict[str, dict]:
+    script = store.script(script_id)
+    binding = {
+        "contract": "stored_script_audit_binding_v1",
+        "stored_script_bound": True,
+        "script_id": script_id,
+        "script_sha256": store.script_audit_sha256(script),
+    }
+    results = {}
+    for audit_type in (
+        "narrative_coherence",
+        "attention_script",
+        "attention_video_preflight",
+        "relatability_script",
+        "relatability_ai_qualitative",
+        "relatability_transcript_cohort",
+    ):
+        findings = {"input_binding": binding}
+        decision = ai_decision if audit_type == "relatability_ai_qualitative" else "PASS"
+        if audit_type == "relatability_ai_qualitative" and include_ai_consensus:
+            findings["qualitative_verdict"] = {
+                "decision": decision,
+                "evaluation_mode": "ai",
+                "ai_evaluated": True,
+                "judge_consensus": {
+                    "consensus_reached": True,
+                    "status": "pass_consensus",
+                },
+            }
+        results[audit_type] = store.put_audit(
+            audit_type, script_id, decision, 90.0, findings
+        )
+    return results
+
+
+def test_live_gate_receipt_persists_exact_latest_quality_store_snapshot(tmp_path):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    source_ids, moment_receipt_id, moment_id = _seed_evidence(store)
+    bound = ReferenceScriptQualityBinder(store).bind(
+        _reference_package(),
+        source_receipt_ids=source_ids,
+        source_moment_receipt_id=moment_receipt_id,
+        source_moment_id=moment_id,
+    )
+    audits = _put_live_admission_audits(store, bound["script_id"])
+    issued_at = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+
+    receipt = store.script_gate_receipt(
+        bound["script_id"], issued_at=issued_at, ttl_seconds=600
+    )
+
+    assert receipt["status"] == "pass"
+    assert receipt["script_id"] == bound["script_id"]
+    assert receipt["stored_script_sha256"] == bound["script_sha256"]
+    assert receipt["script_text_sha256"] == hashlib.sha256(
+        bound["script"]["text"].encode()
+    ).hexdigest()
+    assert receipt["reference_package_result_sha256"] == _reference_package()[
+        "result_sha256"
+    ]
+    assert set(receipt["required_audit_types"]) == {
+        *audits,
+        "owner_calibrated_quality",
+    }
+    for audit_type, audit in audits.items():
+        assert receipt["audits"][audit_type]["audit_id"] == audit["audit_id"]
+        assert len(receipt["audits"][audit_type]["audit_sha256"]) == 64
+    persisted = store.receipt(receipt["receipt_id"])
+    assert persisted["receipt_type"] == "quality_store_script_gate_receipt"
+    assert persisted["payload"] == receipt
+
+    binding = receipt["audits"]["narrative_coherence"]
+    store.put_audit(
+        "narrative_coherence",
+        bound["script_id"],
+        "REVISE",
+        10.0,
+        {
+            "input_binding": {
+                "stored_script_bound": True,
+                "script_id": bound["script_id"],
+                "script_sha256": binding["stored_script_sha256"],
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="not ready_for_render"):
+        store.script_gate_receipt(bound["script_id"], issued_at=issued_at)
+
+
+@pytest.mark.parametrize(
+    ("decision", "include_consensus", "message"),
+    (
+        ("PASS_NON_AI", False, "did not PASS"),
+        ("PASS", False, "lacks a passing AI consensus"),
+    ),
+)
+def test_live_gate_receipt_rejects_non_ai_or_unproven_ai_pass(
+    tmp_path, decision, include_consensus, message
+):
+    store = QualityStore(tmp_path / "quality.sqlite3")
+    source_ids, moment_receipt_id, moment_id = _seed_evidence(store)
+    bound = ReferenceScriptQualityBinder(store).bind(
+        _reference_package(),
+        source_receipt_ids=source_ids,
+        source_moment_receipt_id=moment_receipt_id,
+        source_moment_id=moment_id,
+    )
+    _put_live_admission_audits(
+        store,
+        bound["script_id"],
+        ai_decision=decision,
+        include_ai_consensus=include_consensus,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        store.script_gate_receipt(bound["script_id"])
 
 
 def test_rejects_package_tampering_and_underdiverse_evidence(tmp_path):
