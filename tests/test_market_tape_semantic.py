@@ -110,6 +110,74 @@ def _graph() -> dict:
     return {**core, "graph_sha256": stable_hash(core)}
 
 
+def _rehash_graph(graph: dict) -> dict:
+    core = {key: value for key, value in graph.items() if key != "graph_sha256"}
+    graph["graph_sha256"] = stable_hash(core)
+    return graph
+
+
+def _migration_graph() -> dict:
+    graph = deepcopy(_graph())
+    graph["migration"] = {
+        "contract_type": "content_topic_catalog_migration_v2",
+        "source_catalog_version": "content-topic-catalog-v1.0.0",
+        "source_file_sha256": "a" * 64,
+        "source_count": 1,
+        "source_coverage": "exactly_once",
+        "legacy_role_semantics": "historical_treatment_hint_only",
+        "sources": [
+            {
+                "source_id": "legacy-seed-a4cbfcd4f6e104f9b45a",
+                "catalog_version": "content-topic-catalog-v1.0.0",
+                "legacy_role": "SELL",
+                "legacy_territory_id": "problem_aware",
+                "source_text": "Website leads waiting hours for follow-up",
+                "source_kind": "legacy_content_seed",
+                "mapped_atomic_subject_id": "atomic_subject.avatar-test",
+                "generation_authorized": False,
+                "publishing_authorized": False,
+            }
+        ],
+    }
+    return _rehash_graph(graph)
+
+
+def _migration_signal(
+    service: SemanticTopicService,
+    imported: dict,
+    graph: dict,
+    *,
+    text: str = "Website leads waiting hours for follow-up",
+    source_id: str = "legacy-seed-a4cbfcd4f6e104f9b45a",
+    evidence_overrides: dict | None = None,
+) -> dict:
+    mapping = graph["migration"]["sources"][0]
+    evidence = {
+        "contract": "foundry_legacy_seed_semantic_signal_evidence_v1",
+        "source_catalog_version": graph["migration"]["source_catalog_version"],
+        "source_kind": mapping["source_kind"],
+        "source_text": mapping["source_text"],
+        "mapped_atomic_subject_id": mapping["mapped_atomic_subject_id"],
+        "generation_authorized": False,
+        "publishing_authorized": False,
+        "topic_graph_sha256": graph["graph_sha256"],
+        "source_file_sha256": graph["migration"]["source_file_sha256"],
+        "metrics": {"catalog_records_observed": 1},
+    }
+    evidence.update(evidence_overrides or {})
+    return service.ingest_signal({
+        "contract": SIGNAL_CONTRACT,
+        "graph_version_id": imported["graph"]["graph_version_id"],
+        "signal_type": "problem",
+        "source_kind": "external_signal",
+        "source_entity_id": source_id,
+        "source_observed_at": "2026-08-28T18:05:00Z",
+        "signal_text": text,
+        "source_receipt_id": f"foundry-topic-graph-sha:{graph['graph_sha256']}",
+        "evidence": evidence,
+    })
+
+
 def _import(service: SemanticTopicService, graph: dict | None = None) -> dict:
     return service.import_graph({
         "contract": GRAPH_IMPORT_CONTRACT,
@@ -340,6 +408,156 @@ def test_graph_import_is_idempotent_validated_and_exact_alias_is_audited(
     assert binding["output_sha256"] == stable_hash(
         resolved["resolution_run"]["output_contract"]
     )
+
+
+def test_exact_graph_migration_mapping_creates_one_rules_binding_and_is_idempotent(
+    tmp_path: Path,
+):
+    store = MarketTapeStore(_config(tmp_path))
+    service = SemanticTopicService(store)
+    graph = _migration_graph()
+    imported = _import(service, graph)
+    signal = _migration_signal(service, imported, graph)
+
+    preview = service.preview_resolution(signal["signal_id"])
+    assert preview["state"] == "deterministic_match"
+    assert preview["resolution_path"] == "exact_graph_migration"
+    assert preview["validation_errors"] == []
+    assert preview["provider_call_performed"] is False
+
+    resolved = service.resolve_signal(signal["signal_id"], use_ai=False)
+    binding = resolved["binding"]
+    assert resolved["state"] == "resolved_deterministically"
+    assert resolved["resolution_path"] == "exact_graph_migration"
+    assert resolved["requires_human_review"] is False
+    assert resolved["generation_authorized"] is False
+    assert resolved["publishing_authorized"] is False
+    assert binding["topic_id"] == "atomic_subject.avatar-test"
+    assert binding["decision"] == "approved"
+    assert binding["reviewer_type"] == "rules"
+    assert binding["binding_method"] == "deterministic_exact_graph_migration"
+    assert binding["model_version"] == "exact-graph-migration-v1"
+    assert binding["audit"]["mapping_sha256"] == stable_hash(
+        graph["migration"]["sources"][0]
+    )
+    assert binding["audit"]["graph_sha256"] == graph["graph_sha256"]
+    assert binding["audit"]["source_file_sha256"] == "a" * 64
+    assert binding["observation"]["metrics"] == {"catalog_records_observed": 1}
+    assert resolved["resolution_run"]["input_sha256"] == stable_hash(
+        resolved["resolution_run"]["input_contract"]
+    )
+    assert resolved["resolution_run"]["output_sha256"] == stable_hash(
+        resolved["resolution_run"]["output_contract"]
+    )
+
+    repeated = service.resolve_signal(signal["signal_id"], use_ai=False)
+    assert repeated == {
+        "status": "ok",
+        "contract": "market_tape_semantic_resolution_v1",
+        "state": "already_resolved",
+        "signal_id": signal["signal_id"],
+        "graph_version_id": imported["graph"]["graph_version_id"],
+        "topic_ids": ["atomic_subject.avatar-test"],
+        "mutation_applied": False,
+    }
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_topic_resolution_runs"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_topic_signal_bindings"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_topic_observations"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("signal_text", "signal_text_not_exact_migration_source_text"),
+        ("graph_sha", "evidence_graph_sha256_mismatch"),
+        ("source_file_sha", "evidence_source_file_sha256_mismatch"),
+        ("mapped_evidence", "evidence_mapped_atomic_subject_id_mismatch"),
+        ("duplicate_source_id", "source_entity_mapping_not_unique"),
+        ("non_atomic_target", "mapped_target_not_atomic_subject"),
+        ("inactive_target", "mapped_atomic_subject_missing_or_inactive"),
+        ("unknown_source_id", "source_entity_mapping_not_unique"),
+    ],
+)
+def test_graph_migration_mapping_fails_closed_for_tampering_or_ambiguity(
+    tmp_path: Path,
+    case: str,
+    expected_error: str,
+):
+    store = MarketTapeStore(_config(tmp_path))
+    service = SemanticTopicService(store)
+    graph = _migration_graph()
+    text = "Website leads waiting hours for follow-up"
+    source_id = "legacy-seed-a4cbfcd4f6e104f9b45a"
+    evidence_overrides: dict = {}
+    if case == "duplicate_source_id":
+        graph["migration"]["sources"].append(
+            deepcopy(graph["migration"]["sources"][0])
+        )
+        graph["migration"]["source_count"] = 2
+        _rehash_graph(graph)
+    elif case == "non_atomic_target":
+        graph["migration"]["sources"][0]["mapped_atomic_subject_id"] = (
+            "subtopic.avatar-test"
+        )
+        _rehash_graph(graph)
+    elif case == "inactive_target":
+        next(
+            node
+            for node in graph["nodes"]
+            if node["id"] == "atomic_subject.avatar-test"
+        )["status"] = "deprecated"
+        _rehash_graph(graph)
+    elif case == "signal_text":
+        text = "Website leads waiting minutes for follow-up"
+    elif case == "graph_sha":
+        evidence_overrides["topic_graph_sha256"] = "b" * 64
+    elif case == "source_file_sha":
+        evidence_overrides["source_file_sha256"] = "b" * 64
+    elif case == "mapped_evidence":
+        evidence_overrides["mapped_atomic_subject_id"] = "subtopic.avatar-test"
+    elif case == "unknown_source_id":
+        source_id = "legacy-seed-does-not-exist"
+
+    imported = _import(service, graph)
+    signal = _migration_signal(
+        service,
+        imported,
+        graph,
+        text=text,
+        source_id=source_id,
+        evidence_overrides=evidence_overrides,
+    )
+    preview = service.preview_resolution(signal["signal_id"])
+    assert preview["state"] == "review_required"
+    assert preview["resolution_path"] == "exact_graph_migration"
+    assert expected_error in preview["validation_errors"]
+    assert preview["provider_call_performed"] is False
+
+    result = service.resolve_signal(signal["signal_id"], use_ai=False)
+    assert result["state"] == "review_required"
+    assert result["requires_human_review"] is True
+    assert result["ai_evaluated"] is False
+    assert result["generation_authorized"] is False
+    assert result["publishing_authorized"] is False
+    assert expected_error in result["validation_errors"]
+    assert result["binding"]["decision"] == "review_required"
+    assert result["binding"]["reviewer_type"] == "rules"
+    assert result["binding"]["observation"] is None
+
+    repeated = service.resolve_signal(signal["signal_id"], use_ai=False)
+    assert repeated["binding"]["binding_id"] == result["binding"]["binding_id"]
+    assert repeated["binding"]["idempotent"] is True
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mt_topic_observations"
+        ).fetchone()[0] == 0
 
 
 def test_ai_provider_is_bounded_review_only_and_out_of_scope_is_not_gamed(

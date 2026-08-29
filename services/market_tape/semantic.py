@@ -30,7 +30,9 @@ SIGNAL_CONTRACT = "market_tape_topic_signal_candidate_v1"
 BINDING_CONTRACT = "market_tape_topic_signal_binding_v1"
 RESOLUTION_CONTRACT = "market_tape_semantic_resolution_v1"
 RESOLUTION_SCHEMA_VERSION = "1.0"
-RESOLVER_VERSION = "hybrid-exact-alias-gpt5nano-v1"
+RESOLVER_VERSION = "hybrid-exact-migration-alias-gpt5nano-v2"
+MIGRATION_MAPPING_MODEL_VERSION = "exact-graph-migration-v1"
+MIGRATION_MAPPING_CONTRACT = "content_topic_catalog_migration_v2"
 MAPPING_HEALTH_CONTRACT = "market_tape_semantic_mapping_health_v1"
 GRAPH_SUMMARY_CONTRACT = "market_tape_semantic_graph_summary_v1"
 LINEAGE_CONTRACT = "market_tape_semantic_lineage_v1"
@@ -1052,6 +1054,13 @@ class SemanticTopicService:
             if signal_row is None:
                 raise SemanticContractError("signal_id does not exist")
             graph_version_id = str(signal_row["graph_version_id"])
+            graph_row = connection.execute(
+                """SELECT graph_version_id, graph_sha256, migration_json
+                   FROM mt_topic_graph_versions WHERE graph_version_id = ?""",
+                (graph_version_id,),
+            ).fetchone()
+            if graph_row is None:  # pragma: no cover - foreign key invariant
+                raise RuntimeError("semantic signal graph version is missing")
             if self._current_out_of_scope(connection, canonical_signal_id):
                 return {
                     "status": "ok",
@@ -1083,6 +1092,176 @@ class SemanticTopicService:
                     connection, graph_version_id, node["topic_id"]
                 )
         signal = _decode_signal(signal_row)
+        graph = {
+            "graph_version_id": str(graph_row["graph_version_id"]),
+            "graph_sha256": str(graph_row["graph_sha256"]),
+            "migration": json.loads(graph_row["migration_json"]),
+        }
+        migration_claim = _migration_resolution_claim(signal, graph, nodes)
+        if migration_claim["state"] == "approved":
+            node = migration_claim["selected_node"]
+            candidate_set = [_resolution_node(node)]
+            rationale = (
+                "one imported migration record matched the source identity and "
+                "literal source text, its graph and source-file hashes matched "
+                "the immutable evidence, and its target was one active atomic subject"
+            )
+            output_contract = {
+                "decision": "match",
+                "selected_topic_id": node["topic_id"],
+                "confidence": 1.0,
+                "rationale": rationale,
+                "semantic_binding_only": True,
+            }
+            run = self._record_resolution_run({
+                "signal_id": canonical_signal_id,
+                "graph_version_id": graph_version_id,
+                "resolver_version": RESOLVER_VERSION,
+                "provider": "deterministic",
+                "model_version": MIGRATION_MAPPING_MODEL_VERSION,
+                "output_schema_version": RESOLUTION_SCHEMA_VERSION,
+                "state": "deterministic",
+                "candidate_set": candidate_set,
+                "selected_topic_id": node["topic_id"],
+                "provider_decision": "match",
+                "confidence": 1.0,
+                "rationale": rationale,
+                "response_id": "",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "error_code": "",
+                "input_contract": migration_claim["input_contract"],
+                "output_contract": output_contract,
+            })
+            migration = graph["migration"]
+            binding = self.record_binding({
+                "contract": BINDING_CONTRACT,
+                "signal_id": canonical_signal_id,
+                "topic_id": node["topic_id"],
+                "decision": "approved",
+                "binding_method": "deterministic_exact_graph_migration",
+                "confidence": 1.0,
+                "rationale": rationale,
+                "reviewer_type": "rules",
+                "reviewed_by": RESOLVER_VERSION,
+                "reviewed_at": run["created_at"],
+                "source_receipt_id": signal["source_receipt_id"],
+                "review_receipt_id": run["resolution_run_id"],
+                "resolver_version": RESOLVER_VERSION,
+                "model_version": MIGRATION_MAPPING_MODEL_VERSION,
+                "output_schema_version": RESOLUTION_SCHEMA_VERSION,
+                "input_contract": run["input_contract"],
+                "output_contract": run["output_contract"],
+                "input_sha256": run["input_sha256"],
+                "output_sha256": run["output_sha256"],
+                "audit": {
+                    "resolution_run_id": run["resolution_run_id"],
+                    "resolution_path": "exact_graph_migration",
+                    "graph_sha256": graph["graph_sha256"],
+                    "source_file_sha256": migration["source_file_sha256"],
+                    "mapping_sha256": migration_claim["mapping_sha256"],
+                    "evidence_sha256": signal["evidence_sha256"],
+                    "semantic_binding_only": True,
+                },
+            })
+            return {
+                "status": "ok",
+                "contract": RESOLUTION_CONTRACT,
+                "state": "resolved_deterministically",
+                "resolution_path": "exact_graph_migration",
+                "signal_id": canonical_signal_id,
+                "graph_version_id": graph_version_id,
+                "resolution_run": run,
+                "binding": binding,
+                "requires_human_review": False,
+                "generation_authorized": False,
+                "publishing_authorized": False,
+            }
+        if migration_claim["state"] == "review_required":
+            selected_node = migration_claim.get("selected_node")
+            candidate_set = (
+                [_resolution_node(selected_node)] if selected_node is not None else []
+            )
+            rationale = (
+                "migration-backed resolution requires review because one or more "
+                "exact source, provenance-hash, uniqueness, or atomic-target "
+                "invariants failed"
+            )
+            output_contract = {
+                "decision": "review_required",
+                "selected_topic_id": None,
+                "confidence": 0.0,
+                "rationale": rationale,
+                "validation_errors": migration_claim["errors"],
+            }
+            run = self._record_resolution_run({
+                "signal_id": canonical_signal_id,
+                "graph_version_id": graph_version_id,
+                "resolver_version": RESOLVER_VERSION,
+                "provider": "deterministic",
+                "model_version": MIGRATION_MAPPING_MODEL_VERSION,
+                "output_schema_version": RESOLUTION_SCHEMA_VERSION,
+                "state": "deterministic",
+                "candidate_set": candidate_set,
+                "selected_topic_id": None,
+                "provider_decision": "ambiguous",
+                "confidence": 0.0,
+                "rationale": rationale,
+                "response_id": "",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "error_code": "migration_mapping_validation_failed",
+                "input_contract": migration_claim["input_contract"],
+                "output_contract": output_contract,
+            })
+            proposed_topic_id = (
+                selected_node["topic_id"] if selected_node is not None else None
+            )
+            binding = self.record_binding({
+                "contract": BINDING_CONTRACT,
+                "signal_id": canonical_signal_id,
+                "topic_id": proposed_topic_id,
+                "decision": "review_required",
+                "binding_method": "deterministic_graph_migration_validation",
+                "confidence": 0.0,
+                "rationale": rationale,
+                "reviewer_type": "rules",
+                "reviewed_by": RESOLVER_VERSION,
+                "reviewed_at": run["created_at"],
+                "source_receipt_id": signal["source_receipt_id"],
+                "review_receipt_id": run["resolution_run_id"],
+                "resolver_version": RESOLVER_VERSION,
+                "model_version": MIGRATION_MAPPING_MODEL_VERSION,
+                "output_schema_version": RESOLUTION_SCHEMA_VERSION,
+                "input_contract": run["input_contract"],
+                "output_contract": run["output_contract"],
+                "input_sha256": run["input_sha256"],
+                "output_sha256": run["output_sha256"],
+                "audit": {
+                    "resolution_run_id": run["resolution_run_id"],
+                    "resolution_path": "exact_graph_migration",
+                    "validation_errors": migration_claim["errors"],
+                    "mapping_sha256": migration_claim.get("mapping_sha256"),
+                    "evidence_sha256": signal["evidence_sha256"],
+                },
+            })
+            return {
+                "status": "ok",
+                "contract": RESOLUTION_CONTRACT,
+                "state": "review_required",
+                "resolution_path": "exact_graph_migration",
+                "signal_id": canonical_signal_id,
+                "graph_version_id": graph_version_id,
+                "resolution_run": run,
+                "binding": binding,
+                "validation_errors": migration_claim["errors"],
+                "requires_human_review": True,
+                "ai_evaluated": False,
+                "generation_authorized": False,
+                "publishing_authorized": False,
+            }
         normalized = signal["normalized_signal_text"]
         exact = [
             node
@@ -1327,6 +1506,13 @@ class SemanticTopicService:
             if signal_row is None:
                 raise SemanticContractError("signal_id does not exist")
             graph_version_id = str(signal_row["graph_version_id"])
+            graph_row = connection.execute(
+                """SELECT graph_version_id, graph_sha256, migration_json
+                   FROM mt_topic_graph_versions WHERE graph_version_id = ?""",
+                (graph_version_id,),
+            ).fetchone()
+            if graph_row is None:  # pragma: no cover - foreign key invariant
+                raise RuntimeError("semantic signal graph version is missing")
             rows = [dict(row) for row in connection.execute(
                 """SELECT * FROM mt_topic_nodes
                    WHERE graph_version_id = ? AND status = 'active'""",
@@ -1338,6 +1524,36 @@ class SemanticTopicService:
                     connection, graph_version_id, row["topic_id"]
                 )
         signal = _decode_signal(signal_row)
+        graph = {
+            "graph_version_id": str(graph_row["graph_version_id"]),
+            "graph_sha256": str(graph_row["graph_sha256"]),
+            "migration": json.loads(graph_row["migration_json"]),
+        }
+        migration_claim = _migration_resolution_claim(signal, graph, rows)
+        if migration_claim["state"] != "not_applicable":
+            selected_node = migration_claim.get("selected_node")
+            return {
+                "status": "ok",
+                "contract": "market_tape_semantic_resolution_preview_v1",
+                "dry_run": True,
+                "mutation_applied": False,
+                "provider_call_performed": False,
+                "signal_id": canonical_signal_id,
+                "graph_version_id": graph_version_id,
+                "state": (
+                    "deterministic_match"
+                    if migration_claim["state"] == "approved"
+                    else "review_required"
+                ),
+                "resolution_path": "exact_graph_migration",
+                "candidate_set": (
+                    [_resolution_node(selected_node)]
+                    if selected_node is not None
+                    else []
+                ),
+                "validation_errors": migration_claim["errors"],
+                "would_use_ai_for_ambiguity": False,
+            }
         normalized = signal["normalized_signal_text"]
         exact = [
             row for row in rows
@@ -3894,6 +4110,144 @@ def _resolution_node(node: Mapping[str, Any]) -> Dict[str, Any]:
             }
             for item in node.get("topic_path") or []
         ],
+    }
+
+
+def _migration_resolution_claim(
+    signal: Mapping[str, Any],
+    graph: Mapping[str, Any],
+    active_nodes: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Validate one content-addressed legacy-catalog mapping, fail closed.
+
+    A migration record is stronger evidence than token overlap only when both
+    the immutable source identity and the literal source text match.  Signals
+    that claim this path cannot fall through to alias or AI resolution when a
+    graph/evidence hash or target invariant fails.
+    """
+
+    evidence = signal.get("evidence")
+    evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+    claim_fields = {
+        "topic_graph_sha256",
+        "source_file_sha256",
+        "mapped_atomic_subject_id",
+        "source_text",
+    }
+    claims_migration = claim_fields.issubset(evidence)
+    migration = graph.get("migration")
+    migration = dict(migration) if isinstance(migration, Mapping) else {}
+    sources = migration.get("sources")
+    source_rows = sources if isinstance(sources, list) else []
+    source_entity_id = str(signal.get("source_entity_id") or "")
+    id_matches = [
+        dict(row)
+        for row in source_rows
+        if isinstance(row, Mapping) and row.get("source_id") == source_entity_id
+    ]
+    if not id_matches and not claims_migration:
+        return {"state": "not_applicable"}
+
+    errors: List[str] = []
+    if migration.get("contract_type") != MIGRATION_MAPPING_CONTRACT:
+        errors.append("migration_contract_mismatch")
+    if not isinstance(sources, list):
+        errors.append("migration_sources_not_array")
+    if migration.get("source_coverage") != "exactly_once":
+        errors.append("migration_source_coverage_not_exactly_once")
+    if migration.get("source_count") != len(source_rows):
+        errors.append("migration_source_count_mismatch")
+    if len(id_matches) != 1:
+        errors.append("source_entity_mapping_not_unique")
+
+    mapping = id_matches[0] if len(id_matches) == 1 else None
+    graph_sha = str(graph.get("graph_sha256") or "")
+    source_file_sha = str(migration.get("source_file_sha256") or "")
+    if not _SHA_RE.fullmatch(graph_sha):
+        errors.append("graph_sha256_invalid")
+    if not _SHA_RE.fullmatch(source_file_sha):
+        errors.append("migration_source_file_sha256_invalid")
+    if evidence.get("topic_graph_sha256") != graph_sha:
+        errors.append("evidence_graph_sha256_mismatch")
+    if evidence.get("source_file_sha256") != source_file_sha:
+        errors.append("evidence_source_file_sha256_mismatch")
+
+    selected_node: Optional[Dict[str, Any]] = None
+    mapped_topic_id: Optional[str] = None
+    if mapping is not None:
+        mapping_text = mapping.get("source_text")
+        mapped_topic_id = (
+            str(mapping.get("mapped_atomic_subject_id"))
+            if mapping.get("mapped_atomic_subject_id") not in (None, "")
+            else None
+        )
+        if signal.get("signal_text") != mapping_text:
+            errors.append("signal_text_not_exact_migration_source_text")
+        if evidence.get("source_text") != mapping_text:
+            errors.append("evidence_source_text_mismatch")
+        if evidence.get("mapped_atomic_subject_id") != mapped_topic_id:
+            errors.append("evidence_mapped_atomic_subject_id_mismatch")
+        if evidence.get("source_catalog_version") != migration.get(
+            "source_catalog_version"
+        ):
+            errors.append("evidence_source_catalog_version_mismatch")
+        if mapping.get("catalog_version") != migration.get(
+            "source_catalog_version"
+        ):
+            errors.append("mapping_source_catalog_version_mismatch")
+        if evidence.get("source_kind") != mapping.get("source_kind"):
+            errors.append("evidence_source_kind_mismatch")
+        selected_node = next(
+            (
+                dict(node)
+                for node in active_nodes
+                if node.get("topic_id") == mapped_topic_id
+            ),
+            None,
+        )
+        if selected_node is None:
+            errors.append("mapped_atomic_subject_missing_or_inactive")
+        elif selected_node.get("level") != "atomic_subject":
+            errors.append("mapped_target_not_atomic_subject")
+
+    mapping_hashes = sorted(stable_hash(row) for row in id_matches)
+    input_contract = {
+        "contract": "market_tape_graph_migration_exact_resolution_input_v1",
+        "signal": {
+            "signal_id": signal.get("signal_id"),
+            "source_entity_id": source_entity_id,
+            "signal_text": signal.get("signal_text"),
+            "evidence_sha256": signal.get("evidence_sha256"),
+        },
+        "graph": {
+            "graph_version_id": graph.get("graph_version_id"),
+            "graph_sha256": graph_sha,
+        },
+        "migration": {
+            "contract_type": migration.get("contract_type"),
+            "source_catalog_version": migration.get("source_catalog_version"),
+            "source_file_sha256": source_file_sha,
+            "source_count": migration.get("source_count"),
+            "source_coverage": migration.get("source_coverage"),
+        },
+        "matching_mapping_sha256s": mapping_hashes,
+        "mapping": mapping,
+        "evidence": {
+            key: evidence.get(key)
+            for key in sorted(
+                claim_fields | {"source_catalog_version", "source_kind"}
+            )
+        },
+        "validation_errors": sorted(set(errors)),
+    }
+    return {
+        "state": "approved" if not errors else "review_required",
+        "errors": sorted(set(errors)),
+        "mapping": mapping,
+        "mapping_sha256": mapping_hashes[0] if len(mapping_hashes) == 1 else None,
+        "mapped_topic_id": mapped_topic_id,
+        "selected_node": selected_node,
+        "input_contract": input_contract,
     }
 
 
