@@ -1654,6 +1654,25 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             return jsonify({"status": "error", "code": "SCRIPT_NOT_FOUND", "script_id": script_id}), 404
         return jsonify({"status": "ok", "script": script, "gates": engine.store.script_gate_summary(script_id)})
 
+    @app.get("/api/scripts/<script_id>/gate-receipt")
+    def get_script_gate_receipt(script_id: str):
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        raw_ttl = request.args.get("ttl_seconds", "600")
+        try:
+            ttl_seconds = int(raw_ttl)
+            receipt = engine.store.script_gate_receipt(
+                script_id, ttl_seconds=ttl_seconds
+            )
+        except ValueError as exc:
+            return jsonify({
+                "status": "error",
+                "code": "SCRIPT_GATE_RECEIPT_REJECTED",
+                "error": str(exc),
+            }), 409
+        return jsonify(receipt)
+
     @app.post("/api/relatability/script-audit")
     def relatability_audit():
         return jsonify(engine.relatability.audit(json_body()))

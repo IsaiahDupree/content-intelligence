@@ -533,6 +533,23 @@ def test_atomic_selection_evidence_gates_and_foundry_registration_are_durable(
     assert third["idempotent"] is True
     assert first["registration_id"] == registration["registration_id"]
     assert first["content_id"] == registration["identifiers"]["content_id"]
+    lineage_receipt = service.content_lineage_registration_receipt(
+        first["content_id"]
+    )
+    assert lineage_receipt["status"] == "registered"
+    assert lineage_receipt["content_id"] == (
+        "cid:owned_upload:" + lineage_receipt["parent_asset_id"]
+    )
+    assert lineage_receipt["parent_asset_id"] == registration[
+        "identifiers"
+    ]["parent_asset_id"]
+    assert lineage_receipt["registration_id"] == first["registration_id"]
+    assert lineage_receipt["registration_sha256"] == first[
+        "registration_sha256"
+    ]
+    unsigned_lineage_receipt = dict(lineage_receipt)
+    claimed_receipt_sha256 = unsigned_lineage_receipt.pop("receipt_sha256")
+    assert claimed_receipt_sha256 == stable_hash(unsigned_lineage_receipt)
     with store.connect() as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM mt_semantic_lineage_registrations"
@@ -551,6 +568,14 @@ def test_atomic_selection_evidence_gates_and_foundry_registration_are_durable(
     tampered["registration"]["topic_bindings"][0]["review_status"] = "pending"
     with pytest.raises(SemanticContractError, match="durable Market Tape lineage"):
         service.register_content_lineage(tampered)
+
+    with pytest.raises(
+        SemanticContractError,
+        match="exactly one registered parent asset",
+    ):
+        service.content_lineage_registration_receipt(
+            "cid:owned_upload:not-registered"
+        )
 
     empty_owned_db = tmp_path / "content-quality.sqlite3"
     with sqlite3.connect(empty_owned_db) as connection:

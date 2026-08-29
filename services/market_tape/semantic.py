@@ -45,6 +45,9 @@ GENERATION_CONTEXT_CONTRACT = "semantic_trend_generation_context_v1"
 GENERATION_HANDOFF_CONTRACT = "semantic_trend_generation_handoff_v1"
 SEMANTIC_LINEAGE_CONTRACT = "semantic_trend_content_lineage_v1"
 LINEAGE_REGISTRATION_CONTRACT = "semantic_lineage_registration_v1"
+REGISTERED_CONTENT_LINEAGE_RECEIPT_CONTRACT = (
+    "market_tape_registered_content_lineage_receipt_v1"
+)
 
 TOPIC_LEVELS = (
     "strategic_territory",
@@ -2959,6 +2962,150 @@ class SemanticTopicService:
             "asset_ids": [asset["asset_id"] for asset in assets],
             "content_id": content_id,
         }
+
+    def content_lineage_registration_receipt(
+        self, content_id: str
+    ) -> Dict[str, Any]:
+        """Return a deterministic receipt for one durable parent asset lineage."""
+
+        content_key = _required_text(content_id, "content_id", 500)
+        with self.store.connect() as connection:
+            parent_rows = connection.execute(
+                """SELECT * FROM mt_content_assets
+                   WHERE content_id = ? AND derivative_type = 'parent'
+                         AND parent_asset_id IS NULL
+                   ORDER BY registered_at DESC, asset_id DESC""",
+                (content_key,),
+            ).fetchall()
+            if len(parent_rows) != 1:
+                raise SemanticContractError(
+                    "content_id must identify exactly one registered parent asset"
+                )
+            parent = parent_rows[0]
+            if content_key != f"cid:owned_upload:{parent['asset_id']}":
+                raise SemanticContractError(
+                    "registered content_id does not match its parent asset"
+                )
+            brief = connection.execute(
+                "SELECT * FROM mt_content_briefs WHERE brief_id = ?",
+                (parent["brief_id"],),
+            ).fetchone()
+            if brief is None:
+                raise SemanticContractError(
+                    "registered content lineage has no durable content brief"
+                )
+            registration = connection.execute(
+                """SELECT * FROM mt_semantic_lineage_registrations
+                   WHERE registration_id = ?""",
+                (brief["registration_id"],),
+            ).fetchone()
+            if registration is None:
+                raise SemanticContractError(
+                    "registered content lineage has no durable registration"
+                )
+            identifiers = json.loads(registration["identifiers_json"])
+            registration_payload = json.loads(
+                registration["registration_json"]
+            )
+            registered_lineage = _json_object(
+                registration_payload.get("semantic_lineage"),
+                "registration.semantic_lineage",
+            )
+            registered_plan_raw = _json_object(
+                registration_payload.get("canonical_content_plan"),
+                "registration.canonical_content_plan",
+            )
+            registered_plan, registered_brief, registered_assets = (
+                self._validate_canonical_plan(registered_plan_raw)
+            )
+            registered_parent = registered_assets[0]
+            stored_parent = json.loads(parent["asset_json"])
+            stored_brief = json.loads(brief["brief_json"])
+            expected_identifiers = {
+                "content_id": content_key,
+                "parent_asset_id": parent["asset_id"],
+                "content_brief_id": brief["brief_id"],
+            }
+            for field, value in expected_identifiers.items():
+                if identifiers.get(field) != value:
+                    raise SemanticContractError(
+                        f"durable registration identity differs: {field}"
+                    )
+            registration_core = {
+                "contract_type": LINEAGE_REGISTRATION_CONTRACT,
+                "registration_id": registration["registration_id"],
+                "status": "ready",
+                "identifiers": identifiers,
+                "lineage_sha256": registration["lineage_sha256"],
+                "canonical_plan_sha256": registration[
+                    "canonical_plan_sha256"
+                ],
+            }
+            if stable_hash(registration_core) != registration[
+                "registration_sha256"
+            ]:
+                raise SemanticContractError(
+                    "durable registration SHA-256 no longer verifies"
+                )
+            lineage_core = {
+                key: value for key, value in registered_lineage.items()
+                if key != "lineage_sha256"
+            }
+            if (
+                stable_hash(lineage_core) != registered_lineage.get(
+                    "lineage_sha256"
+                )
+                or registered_lineage.get("lineage_sha256")
+                != registration["lineage_sha256"]
+            ):
+                raise SemanticContractError(
+                    "durable semantic lineage SHA-256 no longer verifies"
+                )
+            if registered_plan.get("plan_sha256") != registration[
+                "canonical_plan_sha256"
+            ]:
+                raise SemanticContractError(
+                    "durable canonical plan SHA-256 differs"
+                )
+            if registered_parent != stored_parent or registered_brief != stored_brief:
+                raise SemanticContractError(
+                    "registered plan differs from exact durable brief or parent asset"
+                )
+
+        expected_lineage = {
+            "content_id": content_key,
+            "parent_asset_id": parent["asset_id"],
+            "parent_asset_sha256": parent["asset_sha256"],
+            "content_brief_id": brief["brief_id"],
+            "content_brief_sha256": brief["brief_sha256"],
+            "lineage_sha256": registration["lineage_sha256"],
+        }
+        for field, value in expected_lineage.items():
+            if registered_lineage.get(field) != value:
+                raise SemanticContractError(
+                    f"registered generation lineage differs: {field}"
+                )
+        core = {
+            "schema_version": "1.0",
+            "contract": REGISTERED_CONTENT_LINEAGE_RECEIPT_CONTRACT,
+            "status": "registered",
+            "content_id": content_key,
+            "parent_asset_id": parent["asset_id"],
+            "parent_asset_sha256": parent["asset_sha256"],
+            "content_brief_id": brief["brief_id"],
+            "content_brief_sha256": brief["brief_sha256"],
+            "atomic_topic_id": brief["atomic_topic_id"],
+            "atomic_topic_selection_id": brief["atomic_selection_id"],
+            "registration_id": registration["registration_id"],
+            "registration_sha256": registration["registration_sha256"],
+            "registration_payload_sha256": stable_hash(registration_payload),
+            "canonical_plan_sha256": registration["canonical_plan_sha256"],
+            "lineage_sha256": registration["lineage_sha256"],
+            "source_service": registration["source_service"],
+            "source_receipt_id": registration["source_receipt_id"],
+            "registered_at": registration["registered_at"],
+        }
+        return {**core, "receipt_sha256": stable_hash(core)}
 
     def generation_context(self, selection_id: str) -> Dict[str, Any]:
         handoff = self.generation_handoff(selection_id)
