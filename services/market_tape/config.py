@@ -263,6 +263,22 @@ class MarketTapeConfig:
     supabase_sync_batch_size: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_SUPABASE_SYNC_BATCH_SIZE", 1000
     ))
+    supabase_sync_post_batch_size: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_SUPABASE_SYNC_POST_BATCH_SIZE", 50
+    ))
+    upwork_default_queries: List[str] = field(default_factory=lambda: _csv(
+        "MARKET_TAPE_UPWORK_DEFAULT_QUERIES",
+        "AI automation,AI agent,workflow automation,OpenAI",
+    ))
+    upwork_max_queries_per_scan: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_UPWORK_MAX_QUERIES_PER_SCAN", 5
+    ))
+    upwork_daily_request_limit: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_UPWORK_DAILY_REQUEST_LIMIT", 10
+    ))
+    upwork_prediction_min_snapshots: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_UPWORK_PREDICTION_MIN_SNAPSHOTS", 3
+    ))
 
     @classmethod
     def from_environment(cls) -> "MarketTapeConfig":

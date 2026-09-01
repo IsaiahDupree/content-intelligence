@@ -10,8 +10,6 @@ import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -2282,12 +2280,20 @@ def test_central_outage_never_discards_local_observations(provider_server, marke
     assert failed["pending"] == queued            # nothing discarded
     assert failed["synced"] == 0
     assert store.status()["totals"]["observations"] == local_before  # local acquisition intact
-    # Failed rows were scheduled for retry with exponential backoff, not dropped.
+    # Actual HTTP failures receive exponential backoff. FK-dependent rows are
+    # deferred behind those parents without inventing an HTTP attempt.
     with store.connect() as connection:
-        scheduled = connection.execute(
+        attempted = connection.execute(
             "SELECT COUNT(*) FROM mt_sync_outbox WHERE attempts = 1 AND next_attempt_at IS NOT NULL"
         ).fetchone()[0]
-        assert scheduled == queued
+        deferred = connection.execute(
+            """SELECT COUNT(*) FROM mt_sync_outbox
+               WHERE attempts = 0
+                 AND error_detail LIKE 'sync deferred because%'"""
+        ).fetchone()[0]
+        assert attempted + deferred == queued
+        assert failed["failed"] == attempted
+        assert failed["deferred"] == deferred
         # Simulate the backoff window elapsing so the recovery flush is eligible.
         connection.execute(
             "UPDATE mt_sync_outbox SET next_attempt_at = '2000-01-01T00:00:00+00:00'"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -15,6 +15,34 @@ from ..store import MarketTapeStore
 
 
 ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
+    "upwork_request_reservation": (
+        "actp_upwork_request_reservations", "request_reservation_id", False,
+    ),
+    "upwork_scan_run": (
+        "actp_upwork_scan_runs", "scan_run_id", False,
+    ),
+    "upwork_job": ("actp_upwork_market_jobs", "job_id", False),
+    "upwork_job_version": (
+        "actp_upwork_job_versions", "job_version_id", False,
+    ),
+    "upwork_query_observation": (
+        "actp_upwork_query_observations", "query_observation_id", False,
+    ),
+    "upwork_job_observation": (
+        "actp_upwork_job_observations", "job_observation_id", False,
+    ),
+    "upwork_demand_snapshot": (
+        "actp_upwork_demand_snapshots", "demand_snapshot_id", False,
+    ),
+    "upwork_prediction": (
+        "actp_upwork_predictions", "prediction_id", False,
+    ),
+    "upwork_prediction_outcome": (
+        "actp_upwork_prediction_outcomes", "prediction_outcome_id", False,
+    ),
+    "upwork_semantic_link": (
+        "actp_upwork_semantic_links", "semantic_link_id", False,
+    ),
     "semantic_graph_version": (
         "actp_semantic_topic_graph_versions", "graph_version_id", False,
     ),
@@ -82,6 +110,15 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
 # A batch can begin in the middle of a run's outbox records. Always process parent
 # tables before dependent tables instead of relying on the first row's entity type.
 ENTITY_SYNC_ORDER = (
+    "upwork_request_reservation",
+    "upwork_scan_run",
+    "upwork_job",
+    "upwork_job_version",
+    "upwork_query_observation",
+    "upwork_job_observation",
+    "upwork_demand_snapshot",
+    "upwork_prediction",
+    "upwork_prediction_outcome",
     "semantic_graph_version",
     "semantic_topic_node",
     "semantic_topic_edge",
@@ -96,6 +133,7 @@ ENTITY_SYNC_ORDER = (
     "semantic_content_brief",
     "semantic_content_asset",
     "semantic_content_lineage",
+    "upwork_semantic_link",
     "creator",
     "trend",
     "run",
@@ -111,6 +149,122 @@ ENTITY_SYNC_ORDER = (
     "receipt",
     "source_health",
 )
+
+def _required_parent_entities(
+    entity_type: str,
+    payload: Dict[str, Any],
+) -> frozenset[Tuple[str, str]]:
+    """Return only FK parents whose exact outbox identities are derivable."""
+
+    references: set[Tuple[str, str]] = set()
+
+    def add(parent_type: str, field: str) -> None:
+        value = payload.get(field)
+        if value is not None and str(value).strip():
+            references.add((parent_type, str(value).strip()))
+
+    def topic(field: str = "topic_id") -> None:
+        graph = payload.get("graph_version_id")
+        topic_id = payload.get(field)
+        if graph and topic_id:
+            references.add(("semantic_topic_node", f"{graph}|{topic_id}"))
+
+    rules = {
+        "upwork_scan_run": (("upwork_request_reservation", "request_reservation_id"),),
+        "upwork_job_version": (("upwork_job", "job_id"),),
+        "upwork_query_observation": (("upwork_scan_run", "scan_run_id"),),
+        "upwork_job_observation": (
+            ("upwork_scan_run", "scan_run_id"),
+            ("upwork_query_observation", "query_observation_id"),
+            ("upwork_job", "job_id"),
+            ("upwork_job_version", "job_version_id"),
+        ),
+        "upwork_demand_snapshot": (("upwork_scan_run", "scan_run_id"),),
+        "upwork_prediction": (("upwork_demand_snapshot", "demand_snapshot_id"),),
+        "upwork_prediction_outcome": (
+            ("upwork_prediction", "prediction_id"),
+            ("upwork_demand_snapshot", "observed_snapshot_id"),
+        ),
+        "upwork_semantic_link": (
+            ("upwork_demand_snapshot", "demand_snapshot_id"),
+            ("semantic_graph_version", "graph_version_id"),
+            ("semantic_signal_candidate", "signal_id"),
+        ),
+        "semantic_topic_node": (("semantic_graph_version", "graph_version_id"),),
+        "semantic_topic_edge": (("semantic_graph_version", "graph_version_id"),),
+        "semantic_signal_candidate": (
+            ("semantic_graph_version", "graph_version_id"),
+            ("trend", "source_trend_id"),
+        ),
+        "semantic_signal_binding": (("semantic_signal_candidate", "signal_id"),),
+        "semantic_resolution_run": (("semantic_signal_candidate", "signal_id"),),
+        "semantic_topic_observation": (
+            ("semantic_signal_candidate", "signal_id"),
+            ("semantic_signal_binding", "binding_id"),
+        ),
+        "semantic_atomic_selection": (("semantic_graph_version", "graph_version_id"),),
+        "semantic_atomic_selection_source": (
+            ("semantic_atomic_selection", "selection_id"),
+            ("semantic_signal_binding", "binding_id"),
+            ("semantic_topic_observation", "topic_observation_key"),
+            ("semantic_signal_candidate", "signal_id"),
+        ),
+        "semantic_evidence_receipt": (("semantic_atomic_selection", "selection_id"),),
+        "semantic_content_brief": (
+            ("semantic_lineage_registration", "registration_id"),
+            ("semantic_graph_version", "graph_version_id"),
+            ("semantic_atomic_selection", "atomic_selection_id"),
+        ),
+        "semantic_content_asset": (("semantic_content_brief", "brief_id"),),
+        "semantic_content_lineage": (
+            ("semantic_signal_candidate", "signal_id"),
+            ("semantic_signal_binding", "binding_id"),
+            ("semantic_topic_observation", "topic_observation_key"),
+            ("semantic_content_brief", "brief_id"),
+            ("semantic_content_asset", "asset_id"),
+        ),
+        "video": (("creator", "creator_id"),),
+        "query_attempt": (("run", "run_id"),),
+        "discovery_attribution": (("video", "video_id"),),
+        "observation": (("video", "video_id"), ("creator", "creator_id")),
+        "observation_quality_flag": (
+            ("observation", "observation_key"),
+            ("observation", "prior_observation_key"),
+            ("run", "run_id"),
+            ("video", "video_id"),
+        ),
+        "genome": (("video", "video_id"),),
+        "membership": (("trend", "trend_id"), ("video", "video_id")),
+        "trend_observation": (("trend", "trend_id"),),
+        "receipt": (("run", "run_id"),),
+    }
+    for parent_type, field in rules.get(entity_type, ()):
+        add(parent_type, field)
+    if entity_type == "semantic_topic_node":
+        topic("canonical_parent_id")
+    elif entity_type == "semantic_topic_edge":
+        topic("source_topic_id")
+        topic("target_topic_id")
+    elif entity_type in {
+        "semantic_signal_binding", "semantic_topic_observation",
+        "semantic_atomic_selection", "semantic_content_lineage",
+    }:
+        topic()
+        if entity_type == "semantic_content_lineage":
+            topic("atomic_topic_id")
+    if entity_type in {
+        "semantic_atomic_selection",
+        "semantic_content_brief",
+        "semantic_content_asset",
+    }:
+        topic("atomic_topic_id")
+    if entity_type == "semantic_resolution_run":
+        topic("selected_topic_id")
+    if entity_type == "semantic_content_asset":
+        add("semantic_content_asset", "parent_asset_id")
+    return frozenset(references)
+
+ADAPTIVE_SPLIT_HTTP_STATUSES = {408, 413, 502, 503, 504, 524}
 
 
 class SupabaseSink:
@@ -170,55 +324,166 @@ class SupabaseSink:
             self.store.mark_outbox_failed(ids, detail)
             failed += len(ids)
             errors.append(detail)
+        dependency_blocked_by = ""
+        deferred_entity_types: list[str] = []
+        deferred = 0
         for entity_type in ENTITY_SYNC_ORDER:
             group = grouped.get(entity_type, [])
             if not group:
+                continue
+            eligible_group: List[Dict[str, Any]] = []
+            for row in group:
+                payload = _normalize_payload(row["payload"])
+                dependency_state = self.store.defer_outbox_for_unsynced_dependencies(
+                    [int(row["outbox_id"])],
+                    _required_parent_entities(entity_type, payload),
+                    "sync deferred because an exact required parent is unsynced",
+                )
+                if dependency_state["deferred"]:
+                    deferred += int(dependency_state["deferred"])
+                    if entity_type not in deferred_entity_types:
+                        deferred_entity_types.append(entity_type)
+                    if not dependency_blocked_by:
+                        dependency_blocked_by = ",".join(
+                            dependency_state["parent_entity_types"]
+                        )
+                else:
+                    eligible_group.append(row)
+            if not eligible_group:
                 continue
             table, conflict, merge = ENTITY_TABLES[entity_type]
             shaped: Dict[Tuple[str, ...], List[Tuple[int, Dict[str, Any]]]] = (
                 defaultdict(list)
             )
-            for row in group:
+            for row in eligible_group:
                 payload = _normalize_payload(row["payload"])
                 shaped[tuple(sorted(payload))].append(
                     (int(row["outbox_id"]), payload)
                 )
+            entity_failed = False
+            post_batch_size = max(
+                1, min(1000, int(self.config.supabase_sync_post_batch_size))
+            )
             for signature in sorted(shaped):
                 records = shaped[signature]
-                ids = [outbox_id for outbox_id, _ in records]
-                payload = [record for _, record in records]
-                try:
-                    response = self.client.post(
-                        f"{self.rest_base_url}/{table}",
-                        params={"on_conflict": conflict},
-                        headers={
-                            "apikey": self.key,
-                            "Authorization": f"Bearer {self.key}",
-                            "Content-Type": "application/json",
-                            "Prefer": (
-                                "resolution="
-                                f"{'merge-duplicates' if merge else 'ignore-duplicates'},"
-                                "return=minimal"
-                            ),
-                        },
-                        json=payload,
+                for offset in range(0, len(records), post_batch_size):
+                    batch = records[offset: offset + post_batch_size]
+                    result = self._sync_record_batch(
+                        table=table,
+                        conflict=conflict,
+                        merge=merge,
+                        records=batch,
                     )
-                    if response.status_code not in {200, 201, 204}:
-                        raise RuntimeError(
-                            f"{table} returned HTTP {response.status_code}: "
-                            f"{sanitize(response.text)[:300]}"
-                        )
-                    self.store.mark_outbox_synced(ids)
-                    synced += len(ids)
-                except (httpx.HTTPError, RuntimeError) as error:
-                    detail = sanitize(error)
-                    self.store.mark_outbox_failed(ids, detail)
-                    failed += len(ids)
-                    errors.append(detail)
+                    synced += result["synced"]
+                    failed += result["failed"]
+                    errors.extend(result["errors"])
+                    entity_failed = entity_failed or result["failed"] > 0
+            if entity_failed:
+                if not dependency_blocked_by:
+                    dependency_blocked_by = entity_type
         pending = self.store.outbox_pending_count()
-        state = "ready" if failed == 0 else "degraded"
+        state = "degraded" if failed else "deferred" if deferred else "ready"
         self.store.save_sink_health(state, pending, "; ".join(errors)[:1000])
-        return {"state": state, "synced": synced, "failed": failed, "pending": pending, "errors": errors[:5]}
+        return {
+            "state": state,
+            "synced": synced,
+            "failed": failed,
+            "deferred": deferred,
+            "pending": pending,
+            "errors": errors[:5],
+            "dependency_blocked_by": dependency_blocked_by,
+            "dependency_deferred_entities": deferred_entity_types,
+        }
+
+    def _sync_record_batch(
+        self,
+        *,
+        table: str,
+        conflict: str,
+        merge: bool,
+        records: List[Tuple[int, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Post one idempotent subset, splitting ambiguous timeouts safely."""
+
+        ids = [outbox_id for outbox_id, _ in records]
+        payload = [record for _, record in records]
+        try:
+            response = self.client.post(
+                f"{self.rest_base_url}/{table}",
+                params={"on_conflict": conflict},
+                headers={
+                    "apikey": self.key,
+                    "Authorization": f"Bearer {self.key}",
+                    "Content-Type": "application/json",
+                    "Prefer": (
+                        "resolution="
+                        f"{'merge-duplicates' if merge else 'ignore-duplicates'},"
+                        "return=minimal"
+                    ),
+                },
+                json=payload,
+            )
+            if response.status_code not in {200, 201, 204}:
+                if (
+                    response.status_code in ADAPTIVE_SPLIT_HTTP_STATUSES
+                    and len(records) > 1
+                ):
+                    return self._split_record_batch(
+                        table=table,
+                        conflict=conflict,
+                        merge=merge,
+                        records=records,
+                    )
+                raise RuntimeError(
+                    f"{table} returned HTTP {response.status_code}: "
+                    f"{sanitize(response.text)[:300]}"
+                )
+            self.store.mark_outbox_synced(ids)
+            return {"synced": len(ids), "failed": 0, "errors": []}
+        except httpx.ReadTimeout as error:
+            if len(records) > 1:
+                return self._split_record_batch(
+                    table=table,
+                    conflict=conflict,
+                    merge=merge,
+                    records=records,
+                )
+            return self._fail_record_batch(ids, error)
+        except (httpx.HTTPError, RuntimeError) as error:
+            return self._fail_record_batch(ids, error)
+
+    def _split_record_batch(
+        self,
+        *,
+        table: str,
+        conflict: str,
+        merge: bool,
+        records: List[Tuple[int, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        midpoint = max(1, len(records) // 2)
+        totals: Dict[str, Any] = {"synced": 0, "failed": 0, "errors": []}
+        for subset in (records[:midpoint], records[midpoint:]):
+            if not subset:
+                continue
+            result = self._sync_record_batch(
+                table=table,
+                conflict=conflict,
+                merge=merge,
+                records=subset,
+            )
+            totals["synced"] += result["synced"]
+            totals["failed"] += result["failed"]
+            totals["errors"].extend(result["errors"])
+        return totals
+
+    def _fail_record_batch(
+        self,
+        ids: List[int],
+        error: Exception,
+    ) -> Dict[str, Any]:
+        detail = sanitize(error)
+        self.store.mark_outbox_failed(ids, detail)
+        return {"synced": 0, "failed": len(ids), "errors": [detail]}
 
     def drain(self, max_batches: int = 250) -> Dict[str, Any]:
         """Flush bounded batches until empty or the queue stops making progress."""

@@ -89,6 +89,45 @@ def test_market_tape_runtime_env_is_self_contained_and_preserves_credentials(tmp
     assert control_token not in rebuilt.stdout + rebuilt.stderr
 
 
+def test_market_tape_runtime_env_preserves_upwork_provider_configuration(
+    tmp_path,
+):
+    repo = tmp_path / "content-intelligence"
+    repo.mkdir()
+    output = tmp_path / "runtime" / ".env.market-tape"
+    output.parent.mkdir()
+    provider_key = "upwork-provider-secret-that-must-not-be-printed"
+    environment = {
+        **os.environ,
+        "UPWORK_SCRAPER_RAPIDAPI_KEY": provider_key,
+        "UPWORK_SCRAPER_HOST": "upwork.loopback.test",
+        "UPWORK_SCRAPER_BASE_URL": "http://127.0.0.1:9876",
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(BUILDER),
+            "--repo-root",
+            str(repo),
+            "--runtime-base",
+            str(tmp_path / "runtime-base"),
+            "--output",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    parsed = dotenv_values(output)
+    assert parsed["UPWORK_SCRAPER_RAPIDAPI_KEY"] == provider_key
+    assert parsed["UPWORK_SCRAPER_HOST"] == "upwork.loopback.test"
+    assert parsed["UPWORK_SCRAPER_BASE_URL"] == "http://127.0.0.1:9876"
+    assert provider_key not in completed.stdout + completed.stderr
+
+
 def test_market_tape_runtime_entrypoints_have_no_actp_dependency():
     paths = (
         REPO_ROOT / "services/market_tape/config.py",

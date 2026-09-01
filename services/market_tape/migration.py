@@ -7,7 +7,6 @@ import json
 import os
 import re
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -17,7 +16,7 @@ from .config import REPO_ROOT, load_runtime_environment
 from .sources.base import sanitize
 
 
-MIGRATION_NAME = "market_tape_v7"
+MIGRATION_NAME = "market_tape_v8"
 MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v1.sql",
     REPO_ROOT / "migrations" / "market_tape_v2_discovery_attributions.sql",
@@ -26,9 +25,10 @@ MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v5_observation_quality.sql",
     REPO_ROOT / "migrations" / "market_tape_v6_semantic_topics.sql",
     REPO_ROOT / "migrations" / "market_tape_v7_software_repository_changes.sql",
+    REPO_ROOT / "migrations" / "market_tape_v8_upwork_demand.sql",
 )
 MIGRATION_PATH = MIGRATION_PATHS[-1]
-VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v6.sql"
+VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v8.sql"
 MANAGEMENT_API_URL = "https://api.supabase.com"
 
 # The probe columns are deliberately the conflict keys used by the outbox sink.
@@ -67,6 +67,19 @@ MARKET_TAPE_TABLES: Dict[str, str] = {
     "actp_semantic_content_briefs": "brief_id",
     "actp_semantic_content_assets": "asset_id",
     "actp_semantic_content_lineage": "lineage_link_id",
+    "actp_upwork_request_reservations": "request_reservation_id",
+    "actp_upwork_scan_runs": "scan_run_id",
+    # ``actp_upwork_jobs`` is owned by the legacy proposal/build workflow and
+    # has a different UUID/status-oriented schema. Keep the Market Tape
+    # append-only identity ledger in its own table.
+    "actp_upwork_market_jobs": "job_id",
+    "actp_upwork_job_versions": "job_version_id",
+    "actp_upwork_query_observations": "query_observation_id",
+    "actp_upwork_job_observations": "job_observation_id",
+    "actp_upwork_demand_snapshots": "demand_snapshot_id",
+    "actp_upwork_predictions": "prediction_id",
+    "actp_upwork_prediction_outcomes": "prediction_outcome_id",
+    "actp_upwork_semantic_links": "semantic_link_id",
 }
 
 APPEND_ONLY_TABLES = {
@@ -89,6 +102,16 @@ APPEND_ONLY_TABLES = {
     "actp_semantic_content_briefs",
     "actp_semantic_content_assets",
     "actp_semantic_content_lineage",
+    "actp_upwork_request_reservations",
+    "actp_upwork_scan_runs",
+    "actp_upwork_market_jobs",
+    "actp_upwork_job_versions",
+    "actp_upwork_query_observations",
+    "actp_upwork_job_observations",
+    "actp_upwork_demand_snapshots",
+    "actp_upwork_predictions",
+    "actp_upwork_prediction_outcomes",
+    "actp_upwork_semantic_links",
 }
 
 APPEND_ONLY_TRIGGERS = {
@@ -137,6 +160,26 @@ APPEND_ONLY_TRIGGERS = {
     "actp_semantic_content_lineage": (
         "actp_semantic_content_lineage_no_update"
     ),
+    "actp_upwork_request_reservations": (
+        "actp_upwork_request_reservations_no_update"
+    ),
+    "actp_upwork_scan_runs": "actp_upwork_scan_runs_no_update",
+    "actp_upwork_market_jobs": "actp_upwork_market_jobs_no_update",
+    "actp_upwork_job_versions": "actp_upwork_job_versions_no_update",
+    "actp_upwork_query_observations": (
+        "actp_upwork_query_observations_no_update"
+    ),
+    "actp_upwork_job_observations": (
+        "actp_upwork_job_observations_no_update"
+    ),
+    "actp_upwork_demand_snapshots": (
+        "actp_upwork_demand_snapshots_no_update"
+    ),
+    "actp_upwork_predictions": "actp_upwork_predictions_no_update",
+    "actp_upwork_prediction_outcomes": (
+        "actp_upwork_prediction_outcomes_no_update"
+    ),
+    "actp_upwork_semantic_links": "actp_upwork_semantic_links_no_update",
 }
 
 # Cover the semantic foreign-key/access paths flagged by Supabase's index
@@ -168,6 +211,40 @@ REQUIRED_INDEXES: Dict[str, str] = {
     ),
     "actp_semantic_observations_signal_graph_idx": (
         "actp_semantic_topic_observations"
+    ),
+    "actp_upwork_reservations_usage_idx": (
+        "actp_upwork_request_reservations"
+    ),
+    "actp_upwork_scans_observed_idx": "actp_upwork_scan_runs",
+    "actp_upwork_versions_job_time_idx": "actp_upwork_job_versions",
+    "actp_upwork_queries_query_time_idx": (
+        "actp_upwork_query_observations"
+    ),
+    "actp_upwork_query_observations_scan_idx": (
+        "actp_upwork_query_observations"
+    ),
+    "actp_upwork_job_observations_job_time_idx": (
+        "actp_upwork_job_observations"
+    ),
+    "actp_upwork_job_observations_query_idx": (
+        "actp_upwork_job_observations"
+    ),
+    "actp_upwork_job_observations_version_idx": (
+        "actp_upwork_job_observations"
+    ),
+    "actp_upwork_snapshots_cohort_time_idx": (
+        "actp_upwork_demand_snapshots"
+    ),
+    "actp_upwork_predictions_cohort_time_idx": "actp_upwork_predictions",
+    "actp_upwork_outcomes_evaluated_idx": (
+        "actp_upwork_prediction_outcomes"
+    ),
+    "actp_upwork_prediction_outcomes_snapshot_idx": (
+        "actp_upwork_prediction_outcomes"
+    ),
+    "actp_upwork_semantic_links_signal_idx": "actp_upwork_semantic_links",
+    "actp_upwork_semantic_links_signal_graph_idx": (
+        "actp_upwork_semantic_links"
     ),
 }
 

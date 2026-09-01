@@ -27,9 +27,10 @@ from .predictor import (
     model_purpose,
     predict_trend_snapshot,
 )
+from .upwork_demand import UPWORK_TABLE_ENTITY_TYPES, ensure_upwork_schema
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 COUNTER_REGRESSION_FLAG_PREFIX = "counter-regression:"
 ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT = (
     "market_tape_accepted_observation_evidence_v1"
@@ -2115,6 +2116,7 @@ class MarketTapeStore:
                 );
                 """
             )
+            ensure_upwork_schema(connection)
             _migrate_semantic_repository_change_constraints(connection)
             _backfill_script_language_demand_lineage(connection)
             transcript_attempt_columns = {
@@ -2878,6 +2880,11 @@ class MarketTapeStore:
                     payload.pop("topic_observation_id", None)
                     add(entity_type, str(identity(payload)), payload)
 
+            for table, identity_field, entity_type in UPWORK_TABLE_ENTITY_TYPES:
+                for row in connection.execute(f"SELECT * FROM {table}").fetchall():
+                    payload = dict(row)
+                    add(entity_type, str(payload[identity_field]), payload)
+
             connection.executemany(
                 """INSERT INTO mt_sync_outbox(
                        entity_type, entity_key, payload_json, created_at, next_attempt_at
@@ -2962,6 +2969,81 @@ class MarketTapeStore:
                        SET attempts = ?, next_attempt_at = ?, error_detail = ? WHERE outbox_id = ?""",
                     (attempts, isoformat(utc_now() + timedelta(seconds=delay)), error_detail[:1000], int(outbox_id)),
                 )
+
+    def defer_outbox_for_unsynced_dependencies(
+        self,
+        outbox_ids: Iterable[int],
+        required_parent_entities: Iterable[Tuple[str, str]],
+        error_detail: str,
+    ) -> Dict[str, Any]:
+        """Defer children behind their exact unsynced parents without an attempt."""
+
+        child_ids = tuple(sorted({int(value) for value in outbox_ids}))
+        parent_entities = tuple(sorted({
+            (str(entity_type).strip(), str(entity_key).strip())
+            for entity_type, entity_key in required_parent_entities
+            if str(entity_type).strip() and str(entity_key).strip()
+        }))
+        if not child_ids or not parent_entities:
+            return {
+                "deferred": 0,
+                "parent_entity_types": [],
+                "parent_entities": [],
+                "next_attempt_at": None,
+            }
+        clauses = " OR ".join(
+            "(entity_type = ? AND entity_key = ?)" for _ in parent_entities
+        )
+        parent_parameters = tuple(
+            value for parent in parent_entities for value in parent
+        )
+        with self.connect() as connection:
+            parent_rows = connection.execute(
+                f"""SELECT entity_type, entity_key, next_attempt_at
+                    FROM mt_sync_outbox
+                    WHERE synced_at IS NULL
+                      AND ({clauses})""",
+                parent_parameters,
+            ).fetchall()
+            if not parent_rows:
+                return {
+                    "deferred": 0,
+                    "parent_entity_types": [],
+                    "parent_entities": [],
+                    "next_attempt_at": None,
+                }
+            blocking_types = sorted(str(row["entity_type"]) for row in parent_rows)
+            parent_due = max(str(row["next_attempt_at"]) for row in parent_rows)
+            defer_until = max(parent_due, isoformat(utc_now()))
+            child_placeholders = ",".join("?" for _ in child_ids)
+            cursor = connection.execute(
+                f"""UPDATE mt_sync_outbox
+                    SET next_attempt_at = CASE
+                            WHEN next_attempt_at < ? THEN ?
+                            ELSE next_attempt_at
+                        END,
+                        error_detail = ?
+                    WHERE synced_at IS NULL
+                      AND outbox_id IN ({child_placeholders})""",
+                (
+                    defer_until,
+                    defer_until,
+                    error_detail[:1000],
+                    *child_ids,
+                ),
+            )
+            return {
+                "deferred": int(cursor.rowcount),
+                "parent_entity_types": sorted(set(blocking_types)),
+                "parent_entities": [
+                    {
+                        "entity_type": str(row["entity_type"]),
+                        "entity_key": str(row["entity_key"]),
+                    }
+                    for row in parent_rows
+                ],
+                "next_attempt_at": defer_until,
+            }
 
     def save_sink_health(self, state: str, pending: int, error_detail: str = "") -> None:
         now = isoformat(utc_now())
@@ -5230,7 +5312,6 @@ class MarketTapeStore:
         if observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=timezone.utc)
         observed = isoformat(observed_at)
-        since = isoformat(observed_at - timedelta(hours=1))
         with self.connect() as connection:
             if trend_ids is not None:
                 trend_ids = sorted(set(str(value) for value in trend_ids if str(value)))

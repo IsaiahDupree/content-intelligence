@@ -88,7 +88,7 @@ def test_current_schema_keeps_append_only_demand_and_lineage_ledgers(tmp_path):
             ).fetchall()
         }
 
-    assert schema_version == str(SCHEMA_VERSION) == "17"
+    assert schema_version == str(SCHEMA_VERSION) == "18"
     assert {
         "event_id",
         "demand_id",

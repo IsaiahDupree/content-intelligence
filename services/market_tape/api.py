@@ -19,8 +19,10 @@ from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
 from .script_demand import ScriptLanguageDemandWorker
 from .semantic import SemanticContractError, SemanticTopicService
+from .sources.upwork import UpworkAPIError
 from .store import MarketTapeStore, ScriptLanguageDemandClaimConflict
 from .sinks import SupabaseSink
+from .upwork_demand import UpworkDemandService
 
 
 def register_market_tape_routes(
@@ -32,9 +34,10 @@ def register_market_tape_routes(
     resolved = config or MarketTapeConfig.from_environment()
     store = MarketTapeStore(resolved)
     semantic = SemanticTopicService(store)
+    upwork = UpworkDemandService(resolved)
     operation_lock = threading.Lock()
 
-    def run_exclusive(operation: Callable[[], Dict[str, Any]]):
+    def run_exclusive(operation: Callable[[], dict[str, Any]]):
         if not operation_lock.acquire(blocking=False):
             return jsonify({
                 "error": "market tape operation already running",
@@ -163,6 +166,99 @@ def register_market_tape_routes(
         return jsonify({
             "candles": store.social_candles(window, limit, request.args.get("platform")),
         })
+
+    @app.get("/api/market-tape/upwork/health")
+    def market_tape_upwork_health():
+        return jsonify(upwork.health())
+
+    @app.get("/api/market-tape/upwork/jobs")
+    def market_tape_upwork_jobs():
+        try:
+            return jsonify(upwork.list_jobs(
+                limit=_limit(request.args.get("limit"), 100, maximum=500),
+                query=request.args.get("query"),
+            ))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/upwork/demand")
+    def market_tape_upwork_demand():
+        try:
+            return jsonify(upwork.demand_report(
+                cohort_type=request.args.get("cohort_type"),
+                cohort_key=request.args.get("cohort_key"),
+                limit=_limit(request.args.get("limit"), 100, maximum=500),
+            ))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/upwork/backtest")
+    def market_tape_upwork_backtest():
+        try:
+            return jsonify(upwork.backtest_report(
+                cohort_type=request.args.get("cohort_type"),
+                cohort_key=request.args.get("cohort_key"),
+            ))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.get("/api/market-tape/upwork/script-context")
+    def market_tape_upwork_script_context():
+        try:
+            return jsonify(upwork.script_context(
+                selection_id=request.args.get("selection_id"),
+                limit=_limit(request.args.get("limit"), 20, maximum=100),
+            ))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/market-tape/upwork/scans")
+    def market_tape_upwork_scan():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "JSON object body required"}), 400
+        if "observed_at" in body:
+            return jsonify({"error": "observed_at is server-controlled"}), 400
+        execute_metered_reads = body.get("execute_metered_reads", False)
+        if not isinstance(execute_metered_reads, bool):
+            return jsonify({"error": "execute_metered_reads must be boolean"}), 400
+        queries = body.get("queries")
+        if queries is not None and (
+            not isinstance(queries, list)
+            or any(not isinstance(value, str) for value in queries)
+        ):
+            return jsonify({"error": "queries must be an array of strings"}), 400
+        try:
+            return run_exclusive(lambda: upwork.scan(
+                queries=queries,
+                execute_metered_reads=execute_metered_reads,
+                max_jobs_per_query=_limit(
+                    body.get("max_jobs_per_query"), 50, maximum=100
+                ),
+                sort=str(body.get("sort") or "recency"),
+            ))
+        except UpworkAPIError as exc:
+            status_code = exc.status_code or 502
+            return jsonify({"error": str(exc), "code": exc.code}), status_code
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+
+    @app.post("/api/market-tape/upwork/signals/materialize")
+    def market_tape_upwork_materialize_signals():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "JSON object body required"}), 400
+        try:
+            return run_exclusive(lambda: upwork.materialize_signals(
+                graph_version_id=body.get("graph_version_id"),
+                limit=_limit(body.get("limit"), 100, maximum=500),
+            ))
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return jsonify({"error": str(exc)}), 400
 
     @app.get("/api/market-tape/semantic/mapping-health")
     def market_tape_semantic_mapping_health():
@@ -382,6 +478,36 @@ def register_market_tape_routes(
                     "method": "GET",
                     "path": "/api/market-tape/semantic/generation-handoff",
                     "required": ["selection_id"],
+                },
+                "upwork_health": {
+                    "method": "GET",
+                    "path": "/api/market-tape/upwork/health",
+                    "metered": False,
+                },
+                "upwork_demand": {
+                    "method": "GET",
+                    "path": "/api/market-tape/upwork/demand",
+                    "bounds": {"limit": [1, 500]},
+                },
+                "upwork_backtest": {
+                    "method": "GET",
+                    "path": "/api/market-tape/upwork/backtest",
+                },
+                "upwork_script_context": {
+                    "method": "GET",
+                    "path": "/api/market-tape/upwork/script-context",
+                    "policy": "approved_aggregate_demand_only",
+                },
+                "run_upwork_scan": {
+                    "method": "POST",
+                    "path": "/api/market-tape/upwork/scans",
+                    "required": ["execute_metered_reads"],
+                    "effect": "pre_reserved_bounded_metered_reads",
+                },
+                "materialize_upwork_signals": {
+                    "method": "POST",
+                    "path": "/api/market-tape/upwork/signals/materialize",
+                    "effect": "append_only_external_signal_candidates",
                 },
                 "import_semantic_graph": {
                     "method": "POST",
@@ -603,7 +729,7 @@ def register_market_tape_routes(
         if not _authorized():
             return jsonify({"error": "local control token required"}), 401
         body: Any = request.get_json(silent=True) or {}
-        def flush() -> Dict[str, Any]:
+        def flush() -> dict[str, Any]:
             reconciled = store.enqueue_missing_for_sync() if body.get("reconcile") is True else 0
             if body.get("force") is True:
                 store.make_outbox_due()

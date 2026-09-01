@@ -18,13 +18,14 @@ from .semantic import (
     GRAPH_IMPORT_CONTRACT,
     SemanticContractError,
     SemanticTopicService,
-    canonical_json,
     normalize_text,
     validate_topic_graph,
 )
 from .sources import build_sources
+from .sources.upwork import UpworkAPIError
 from .sinks import SupabaseSink
 from .store import MarketTapeStore
+from .upwork_demand import UpworkDemandService
 
 
 def main() -> int:
@@ -115,6 +116,28 @@ def main() -> int:
     semantic_status.add_argument("--graph-version-id")
     semantic_status.add_argument("--signal-type")
     semantic_status.add_argument("--limit", type=int, default=25)
+    subparsers.add_parser("upwork-health")
+    upwork_scan = subparsers.add_parser("upwork-scan")
+    upwork_scan.add_argument("--query", action="append", dest="queries")
+    upwork_scan.add_argument("--execute-metered-reads", action="store_true")
+    upwork_scan.add_argument("--max-jobs-per-query", type=int, default=50)
+    upwork_scan.add_argument("--sort", default="recency")
+    upwork_jobs = subparsers.add_parser("upwork-jobs")
+    upwork_jobs.add_argument("--query")
+    upwork_jobs.add_argument("--limit", type=int, default=100)
+    upwork_demand = subparsers.add_parser("upwork-demand")
+    upwork_demand.add_argument("--cohort-type")
+    upwork_demand.add_argument("--cohort-key")
+    upwork_demand.add_argument("--limit", type=int, default=100)
+    upwork_backtest = subparsers.add_parser("upwork-backtest")
+    upwork_backtest.add_argument("--cohort-type")
+    upwork_backtest.add_argument("--cohort-key")
+    upwork_context = subparsers.add_parser("upwork-script-context")
+    upwork_context.add_argument("--selection-id")
+    upwork_context.add_argument("--limit", type=int, default=20)
+    upwork_materialize = subparsers.add_parser("upwork-materialize-signals")
+    upwork_materialize.add_argument("--graph-version-id")
+    upwork_materialize.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
 
     config = MarketTapeConfig.from_environment()
@@ -291,6 +314,60 @@ def main() -> int:
                 limit=min(100, max(1, int(args.limit))),
             ),
         })
+    if args.command.startswith("upwork-"):
+        upwork = UpworkDemandService(config)
+        try:
+            if args.command == "upwork-health":
+                return _print(upwork.health())
+            if args.command == "upwork-scan":
+                return _print(upwork.scan(
+                    queries=args.queries,
+                    execute_metered_reads=bool(args.execute_metered_reads),
+                    max_jobs_per_query=min(
+                        100, max(1, int(args.max_jobs_per_query))
+                    ),
+                    sort=args.sort,
+                ))
+            if args.command == "upwork-jobs":
+                return _print(upwork.list_jobs(
+                    limit=min(500, max(1, int(args.limit))),
+                    query=args.query,
+                ))
+            if args.command == "upwork-demand":
+                return _print(upwork.demand_report(
+                    cohort_type=args.cohort_type,
+                    cohort_key=args.cohort_key,
+                    limit=min(500, max(1, int(args.limit))),
+                ))
+            if args.command == "upwork-backtest":
+                return _print(upwork.backtest_report(
+                    cohort_type=args.cohort_type,
+                    cohort_key=args.cohort_key,
+                ))
+            if args.command == "upwork-script-context":
+                return _print(upwork.script_context(
+                    selection_id=args.selection_id,
+                    limit=min(100, max(1, int(args.limit))),
+                ))
+            if args.command == "upwork-materialize-signals":
+                return _print(upwork.materialize_signals(
+                    graph_version_id=args.graph_version_id,
+                    limit=min(500, max(1, int(args.limit))),
+                ))
+        except UpworkAPIError as exc:
+            return _print({
+                "status": "error",
+                "code": exc.code,
+                "error": str(exc),
+            }, exit_code=2)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return _print({
+                "status": "error",
+                "code": "upwork_command_failed",
+                "error": str(exc),
+            }, exit_code=2)
+        finally:
+            upwork.close()
     if args.command == "doctor":
         sources = build_sources(config, "doctor", store.remaining_request_budget)
         try:
@@ -319,9 +396,9 @@ def main() -> int:
     return 1
 
 
-def _print(value: Any) -> int:
+def _print(value: Any, *, exit_code: int = 0) -> int:
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
-    return 0
+    return exit_code
 
 
 def _load_json(path: str) -> Any:
