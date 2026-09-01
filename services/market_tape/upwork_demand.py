@@ -45,7 +45,7 @@ UPWORK_PREDICTION_OUTCOME_CONTRACT = (
     "market_tape_upwork_prediction_outcome_v1"
 )
 UPWORK_SEMANTIC_LINK_CONTRACT = "upwork_market_demand_signal_v1"
-UPWORK_SCRIPT_CONTEXT_CONTRACT = "upwork_market_demand_script_context_v1"
+UPWORK_SCRIPT_CONTEXT_CONTRACT = "upwork_market_demand_script_context_v2"
 UPWORK_PREDICTION_MODEL_VERSION = "upwork-demand-direction-v1"
 
 UPWORK_TABLE_ENTITY_TYPES: tuple[tuple[str, str, str], ...] = (
@@ -2128,27 +2128,49 @@ class UpworkDemandService:
                             selection_row["selection_id"],
                         ),
                     ).fetchall()
-                    stale_binding_count = int(
-                        connection.execute(
-                            """SELECT COUNT(*)
+                    binding_disposition_rows = connection.execute(
+                        """WITH selected_pairs AS (
+                               SELECT DISTINCT selected_binding.signal_id,
+                                               selected_binding.topic_id
                                FROM mt_atomic_topic_selection_sources source
                                JOIN mt_topic_signal_bindings selected_binding
                                  ON selected_binding.binding_id = source.binding_id
                                WHERE source.selection_id = ?
-                                 AND COALESCE((
-                                     SELECT current_binding.decision
-                                     FROM mt_topic_signal_bindings current_binding
-                                     WHERE current_binding.signal_id =
-                                               selected_binding.signal_id
-                                       AND current_binding.topic_id =
-                                               selected_binding.topic_id
-                                     ORDER BY current_binding.reviewed_at DESC,
-                                              current_binding.binding_id DESC
-                                     LIMIT 1
-                                 ), '') != 'approved'""",
-                            (selection_row["selection_id"],),
-                        ).fetchone()[0]
+                           ), ranked AS (
+                               SELECT current_binding.*,
+                                      ROW_NUMBER() OVER (
+                                          PARTITION BY current_binding.signal_id,
+                                                       current_binding.topic_id
+                                          ORDER BY current_binding.reviewed_at DESC,
+                                                   current_binding.binding_id DESC
+                                      ) AS row_number
+                               FROM mt_topic_signal_bindings current_binding
+                               JOIN selected_pairs selected
+                                 ON selected.signal_id = current_binding.signal_id
+                                AND selected.topic_id = current_binding.topic_id
+                           )
+                           SELECT binding_id, signal_id, topic_id, decision,
+                                  reviewed_at
+                           FROM ranked WHERE row_number = 1
+                           ORDER BY signal_id, topic_id, binding_id""",
+                        (selection_row["selection_id"],),
+                    ).fetchall()
+                    binding_dispositions = [
+                        {
+                            "binding_id": str(row["binding_id"]),
+                            "signal_id": str(row["signal_id"]),
+                            "topic_id": str(row["topic_id"]),
+                            "decision": str(row["decision"]),
+                            "reviewed_at": str(row["reviewed_at"]),
+                        }
+                        for row in binding_disposition_rows
+                    ]
+                    stale_binding_count = sum(
+                        disposition["decision"] != "approved"
+                        for disposition in binding_dispositions
                     )
+                    if not binding_dispositions:
+                        blockers.append("selection_binding_dispositions_required")
                     if stale_binding_count:
                         blockers.append("selection_binding_no_longer_approved")
                     eligible_rows = [
@@ -2175,6 +2197,7 @@ class UpworkDemandService:
                         "atomic_topic_id": str(selection_row["atomic_topic_id"]),
                         "semantic_link_ids": semantic_link_ids,
                         "observation_ids": observation_ids,
+                        "binding_dispositions": binding_dispositions,
                     }
                     unique_snapshot_rows: dict[str, sqlite3.Row] = {}
                     for row in eligible_rows:
@@ -2183,6 +2206,14 @@ class UpworkDemandService:
                         )
                     evidence_times = [reviewed_at] if reviewed_at is not None else []
                     evidence_timestamps_valid = True
+                    for disposition in binding_dispositions:
+                        disposition_time = parse_datetime(
+                            disposition["reviewed_at"]
+                        )
+                        if disposition_time is None:
+                            evidence_timestamps_valid = False
+                        else:
+                            evidence_times.append(disposition_time)
                     for row in unique_snapshot_rows.values():
                         for field in ("observed_at", "prediction_as_of"):
                             evidence_time = parse_datetime(row[field])
@@ -2192,12 +2223,13 @@ class UpworkDemandService:
                                 evidence_times.append(evidence_time)
                     if not evidence_timestamps_valid:
                         blockers.append("demand_evidence_timestamp_invalid")
-                    elif evidence_times:
+                    if evidence_times:
                         # The authority response is content-addressed and may be
                         # fetched more than once. Derive its timestamp only from
                         # immutable selection/evidence rows while ensuring every
                         # included prediction already existed by generated_at.
                         generated_at = str(isoformat(max(evidence_times)))
+                    if evidence_timestamps_valid:
                         cohorts = [
                             self._script_cohort_projection(dict(row))
                             for row in list(unique_snapshot_rows.values())[

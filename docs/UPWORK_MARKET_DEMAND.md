@@ -134,6 +134,10 @@ Failed scans and zero-job snapshots remain durable audit evidence, but they are
 not eligible for semantic materialization or script context. Script context
 also revalidates the latest disposition of every selection binding; a later
 revocation invalidates the older atomic selection for generation.
+`upwork_market_demand_script_context_v2` content-addresses those effective
+binding IDs, decisions, topic/signal pairs, and review timestamps, and derives
+`generated_at` from the latest immutable selection, disposition, observation,
+or prediction timestamp.
 
 ## Supabase rollout
 
