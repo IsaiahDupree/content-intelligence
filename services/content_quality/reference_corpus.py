@@ -469,6 +469,36 @@ class ReferenceCorpusService:
             raise RuntimeError("source reader returned a non-object")
         return payload
 
+    def _continuation_cursor(
+        self, corpus_id: str
+    ) -> tuple[str, str, str]:
+        self.corpus_status(corpus_id)
+        with closing(self.connect()) as connection:
+            corpus = connection.execute(
+                "SELECT creator_handle FROM reference_corpora WHERE corpus_id=?",
+                (corpus_id,),
+            ).fetchone()
+            receipt = connection.execute(
+                """SELECT receipt_id, payload_path
+                   FROM reference_raw_receipts
+                   WHERE corpus_id=? AND endpoint='/reels'
+                   ORDER BY captured_at DESC
+                   LIMIT 1""",
+                (corpus_id,),
+            ).fetchone()
+        if corpus is None or receipt is None:
+            raise ValueError("continuation source has no Reel page receipt")
+        payload_path = Path(str(receipt["payload_path"]))
+        if not payload_path.is_file():
+            raise RuntimeError("continuation source receipt is unavailable")
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        paging = payload.get("paging_info")
+        paging = paging if isinstance(paging, dict) else {}
+        cursor = str(paging.get("max_id") or "").strip()
+        if not paging.get("more_available") or not cursor:
+            raise ValueError("continuation source feed is exhausted")
+        return str(corpus["creator_handle"]), cursor, str(receipt["receipt_id"])
+
     def _put_raw(
         self,
         corpus_id: str,
@@ -713,6 +743,9 @@ class ReferenceCorpusService:
         username: str,
         limit: int = 75,
         corpus_id: str | None = None,
+        start_max_id: str = "",
+        continuation_of: str = "",
+        continuation_receipt_id: str = "",
     ) -> dict[str, Any]:
         username = str(username).strip().lower().removeprefix("@").strip()
         if not re.fullmatch(r"[a-z0-9_.]{1,30}", username):
@@ -748,7 +781,9 @@ class ReferenceCorpusService:
         observed_at = utc_now()
         normalized: dict[str, dict[str, Any]] = {}
         receipts = [identity_receipt, profile_receipt]
-        max_id = ""
+        initial_max_id = str(start_max_id or "").strip()
+        max_id = initial_max_id
+        last_paging: dict[str, Any] = {}
         page_count = 0
         while len(normalized) < limit and page_count < 20:
             parameters = {"id": user_id, "count": min(12, limit), "max_id": max_id}
@@ -772,6 +807,7 @@ class ReferenceCorpusService:
                     break
             paging = payload.get("paging_info")
             paging = paging if isinstance(paging, dict) else {}
+            last_paging = paging
             next_id = str(paging.get("max_id") or "")
             page_count += 1
             if not paging.get("more_available") or not next_id or next_id == max_id:
@@ -785,6 +821,10 @@ class ReferenceCorpusService:
                 (corpus_id,),
             ).fetchone()[0])
         state = "acquired" if len(selected) >= limit else "partial"
+        feed_has_more = bool(
+            last_paging.get("more_available")
+            and str(last_paging.get("max_id") or "").strip()
+        )
         self._upsert_corpus(
             corpus_id=corpus_id,
             username=username,
@@ -798,6 +838,13 @@ class ReferenceCorpusService:
                 "following": int(profile.get("following_count") or 0),
                 "is_verified": bool(profile.get("is_verified")),
                 "source_receipt_id": profile_receipt["receipt_id"],
+                "continuation_of": str(continuation_of or ""),
+                "continuation_receipt_id": str(continuation_receipt_id or ""),
+                "continuation_cursor_sha256": (
+                    hashlib.sha256(initial_max_id.encode("utf-8")).hexdigest()
+                    if initial_max_id else ""
+                ),
+                "feed_has_more": feed_has_more,
             },
         )
         return {
@@ -812,10 +859,35 @@ class ReferenceCorpusService:
             "refreshed_count": min(before_count, len(selected)),
             "page_count": page_count,
             "raw_receipt_count": len(receipts),
+            "continuation_of": str(continuation_of or ""),
+            "feed_has_more": feed_has_more,
             "observed_at": observed_at,
             "rights_state": SOURCE_RIGHTS_STATE,
             "source_clips_retained": False,
         }
+
+    def acquire_instagram_next(
+        self,
+        *,
+        from_corpus_id: str,
+        corpus_id: str,
+        limit: int = MAX_CORPUS_ITEMS,
+    ) -> dict[str, Any]:
+        source_id = str(from_corpus_id or "").strip()
+        next_id = str(corpus_id or "").strip()
+        if not source_id or not next_id:
+            raise ValueError("from_corpus_id and corpus_id are required")
+        if source_id == next_id:
+            raise ValueError("continuation corpus must have a distinct ID")
+        username, cursor, receipt_id = self._continuation_cursor(source_id)
+        return self.acquire_instagram(
+            username=username,
+            limit=limit,
+            corpus_id=next_id,
+            start_max_id=cursor,
+            continuation_of=source_id,
+            continuation_receipt_id=receipt_id,
+        )
 
     def _pending_items(self, corpus_id: str, limit: int) -> list[dict[str, Any]]:
         with closing(self.connect()) as connection:
@@ -832,12 +904,44 @@ class ReferenceCorpusService:
                          WHERE newest.item_id=i.item_id
                          ORDER BY newest.observed_at DESC LIMIT 1
                      )
-                   WHERE i.corpus_id=? AND i.extraction_state!='complete'
+                   WHERE i.corpus_id=? AND i.extraction_state='pending'
                    ORDER BY i.published_at DESC, i.item_id
                    LIMIT ?""",
                 (corpus_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def queue_failed_items(
+        self, *, corpus_id: str, limit: int = MAX_CORPUS_ITEMS
+    ) -> dict[str, Any]:
+        self.corpus_status(corpus_id)
+        bounded = max(1, min(MAX_CORPUS_ITEMS, int(limit)))
+        now = utc_now()
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT item_id FROM reference_items
+                   WHERE corpus_id=? AND extraction_state='failed'
+                   ORDER BY updated_at, item_id
+                   LIMIT ?""",
+                (corpus_id, bounded),
+            ).fetchall()
+            item_ids = [str(row["item_id"]) for row in rows]
+            if item_ids:
+                marks = ",".join("?" for _ in item_ids)
+                connection.execute(
+                    f"UPDATE reference_items SET extraction_state='pending', updated_at=? "
+                    f"WHERE item_id IN ({marks})",
+                    (now, *item_ids),
+                )
+                connection.commit()
+        return {
+            "status": "ok",
+            "contract": "reference_failed_retry_queue_v1",
+            "corpus_id": corpus_id,
+            "queued_count": len(item_ids),
+            "failure_receipts_retained": True,
+            "queued_at": now,
+        }
 
     def _raw_asset(self, item: dict[str, Any]) -> dict[str, Any]:
         path = Path(str(item["raw_path"]))
