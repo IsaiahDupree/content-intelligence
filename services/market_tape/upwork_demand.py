@@ -1450,11 +1450,11 @@ class UpworkDemandService:
                 velocity = new_jobs / elapsed
                 acceleration = (velocity - float(previous["velocity"])) / elapsed
             evidence_state = (
-                "partial"
+                "insufficient"
+                if unique_jobs == 0
+                else "partial"
                 if cohort_partial
                 else "complete"
-                if unique_jobs > 0
-                else "insufficient"
             )
             evidence = {
                 "scan_run_id": scan_run_id,
@@ -1908,14 +1908,20 @@ class UpworkDemandService:
             snapshots = connection.execute(
                 """SELECT snapshot.*, prediction.direction,
                           prediction.confidence, prediction.model_version,
-                          prediction.as_of AS prediction_as_of
+                          prediction.as_of AS prediction_as_of,
+                          scan.state AS scan_state
                    FROM mt_upwork_demand_snapshots snapshot
                    JOIN mt_upwork_predictions prediction
                      ON prediction.demand_snapshot_id = snapshot.demand_snapshot_id
+                   JOIN mt_upwork_scan_runs scan
+                     ON scan.scan_run_id = snapshot.scan_run_id
                    LEFT JOIN mt_upwork_semantic_links link
                      ON link.demand_snapshot_id = snapshot.demand_snapshot_id
                     AND link.graph_version_id = ?
                    WHERE link.semantic_link_id IS NULL
+                     AND scan.state IN ('complete', 'partial')
+                     AND snapshot.evidence_state IN ('complete', 'partial')
+                     AND snapshot.unique_jobs > 0
                    ORDER BY snapshot.observed_at DESC,
                             snapshot.demand_snapshot_id DESC LIMIT ?""",
                 (graph_version_id, bounded_limit),
@@ -2096,13 +2102,16 @@ class UpworkDemandService:
                                   prediction.direction,
                                   prediction.confidence,
                                   prediction.model_version,
-                                  prediction.as_of AS prediction_as_of
+                                  prediction.as_of AS prediction_as_of,
+                                  scan.state AS scan_state
                            FROM mt_atomic_topic_selection_sources source
                            JOIN mt_upwork_semantic_links link
                              ON link.signal_id = source.signal_id
                             AND link.graph_version_id = ?
                            JOIN mt_upwork_demand_snapshots snapshot
                              ON snapshot.demand_snapshot_id = link.demand_snapshot_id
+                           JOIN mt_upwork_scan_runs scan
+                             ON scan.scan_run_id = snapshot.scan_run_id
                            JOIN mt_upwork_predictions prediction
                              ON prediction.demand_snapshot_id =
                                 snapshot.demand_snapshot_id
@@ -2119,13 +2128,41 @@ class UpworkDemandService:
                             selection_row["selection_id"],
                         ),
                     ).fetchall()
+                    stale_binding_count = int(
+                        connection.execute(
+                            """SELECT COUNT(*)
+                               FROM mt_atomic_topic_selection_sources source
+                               JOIN mt_topic_signal_bindings selected_binding
+                                 ON selected_binding.binding_id = source.binding_id
+                               WHERE source.selection_id = ?
+                                 AND COALESCE((
+                                     SELECT current_binding.decision
+                                     FROM mt_topic_signal_bindings current_binding
+                                     WHERE current_binding.signal_id =
+                                               selected_binding.signal_id
+                                       AND current_binding.topic_id =
+                                               selected_binding.topic_id
+                                     ORDER BY current_binding.reviewed_at DESC,
+                                              current_binding.binding_id DESC
+                                     LIMIT 1
+                                 ), '') != 'approved'""",
+                            (selection_row["selection_id"],),
+                        ).fetchone()[0]
+                    )
+                    if stale_binding_count:
+                        blockers.append("selection_binding_no_longer_approved")
                     eligible_rows = [
                         row
                         for row in source_rows
                         if row["evidence_state"] in {"complete", "partial"}
+                        and int(row["unique_jobs"]) > 0
+                        and row["scan_state"] in {"complete", "partial"}
                     ]
                     if len(eligible_rows) != len(source_rows):
                         blockers.append("insufficient_demand_evidence")
+                        eligible_rows = []
+                    if stale_binding_count:
+                        eligible_rows = []
                     semantic_link_ids = sorted(
                         {str(row["semantic_link_id"]) for row in eligible_rows}
                     )

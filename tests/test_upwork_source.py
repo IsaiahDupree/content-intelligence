@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +35,8 @@ class _RapidAPIHandler(BaseHTTPRequestHandler):
         self.__class__.requests.append(
             {"path": self.path, "headers": dict(self.headers), "body": body}
         )
+        if body.get("keyword") == "slow response":
+            time.sleep(0.15)
         if body.get("keyword") == "provider error":
             self._json(
                 429,
@@ -136,7 +139,12 @@ class _RapidAPIHandler(BaseHTTPRequestHandler):
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # A timeout test intentionally closes the client connection before
+            # this real loopback server finishes its delayed response.
+            return
 
 
 @contextmanager
@@ -245,6 +253,61 @@ def test_search_and_detail_match_provider_contract(
         == "upwork-jobs-scraper-api.p.rapidapi.com"
     )
     assert handler.requests[0]["headers"]["X-RapidAPI-Key"] == "secret"
+
+
+def test_upwork_default_timeout_is_separate_from_generic_source_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MARKET_TAPE_UPWORK_REQUEST_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("UPWORK_SCRAPER_RAPIDAPI_KEY", "secret")
+    config = MarketTapeConfig(
+        db_path=tmp_path / "market-tape.sqlite3",
+        object_dir=tmp_path / "objects",
+        allow_metered_reads=True,
+        request_timeout_seconds=0.02,
+    )
+
+    with _rapidapi_server() as (base_url, handler):
+        client = _test_client(config, base_url)
+        try:
+            health = client.health()
+            result = client.search_jobs(
+                keyword="slow response", execute_metered_reads=True
+            )
+        finally:
+            client.close()
+
+    assert health["request_timeout_seconds"] == 60.0
+    assert result["count"] == 1
+    assert [row["body"]["keyword"] for row in handler.requests] == [
+        "slow response"
+    ]
+
+
+def test_upwork_timeout_environment_override_reaches_real_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MARKET_TAPE_UPWORK_REQUEST_TIMEOUT_SECONDS", "0.05")
+    monkeypatch.setenv("UPWORK_SCRAPER_RAPIDAPI_KEY", "secret")
+    config = _config(tmp_path)
+
+    with _rapidapi_server() as (base_url, handler):
+        client = _test_client(config, base_url)
+        try:
+            assert client.health()["request_timeout_seconds"] == 0.05
+            with pytest.raises(UpworkAPIError) as error:
+                client.search_jobs(
+                    keyword="slow response", execute_metered_reads=True
+                )
+        finally:
+            client.close()
+
+    assert error.value.code == "upstream_unreachable"
+    assert error.value.retryable is True
+    assert isinstance(error.value.__cause__, httpx.ReadTimeout)
+    assert [row["body"]["keyword"] for row in handler.requests] == [
+        "slow response"
+    ]
 
 
 def test_metered_gates_fail_before_transport(

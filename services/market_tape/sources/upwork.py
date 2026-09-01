@@ -7,6 +7,7 @@ call opt-in at the call site.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -93,10 +94,20 @@ class UpworkRapidAPIClient:
             test_base_url=test_base_url,
             allow_loopback_test_transport=allow_loopback_test_transport,
         )
+        self.request_timeout_seconds = float(
+            config.upwork_request_timeout_seconds
+        )
+        if (
+            not math.isfinite(self.request_timeout_seconds)
+            or self.request_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "MARKET_TAPE_UPWORK_REQUEST_TIMEOUT_SECONDS must be positive"
+            )
         if client is not None and client.follow_redirects:
             raise ValueError("injected Upwork HTTP client must disable redirects")
         self._client = client or httpx.Client(
-            timeout=config.request_timeout_seconds,
+            timeout=self.request_timeout_seconds,
             follow_redirects=False,
         )
         self._owns_client = client is None
@@ -159,6 +170,7 @@ class UpworkRapidAPIClient:
             "configured": configured,
             "metered": True,
             "request_units_per_call": self.request_units_per_call,
+            "request_timeout_seconds": self.request_timeout_seconds,
             "execute_metered_reads_default": False,
             "base_url": self.base_url,
             "host": self.host,

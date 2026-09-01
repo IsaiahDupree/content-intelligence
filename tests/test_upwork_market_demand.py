@@ -27,6 +27,7 @@ from services.market_tape.semantic import (  # noqa: E402
 from services.market_tape.sources.upwork import UpworkAPIError  # noqa: E402
 from services.market_tape.store import MarketTapeStore  # noqa: E402
 from services.market_tape.upwork_demand import (  # noqa: E402
+    UPWORK_SEMANTIC_LINK_CONTRACT,
     UPWORK_SCRIPT_CONTEXT_CONTRACT,
     UPWORK_TABLE_ENTITY_TYPES,
     UpworkDemandService,
@@ -66,6 +67,21 @@ class _DemandRapidAPIHandler(BaseHTTPRequestHandler):
         index = len(self.__class__.requests)
         self.__class__.requests.append({"path": self.path, "body": body})
         batch = self.__class__.batches[min(index, len(self.__class__.batches) - 1)]
+        status = int(batch.get("status", 200))
+        if status >= 400:
+            response = batch.get("response") or {
+                "code": "provider_timeout",
+                "message": "provider timed out",
+                "status": status,
+                "retryable": True,
+            }
+            payload = json.dumps(response).encode()
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         response = {
             "data": {
                 "jobs": batch["jobs"],
@@ -659,6 +675,25 @@ def test_semantic_selection_is_required_for_aggregate_script_context(
         repeated_context = service.script_context(
             selection_id=selection["selection"]["selection_id"]
         )
+        semantic.record_binding(
+            {
+                "signal_id": signal_id,
+                "topic_id": "atomic_subject.freelance-demand-test",
+                "decision": "revoked",
+                "binding_method": "human_review",
+                "confidence": 1.0,
+                "rationale": "The selected demand observation was withdrawn.",
+                "reviewer_type": "human",
+                "reviewed_by": "pytest-revoker",
+                "reviewed_at": "2026-08-30T12:03:00Z",
+                "source_receipt_id": "receipt:upwork-demand-revoked",
+                "review_receipt_id": "receipt:binding-revoked",
+                "audit": {"automatic_binding": False},
+            }
+        )
+        revoked_context = service.script_context(
+            selection_id=selection["selection"]["selection_id"]
+        )
         service.close()
 
     assert blocked["generation_authorized"] is False
@@ -723,3 +758,134 @@ def test_semantic_selection_is_required_for_aggregate_script_context(
         key: value for key, value in context.items() if key != "context_sha256"
     }
     assert context["context_sha256"] == stable_hash(context_core)
+    assert revoked_context["generation_authorized"] is False
+    assert revoked_context["cohorts"] == []
+    assert "selection_binding_no_longer_approved" in revoked_context["blockers"]
+
+
+def test_failed_zero_job_snapshot_cannot_reach_script_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    batches = [
+        {"jobs": [_job(1)]},
+        {"status": 502},
+    ]
+    with _provider(batches, monkeypatch) as provider:
+        config = _config(tmp_path)
+        store = MarketTapeStore(config)
+        clock = _Clock(datetime(2026, 8, 30, 12, tzinfo=timezone.utc))
+        service = _service(config, provider, clock)
+        valid_scan = service.scan(execute_metered_reads=True)
+        clock.advance()
+        failed_scan = service.scan(execute_metered_reads=True)
+        semantic = SemanticTopicService(store)
+        imported = semantic.import_graph(
+            {
+                "source_service": "upwork-demand-test",
+                "source_receipt_id": "receipt:graph-zero-evidence",
+                "imported_by": "pytest",
+                "imported_at": "2026-08-30T14:00:00Z",
+                "graph": _graph(),
+            }
+        )
+        graph_version_id = imported["graph"]["graph_version_id"]
+        materialized = service.materialize_signals(
+            graph_version_id=graph_version_id, limit=10
+        )
+        with store.connect() as connection:
+            materialized_links = connection.execute(
+                """SELECT signal_id, demand_snapshot_id
+                   FROM mt_upwork_semantic_links
+                   WHERE graph_version_id = ? AND cohort_type = 'query'
+                   ORDER BY created_at, semantic_link_id""",
+                (graph_version_id,),
+            ).fetchall()
+        signal_id = str(materialized_links[0]["signal_id"])
+        bindings = []
+        for index in range(2):
+            bindings.append(
+                semantic.record_binding(
+                    {
+                        "signal_id": signal_id,
+                        "topic_id": "atomic_subject.freelance-demand-test",
+                        "decision": "approved",
+                        "binding_method": "reviewed_rules",
+                        "confidence": 1.0,
+                        "rationale": "The non-empty aggregate cohort matches the subject.",
+                        "reviewer_type": "rules",
+                        "reviewed_by": f"pytest-{index}",
+                        "reviewed_at": f"2026-08-30T14:0{index + 1}:00Z",
+                        "source_receipt_id": f"receipt:upwork-valid-{index}",
+                        "review_receipt_id": f"receipt:binding-valid-{index}",
+                        "audit": {"automatic_binding": False},
+                    }
+                )
+            )
+        selection = semantic.record_atomic_selection(
+            {
+                "graph_version_id": graph_version_id,
+                "atomic_topic_id": "atomic_subject.freelance-demand-test",
+                "binding_ids": [binding["binding_id"] for binding in bindings],
+                "reviewer_type": "rules",
+                "reviewer_id": "pytest",
+                "reviewed_at": "2026-08-30T14:03:00Z",
+                "review_receipt_id": "receipt:selection-zero-evidence",
+                "rationale": "Use only the non-empty buyer-demand observation.",
+            }
+        )
+
+        # Simulate a pre-fix link that already associated the selected signal
+        # with a terminal failed scan.  The read gate must still fail closed.
+        failed_snapshot_id = failed_scan["demand_snapshot_ids"][0]
+        link_core = {
+            "contract": UPWORK_SEMANTIC_LINK_CONTRACT,
+            "demand_snapshot_id": failed_snapshot_id,
+            "signal_id": signal_id,
+            "graph_version_id": graph_version_id,
+            "cohort_type": "query",
+            "cohort_key": "ai automation",
+            "created_at": "2026-08-30T14:04:00+00:00",
+            "automatic_binding": 0,
+        }
+        link_core["link_sha256"] = stable_hash(link_core)
+        with store.connect() as connection:
+            failed_snapshot = connection.execute(
+                """SELECT evidence_state FROM mt_upwork_demand_snapshots
+                   WHERE demand_snapshot_id = ?""",
+                (failed_snapshot_id,),
+            ).fetchone()
+            connection.execute(
+                """INSERT INTO mt_upwork_semantic_links(
+                       semantic_link_id, contract, demand_snapshot_id,
+                       signal_id, graph_version_id, cohort_type, cohort_key,
+                       created_at, automatic_binding, link_sha256
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "upwork-semantic-link:legacy-zero-evidence",
+                    link_core["contract"],
+                    link_core["demand_snapshot_id"],
+                    link_core["signal_id"],
+                    link_core["graph_version_id"],
+                    link_core["cohort_type"],
+                    link_core["cohort_key"],
+                    link_core["created_at"],
+                    link_core["automatic_binding"],
+                    link_core["link_sha256"],
+                ),
+            )
+        context = service.script_context(
+            selection_id=selection["selection"]["selection_id"]
+        )
+        service.close()
+
+    assert valid_scan["state"] == "complete"
+    assert failed_scan["state"] == "failed"
+    assert failed_scan["accepted_job_observations"] == 0
+    assert failed_snapshot["evidence_state"] == "insufficient"
+    assert materialized["created"] >= 1
+    assert failed_snapshot_id not in {
+        str(link["demand_snapshot_id"]) for link in materialized_links
+    }
+    assert context["generation_authorized"] is False
+    assert context["cohorts"] == []
+    assert "insufficient_demand_evidence" in context["blockers"]

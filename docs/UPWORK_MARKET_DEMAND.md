@@ -26,9 +26,15 @@ five queries. Configure these independently:
 MARKET_TAPE_UPWORK_DEFAULT_QUERIES=AI automation,AI agent,workflow automation,OpenAI
 MARKET_TAPE_UPWORK_MAX_QUERIES_PER_SCAN=5
 MARKET_TAPE_UPWORK_DAILY_REQUEST_LIMIT=10
+MARKET_TAPE_UPWORK_REQUEST_TIMEOUT_SECONDS=60
 MARKET_TAPE_UPWORK_PREDICTION_MIN_SNAPSHOTS=3
 MARKET_TAPE_SUPABASE_SYNC_POST_BATCH_SIZE=50
 ```
+
+The Upwork request timeout is deliberately separate from
+`MARKET_TAPE_REQUEST_TIMEOUT_SECONDS`. Provider-side job scraping can take
+longer than ordinary Market Tape source reads; changing this value therefore
+does not lengthen timeouts for YouTube, TikTok, Instagram, or other sources.
 
 Provider credentials and routing are supplied only through environment
 variables:
@@ -123,6 +129,11 @@ is available only through an approved, selection-linked semantic observation
 and includes aggregate buyer-demand metrics and lineage identifiers. Raw job
 descriptions are never returned as script language and must never be copied or
 lightly rewritten into a script.
+
+Failed scans and zero-job snapshots remain durable audit evidence, but they are
+not eligible for semantic materialization or script context. Script context
+also revalidates the latest disposition of every selection binding; a later
+revocation invalidates the older atomic selection for generation.
 
 ## Supabase rollout
 

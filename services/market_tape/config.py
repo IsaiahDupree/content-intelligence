@@ -276,6 +276,9 @@ class MarketTapeConfig:
     upwork_daily_request_limit: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_UPWORK_DAILY_REQUEST_LIMIT", 10
     ))
+    upwork_request_timeout_seconds: float = field(default_factory=lambda: _float(
+        "MARKET_TAPE_UPWORK_REQUEST_TIMEOUT_SECONDS", 60.0
+    ))
     upwork_prediction_min_snapshots: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_UPWORK_PREDICTION_MIN_SNAPSHOTS", 3
     ))
