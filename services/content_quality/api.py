@@ -670,14 +670,25 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         started = time.monotonic()
         payload = json_body()
         try:
-            result = reference_corpus.acquire_instagram(
-                username=str(payload.get("username") or ""),
-                limit=max(
-                    1,
-                    min(MAX_CORPUS_ITEMS, int(payload.get("limit") or 75)),
-                ),
-                corpus_id=str(payload.get("corpus_id") or "") or None,
+            limit = max(
+                1,
+                min(MAX_CORPUS_ITEMS, int(payload.get("limit") or 75)),
             )
+            continue_from = str(
+                payload.get("continue_from_corpus_id") or ""
+            ).strip()
+            if continue_from:
+                result = reference_corpus.acquire_instagram_next(
+                    from_corpus_id=continue_from,
+                    corpus_id=str(payload.get("corpus_id") or ""),
+                    limit=limit,
+                )
+            else:
+                result = reference_corpus.acquire_instagram(
+                    username=str(payload.get("username") or ""),
+                    limit=limit,
+                    corpus_id=str(payload.get("corpus_id") or "") or None,
+                )
         except ValueError as error:
             return reference_invalid_request(
                 "reference_corpus_acquire", payload, error, started
@@ -703,6 +714,11 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         started = time.monotonic()
         payload = json_body()
         try:
+            if bool(payload.get("retry_failed", False)):
+                reference_corpus.queue_failed_items(
+                    corpus_id=str(payload.get("corpus_id") or ""),
+                    limit=max(1, min(3, int(payload.get("limit") or 1))),
+                )
             result = reference_corpus.extract_batch(
                 corpus_id=str(payload.get("corpus_id") or ""),
                 limit=max(1, min(3, int(payload.get("limit") or 1))),
@@ -1176,12 +1192,18 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "method": "POST",
                     "path": "/api/reference-corpus/acquire",
                     "required": ["username"],
+                    "optional": ["corpus_id", "continue_from_corpus_id"],
                     "bounds": {"limit": [1, 240]},
+                    "continuation_policy": (
+                        "use a distinct corpus_id and continue_from_corpus_id; "
+                        "the cursor is derived from an immutable page receipt"
+                    ),
                 },
                 "extract_reference_items": {
                     "method": "POST",
                     "path": "/api/reference-corpus/extract",
                     "required": ["corpus_id"],
+                    "optional": ["retry_failed"],
                     "bounds": {"limit": [1, 3]},
                     "default": "local typed analysis with optional AI enrichment",
                 },

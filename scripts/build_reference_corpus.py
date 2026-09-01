@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     acquire.add_argument("--corpus-id")
     acquire.set_defaults(handler=run_acquire)
 
+    acquire_next = commands.add_parser("acquire-next")
+    acquire_next.add_argument("--from-corpus-id", required=True)
+    acquire_next.add_argument("--corpus-id", required=True)
+    acquire_next.add_argument("--limit", type=int, default=240)
+    acquire_next.set_defaults(handler=run_acquire_next)
+
     status = commands.add_parser("status")
     status.add_argument("--corpus-id", required=True)
     status.set_defaults(handler=run_status)
@@ -96,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--transcript-model", default="base.en")
     extract.add_argument("--semantic-model", default="gpt-5-nano")
     extract.add_argument("--no-semantic", action="store_true")
+    extract.add_argument("--retry-failed", action="store_true")
     extract.set_defaults(handler=run_extract)
 
     extract_all = commands.add_parser("extract-all")
@@ -105,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_all.add_argument("--transcript-model", default="base.en")
     extract_all.add_argument("--semantic-model", default="gpt-5-nano")
     extract_all.add_argument("--no-semantic", action="store_true")
+    extract_all.add_argument("--retry-failed", action="store_true")
     extract_all.set_defaults(handler=run_extract_all)
 
     reanalyze = commands.add_parser("reanalyze")
@@ -190,27 +198,47 @@ def run_acquire(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def run_acquire_next(args: argparse.Namespace) -> dict[str, Any]:
+    return service(args, with_source=True).acquire_instagram_next(
+        from_corpus_id=args.from_corpus_id,
+        corpus_id=args.corpus_id,
+        limit=args.limit,
+    )
+
+
 def run_status(args: argparse.Namespace) -> dict[str, Any]:
     return service(args).corpus_status(args.corpus_id)
 
 
 def run_extract(args: argparse.Namespace) -> dict[str, Any]:
-    return service(args).extract_batch(
+    store = service(args)
+    retry = None
+    if args.retry_failed:
+        retry = store.queue_failed_items(
+            corpus_id=args.corpus_id, limit=args.limit
+        )
+    result = store.extract_batch(
         corpus_id=args.corpus_id,
         limit=args.limit,
         transcript_model=args.transcript_model,
         semantic_ai=not args.no_semantic,
         semantic_model=args.semantic_model,
     )
+    if retry is not None:
+        result["retry_queue"] = retry
+    return result
 
 
 def run_extract_all(args: argparse.Namespace) -> dict[str, Any]:
     store = service(args)
+    retry = None
+    if args.retry_failed:
+        retry = store.queue_failed_items(corpus_id=args.corpus_id)
     batches: list[dict[str, Any]] = []
     for _ in range(max(1, args.max_batches)):
         current = store.corpus_status(args.corpus_id)
         states = current["counts"]["extraction_states"]
-        if states.get("complete", 0) >= current["counts"]["items"]:
+        if states.get("pending", 0) == 0:
             break
         batch = store.extract_batch(
             corpus_id=args.corpus_id,
@@ -227,6 +255,7 @@ def run_extract_all(args: argparse.Namespace) -> dict[str, Any]:
         "contract": "content_reference_corpus_extract_all_v1",
         "corpus_id": args.corpus_id,
         "batches": batches,
+        "retry_queue": retry,
         "final": store.corpus_status(args.corpus_id),
         "summary": store.summarize(args.corpus_id),
     }
@@ -346,7 +375,7 @@ def run_full(args: argparse.Namespace) -> dict[str, Any]:
     for _ in range(max(1, args.max_batches)):
         current = store.corpus_status(corpus_id)
         states = current["counts"]["extraction_states"]
-        if states.get("complete", 0) >= current["counts"]["items"]:
+        if states.get("pending", 0) == 0:
             break
         batch = store.extract_batch(
             corpus_id=corpus_id,

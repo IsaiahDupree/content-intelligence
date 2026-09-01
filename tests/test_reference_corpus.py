@@ -109,6 +109,85 @@ def test_recorded_reel_normalizes_with_reference_only_rights(tmp_path):
     assert row["direct_use_allowed"] is False
 
 
+def test_continuation_cursor_is_receipt_bound_and_feed_exhaustion_is_typed(
+    tmp_path,
+):
+    store = ReferenceCorpusService(tmp_path)
+    store._upsert_corpus(
+        corpus_id=CORPUS_ID,
+        username="personalbrandlaunch",
+        target_count=1,
+        state="partial",
+        profile={"username": "personalbrandlaunch"},
+    )
+    receipt = store._put_raw(
+        CORPUS_ID,
+        "/reels",
+        {"id": "recorded-user", "count": 1, "max_id": ""},
+        {
+            "items": [recorded_reel()],
+            "paging_info": {"more_available": True, "max_id": "next-page"},
+        },
+    )
+
+    username, cursor, receipt_id = store._continuation_cursor(CORPUS_ID)
+
+    assert username == "personalbrandlaunch"
+    assert cursor == "next-page"
+    assert receipt_id == receipt["receipt_id"]
+
+    exhausted_id = "instagram-exhausted-reference-v1"
+    store._upsert_corpus(
+        corpus_id=exhausted_id,
+        username="personalbrandlaunch",
+        target_count=1,
+        state="acquired",
+        profile={"username": "personalbrandlaunch"},
+    )
+    store._put_raw(
+        exhausted_id,
+        "/reels",
+        {"id": "recorded-user", "count": 1, "max_id": ""},
+        {"items": [recorded_reel()], "paging_info": {"more_available": False}},
+    )
+
+    try:
+        store._continuation_cursor(exhausted_id)
+    except ValueError as error:
+        assert str(error) == "continuation source feed is exhausted"
+    else:
+        raise AssertionError("exhausted feed should reject continuation")
+
+
+def test_extraction_sweep_skips_terminal_states_and_retries_failures_explicitly(
+    tmp_path,
+):
+    store = seed_service(tmp_path)
+    item_id = store.list_items(CORPUS_ID, limit=1)[0]["item_id"]
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE reference_items SET extraction_state='partial' WHERE item_id=?",
+            (item_id,),
+        )
+        connection.commit()
+    assert store._pending_items(CORPUS_ID, 10) == []
+
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE reference_items SET extraction_state='failed' WHERE item_id=?",
+            (item_id,),
+        )
+        connection.commit()
+    assert store._pending_items(CORPUS_ID, 10) == []
+
+    queued = store.queue_failed_items(corpus_id=CORPUS_ID)
+    assert queued["queued_count"] == 1
+    assert queued["failure_receipts_retained"] is True
+    assert [row["item_id"] for row in store._pending_items(CORPUS_ID, 10)] == [
+        item_id
+    ]
+
+
 def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
     store = seed_service(tmp_path)
 
@@ -247,6 +326,9 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
     names = catalog.get_json()["".join(("oper", "ations"))]
     assert "build_reference_context" in names
     assert names["acquire_reference_corpus"]["bounds"]["limit"] == [1, 240]
+    assert "continue_from_corpus_id" in names["acquire_reference_corpus"][
+        "optional"
+    ]
     assert "audit_against_reference_corpus" in names
     assert names["extract_reference_items"]["bounds"]["limit"] == [1, 3]
 
