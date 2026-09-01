@@ -180,6 +180,10 @@ EXPECTED_ADVISOR_INDEXES = {
         "actp_market_rapid_trend_triggers",
         "trend_id,detected_atdesc,trigger_id",
     ),
+    "actp_market_rapid_triggers_baseline_idx": (
+        "actp_market_rapid_trend_triggers",
+        "baseline_trend_observation_key",
+    ),
     "actp_market_rapid_triggers_expiry_idx": (
         "actp_market_rapid_trend_triggers",
         "expires_at,trigger_id",
@@ -230,7 +234,7 @@ def test_semantic_advisor_indexes_are_checked_and_cover_expected_columns():
         index_name: table
         for index_name, (table, _columns) in EXPECTED_ADVISOR_INDEXES.items()
     }
-    assert len(REQUIRED_INDEXES) == 34
+    assert len(REQUIRED_INDEXES) == 35
     for index_name, (table, columns) in EXPECTED_ADVISOR_INDEXES.items():
         expected = (
             f"createindexifnotexists{index_name}"

@@ -268,6 +268,9 @@ REQUIRED_INDEXES: Dict[str, str] = {
     "actp_market_rapid_triggers_trend_idx": (
         "actp_market_rapid_trend_triggers"
     ),
+    "actp_market_rapid_triggers_baseline_idx": (
+        "actp_market_rapid_trend_triggers"
+    ),
     "actp_market_rapid_triggers_expiry_idx": (
         "actp_market_rapid_trend_triggers"
     ),

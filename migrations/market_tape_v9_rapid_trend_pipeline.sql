@@ -42,6 +42,10 @@ create index if not exists actp_market_rapid_triggers_trend_idx
     detected_at desc,
     trigger_id
   );
+create index if not exists actp_market_rapid_triggers_baseline_idx
+  on public.actp_market_rapid_trend_triggers(
+    baseline_trend_observation_key
+  );
 create index if not exists actp_market_rapid_triggers_expiry_idx
   on public.actp_market_rapid_trend_triggers(expires_at, trigger_id);
 
