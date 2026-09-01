@@ -17,6 +17,7 @@ from .dataset import MarketTapeDatasetManager
 from .full_pipeline import run_full_pipeline
 from .intelligence import build_intelligence_snapshot
 from .predictor import MarketTapePredictor
+from .rapid_trend import RapidTrendTriggerService
 from .script_demand import ScriptLanguageDemandWorker
 from .semantic import SemanticContractError, SemanticTopicService
 from .sources.upwork import UpworkAPIError
@@ -34,6 +35,7 @@ def register_market_tape_routes(
     resolved = config or MarketTapeConfig.from_environment()
     store = MarketTapeStore(resolved)
     semantic = SemanticTopicService(store)
+    rapid_trends = RapidTrendTriggerService(resolved, store)
     upwork = UpworkDemandService(resolved)
     operation_lock = threading.Lock()
 
@@ -78,6 +80,53 @@ def register_market_tape_routes(
     def market_tape_trends():
         limit = _limit(request.args.get("limit"), 100)
         return jsonify({"trends": store.list_trends(limit, request.args.get("state"))})
+
+    @app.get("/api/market-tape/rapid-trends")
+    def market_tape_rapid_trends():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        return jsonify(rapid_trends.list_triggers(
+            limit=_limit(request.args.get("limit"), 100, maximum=500),
+            state=request.args.get("state"),
+        ))
+
+    @app.get("/api/market-tape/rapid-trends/<path:trigger_id>")
+    def market_tape_rapid_trend(trigger_id: str):
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        trigger = rapid_trends.get_trigger(trigger_id)
+        if trigger is None:
+            return jsonify({
+                "status": "error",
+                "code": "RAPID_TREND_TRIGGER_NOT_FOUND",
+                "trigger_id": trigger_id,
+            }), 404
+        return jsonify({"status": "ok", "trigger": trigger})
+
+    @app.get("/api/market-tape/rapid-trends/<path:trigger_id>/script-request")
+    def market_tape_rapid_trend_script_request(trigger_id: str):
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        payload, status_code = rapid_trends.script_request(trigger_id)
+        return jsonify(payload), status_code
+
+    @app.post("/api/market-tape/rapid-trends/evaluate")
+    def market_tape_evaluate_rapid_trends():
+        if not _authorized():
+            return jsonify({"error": "local control token required"}), 401
+        body: Any = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"error": "JSON object body required"}), 400
+        trend_ids = body.get("trend_ids")
+        if trend_ids is not None and not isinstance(trend_ids, list):
+            return jsonify({"error": "trend_ids must be an array"}), 400
+        source_run_id = " ".join(
+            str(body.get("source_run_id") or "manual-provider-free-evaluation").split()
+        )[:500]
+        return run_exclusive(lambda: rapid_trends.evaluate(
+            source_run_id=source_run_id,
+            trend_ids=trend_ids,
+        ))
 
     @app.get("/api/market-tape/keywords")
     def market_tape_keywords():
@@ -456,6 +505,32 @@ def register_market_tape_routes(
                 "keyword_intelligence": {
                     "method": "GET", "path": "/api/market-tape/keywords",
                     "bounds": {"limit": [1, 1000]},
+                },
+                "rapid_trend_triggers": {
+                    "method": "GET",
+                    "path": "/api/market-tape/rapid-trends",
+                    "bounds": {"limit": [1, 500]},
+                    "authenticated": True,
+                },
+                "rapid_trend_trigger_detail": {
+                    "method": "GET",
+                    "path": "/api/market-tape/rapid-trends/{trigger_id}",
+                    "authenticated": True,
+                },
+                "rapid_trend_script_request": {
+                    "method": "GET",
+                    "path": (
+                        "/api/market-tape/rapid-trends/{trigger_id}/script-request"
+                    ),
+                    "authenticated": True,
+                    "policy": "live_semantic_handoff_and_ttl_required",
+                },
+                "evaluate_rapid_trends": {
+                    "method": "POST",
+                    "path": "/api/market-tape/rapid-trends/evaluate",
+                    "authenticated": True,
+                    "metered": False,
+                    "effect": "bounded_provider_free_breakout_crossing_evaluation",
                 },
                 "semantic_mapping_health": {
                     "method": "GET",

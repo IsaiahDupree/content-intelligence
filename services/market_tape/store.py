@@ -10,7 +10,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .config import MarketTapeConfig
 from .keywords import rank_keywords
@@ -30,7 +30,7 @@ from .predictor import (
 from .upwork_demand import UPWORK_TABLE_ENTITY_TYPES, ensure_upwork_schema
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 COUNTER_REGRESSION_FLAG_PREFIX = "counter-regression:"
 ACCEPTED_OBSERVATION_EVIDENCE_CONTRACT = (
     "market_tape_accepted_observation_evidence_v1"
@@ -74,6 +74,45 @@ SCRIPT_LANGUAGE_DEMAND_FINAL_EVENTS = {
     "blocked",
     "failed",
 }
+
+
+def rapid_trend_trigger_sync_payload(
+    row: sqlite3.Row | Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Convert a local trigger row to portable Supabase lineage keys.
+
+    SQLite's trend observation ids are local autoincrement values.  The
+    control-plane identity is the same content-derived key already used by
+    the trend-observation outbox.
+    """
+
+    payload = dict(row)
+    evidence_value = payload.get("evidence_json")
+    evidence = (
+        json.loads(evidence_value)
+        if isinstance(evidence_value, str)
+        else dict(evidence_value or {})
+    )
+    trend_id = str(payload["trend_id"])
+
+    def observation_key(field: str) -> str:
+        snapshot = evidence.get(field)
+        if not isinstance(snapshot, dict) or not snapshot.get("observed_at"):
+            raise ValueError(f"rapid trend evidence is missing {field}")
+        return stable_hash({
+            "trend_id": trend_id,
+            "observed_at": snapshot["observed_at"],
+        })
+
+    payload["baseline_trend_observation_key"] = observation_key(
+        "baseline_observation"
+    )
+    payload["trigger_trend_observation_key"] = observation_key(
+        "trigger_observation"
+    )
+    payload.pop("baseline_trend_observation_id", None)
+    payload.pop("trigger_trend_observation_id", None)
+    return payload
 
 
 def _migrate_semantic_repository_change_constraints(
@@ -1018,6 +1057,101 @@ class MarketTapeStore:
                 BEFORE DELETE ON mt_trend_observations
                 BEGIN
                     SELECT RAISE(ABORT, 'trend observations are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_rapid_trend_triggers (
+                    trigger_id TEXT PRIMARY KEY,
+                    contract TEXT NOT NULL CHECK(
+                        contract = 'market_tape_rapid_trend_trigger_v1'
+                    ),
+                    trigger_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(trigger_sha256) = 64
+                    ),
+                    policy_version TEXT NOT NULL,
+                    policy_sha256 TEXT NOT NULL CHECK(
+                        length(policy_sha256) = 64
+                    ),
+                    trend_id TEXT NOT NULL,
+                    baseline_trend_observation_id INTEGER NOT NULL,
+                    trigger_trend_observation_id INTEGER NOT NULL UNIQUE,
+                    source_run_id TEXT NOT NULL DEFAULT '',
+                    source_receipt_id TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL CHECK(
+                        length(evidence_sha256) = 64
+                    ),
+                    evidence_json TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    UNIQUE(
+                        policy_sha256, trend_id,
+                        baseline_trend_observation_id,
+                        trigger_trend_observation_id
+                    ),
+                    FOREIGN KEY(trend_id) REFERENCES mt_trends(trend_id),
+                    FOREIGN KEY(baseline_trend_observation_id)
+                        REFERENCES mt_trend_observations(trend_observation_id),
+                    FOREIGN KEY(trigger_trend_observation_id)
+                        REFERENCES mt_trend_observations(trend_observation_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_rapid_trend_trigger_time_idx
+                    ON mt_rapid_trend_triggers(detected_at DESC, trigger_id);
+                CREATE INDEX IF NOT EXISTS mt_rapid_trend_trigger_trend_idx
+                    ON mt_rapid_trend_triggers(trend_id, detected_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS mt_rapid_trend_triggers_no_update
+                BEFORE UPDATE ON mt_rapid_trend_triggers
+                BEGIN
+                    SELECT RAISE(ABORT, 'rapid trend triggers are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_rapid_trend_triggers_no_delete
+                BEFORE DELETE ON mt_rapid_trend_triggers
+                BEGIN
+                    SELECT RAISE(ABORT, 'rapid trend triggers are append-only');
+                END;
+
+                CREATE TABLE IF NOT EXISTS mt_rapid_trend_trigger_events (
+                    event_id TEXT PRIMARY KEY,
+                    trigger_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN (
+                        'detected', 'semantic_materialized',
+                        'evidence_demand_enqueued', 'handoff_ready',
+                        'script_queued', 'script_completed',
+                        'video_queued', 'video_completed', 'blocked', 'failed'
+                    )),
+                    attempt_no INTEGER NOT NULL DEFAULT 0 CHECK(attempt_no >= 0),
+                    source_service TEXT NOT NULL,
+                    source_receipt_id TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL CHECK(
+                        length(payload_sha256) = 64
+                    ),
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(trigger_id, event_type, attempt_no),
+                    FOREIGN KEY(trigger_id)
+                        REFERENCES mt_rapid_trend_triggers(trigger_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS mt_rapid_trend_events_trigger_time_idx
+                    ON mt_rapid_trend_trigger_events(
+                        trigger_id, created_at, event_id
+                    );
+                CREATE INDEX IF NOT EXISTS mt_rapid_trend_events_type_time_idx
+                    ON mt_rapid_trend_trigger_events(
+                        event_type, created_at DESC, trigger_id
+                    );
+
+                CREATE TRIGGER IF NOT EXISTS mt_rapid_trend_events_no_update
+                BEFORE UPDATE ON mt_rapid_trend_trigger_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'rapid trend events are append-only');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS mt_rapid_trend_events_no_delete
+                BEFORE DELETE ON mt_rapid_trend_trigger_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'rapid trend events are append-only');
                 END;
 
                 CREATE TABLE IF NOT EXISTS mt_poll_queue (
@@ -2786,6 +2920,24 @@ class MarketTapeStore:
                 })
                 payload["trend_observation_key"] = key
                 add("trend_observation", key, payload)
+            for row in connection.execute(
+                "SELECT * FROM mt_rapid_trend_triggers"
+            ).fetchall():
+                payload = rapid_trend_trigger_sync_payload(row)
+                add(
+                    "rapid_trend_trigger",
+                    str(payload["trigger_id"]),
+                    payload,
+                )
+            for row in connection.execute(
+                "SELECT * FROM mt_rapid_trend_trigger_events"
+            ).fetchall():
+                payload = dict(row)
+                add(
+                    "rapid_trend_trigger_event",
+                    str(payload["event_id"]),
+                    payload,
+                )
             for row in connection.execute("SELECT * FROM mt_predictions").fetchall():
                 payload = dict(row)
                 payload.pop("prediction_id", None)
@@ -7691,6 +7843,12 @@ class MarketTapeStore:
                 "script_language_demand_events": connection.execute(
                     "SELECT COUNT(*) FROM mt_script_language_demand_events"
                 ).fetchone()[0],
+                "rapid_trend_triggers": connection.execute(
+                    "SELECT COUNT(*) FROM mt_rapid_trend_triggers"
+                ).fetchone()[0],
+                "rapid_trend_trigger_events": connection.execute(
+                    "SELECT COUNT(*) FROM mt_rapid_trend_trigger_events"
+                ).fetchone()[0],
                 "semantic_graph_versions": connection.execute(
                     "SELECT COUNT(*) FROM mt_topic_graph_versions"
                 ).fetchone()[0],
@@ -7785,6 +7943,11 @@ class MarketTapeStore:
                    FROM current GROUP BY state ORDER BY state""",
                 (isoformat(utc_now()),),
             ).fetchall()
+            rapid_event_rows = connection.execute(
+                """SELECT event_type, COUNT(*) AS count
+                   FROM mt_rapid_trend_trigger_events
+                   GROUP BY event_type ORDER BY event_type"""
+            ).fetchall()
             platform_rows = connection.execute(
                 """SELECT observation.platform,
                           COUNT(DISTINCT observation.video_id) AS count
@@ -7849,6 +8012,10 @@ class MarketTapeStore:
         demand_by_state = {
             str(row["state"]): int(row["count"]) for row in demand_state_rows
         }
+        rapid_by_event = {
+            str(row["event_type"]): int(row["count"])
+            for row in rapid_event_rows
+        }
         return {
             "schema_version": SCHEMA_VERSION,
             "code_schema_version": SCHEMA_VERSION,
@@ -7868,6 +8035,16 @@ class MarketTapeStore:
                 "append_only": True,
                 "total": sum(demand_by_state.values()),
                 "by_state": demand_by_state,
+            },
+            "rapid_trends": {
+                "contract": "market_tape_rapid_trend_status_v1",
+                "enabled": bool(self.config.rapid_trend_trigger_enabled),
+                "append_only": True,
+                "provider_free_detection": True,
+                "automatic_semantic_approval": False,
+                "automatic_publish": False,
+                "total": int(totals["rapid_trend_triggers"]),
+                "events_by_type": rapid_by_event,
             },
             "daily": {
                 "date": today,

@@ -16,7 +16,7 @@ from .config import REPO_ROOT, load_runtime_environment
 from .sources.base import sanitize
 
 
-MIGRATION_NAME = "market_tape_v8"
+MIGRATION_NAME = "market_tape_v9"
 MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v1.sql",
     REPO_ROOT / "migrations" / "market_tape_v2_discovery_attributions.sql",
@@ -26,9 +26,10 @@ MIGRATION_PATHS = (
     REPO_ROOT / "migrations" / "market_tape_v6_semantic_topics.sql",
     REPO_ROOT / "migrations" / "market_tape_v7_software_repository_changes.sql",
     REPO_ROOT / "migrations" / "market_tape_v8_upwork_demand.sql",
+    REPO_ROOT / "migrations" / "market_tape_v9_rapid_trend_pipeline.sql",
 )
 MIGRATION_PATH = MIGRATION_PATHS[-1]
-VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v8.sql"
+VERIFICATION_PATH = REPO_ROOT / "migrations" / "verify_market_tape_v9.sql"
 MANAGEMENT_API_URL = "https://api.supabase.com"
 
 # The probe columns are deliberately the conflict keys used by the outbox sink.
@@ -80,6 +81,13 @@ MARKET_TAPE_TABLES: Dict[str, str] = {
     "actp_upwork_predictions": "prediction_id",
     "actp_upwork_prediction_outcomes": "prediction_outcome_id",
     "actp_upwork_semantic_links": "semantic_link_id",
+    "actp_market_rapid_trend_triggers": (
+        "trigger_id,baseline_trend_observation_key,"
+        "trigger_trend_observation_key,trigger_sha256"
+    ),
+    "actp_market_rapid_trend_trigger_events": (
+        "event_id,trigger_id,event_type,payload_sha256"
+    ),
 }
 
 APPEND_ONLY_TABLES = {
@@ -112,6 +120,8 @@ APPEND_ONLY_TABLES = {
     "actp_upwork_predictions",
     "actp_upwork_prediction_outcomes",
     "actp_upwork_semantic_links",
+    "actp_market_rapid_trend_triggers",
+    "actp_market_rapid_trend_trigger_events",
 }
 
 APPEND_ONLY_TRIGGERS = {
@@ -180,6 +190,12 @@ APPEND_ONLY_TRIGGERS = {
         "actp_upwork_prediction_outcomes_no_update"
     ),
     "actp_upwork_semantic_links": "actp_upwork_semantic_links_no_update",
+    "actp_market_rapid_trend_triggers": (
+        "actp_market_rapid_triggers_no_update"
+    ),
+    "actp_market_rapid_trend_trigger_events": (
+        "actp_market_rapid_events_no_update"
+    ),
 }
 
 # Cover the semantic foreign-key/access paths flagged by Supabase's index
@@ -245,6 +261,21 @@ REQUIRED_INDEXES: Dict[str, str] = {
     "actp_upwork_semantic_links_signal_idx": "actp_upwork_semantic_links",
     "actp_upwork_semantic_links_signal_graph_idx": (
         "actp_upwork_semantic_links"
+    ),
+    "actp_market_rapid_triggers_detected_idx": (
+        "actp_market_rapid_trend_triggers"
+    ),
+    "actp_market_rapid_triggers_trend_idx": (
+        "actp_market_rapid_trend_triggers"
+    ),
+    "actp_market_rapid_triggers_expiry_idx": (
+        "actp_market_rapid_trend_triggers"
+    ),
+    "actp_market_rapid_events_trigger_time_idx": (
+        "actp_market_rapid_trend_trigger_events"
+    ),
+    "actp_market_rapid_events_type_time_idx": (
+        "actp_market_rapid_trend_trigger_events"
     ),
 }
 

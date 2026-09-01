@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -30,7 +31,10 @@ from services.market_tape.semantic import (
 from services.market_tape.store import MarketTapeStore
 
 
-FOUNDRY_ROOT = Path(__file__).resolve().parents[2] / "marketing-video-foundry"
+_DEFAULT_FOUNDRY_ROOT = Path(__file__).resolve().parents[2] / "marketing-video-foundry"
+FOUNDRY_ROOT = Path(
+    os.environ.get("MARKETING_VIDEO_FOUNDRY_ROOT", str(_DEFAULT_FOUNDRY_ROOT))
+).expanduser().resolve()
 FOUNDRY_GRAPH_PATH = FOUNDRY_ROOT / "configs/content-topic-graph-v2.json"
 if str(FOUNDRY_ROOT) not in sys.path:
     sys.path.insert(0, str(FOUNDRY_ROOT))
@@ -1159,7 +1163,7 @@ def test_v15_upgrade_preserves_existing_rows_and_self_heals_semantic_tables(
     with store.connect() as connection:
         assert connection.execute(
             "SELECT value FROM mt_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "17"
+        ).fetchone()[0] == "19"
         assert connection.execute(
             "SELECT payload FROM pre_upgrade_sentinel WHERE sentinel_id='sentinel-1'"
         ).fetchone()[0] == "must survive"

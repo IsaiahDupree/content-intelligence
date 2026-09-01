@@ -13,7 +13,6 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
 
@@ -2968,7 +2967,10 @@ class SemanticTopicService:
             expected_brief_evidence = []
             for receipt in exported["evidence_receipts"]:
                 item = {
-                    "evidence_id": receipt["receipt_id"],
+                    # The receipt remains semantic lineage authority; the
+                    # executable content brief binds to the underlying source
+                    # record stored by Foundry.
+                    "evidence_id": receipt["source_record_id"],
                     "evidence_type": receipt["evidence_type"],
                 }
                 if receipt.get("claim"):
@@ -3032,7 +3034,7 @@ class SemanticTopicService:
                 registration_id,
                 dict(registration_row),
             )
-            brief_cursor = connection.execute(
+            connection.execute(
                 """INSERT INTO mt_content_briefs(
                        brief_id, graph_version_id, atomic_topic_id,
                        brief_contract, brief_sha256, status,

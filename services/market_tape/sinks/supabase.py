@@ -101,6 +101,12 @@ ENTITY_TABLES: Dict[str, Tuple[str, str, bool]] = {
     "trend": ("actp_trends", "trend_id", True),
     "membership": ("actp_trend_memberships", "trend_id,video_id", True),
     "trend_observation": ("actp_trend_observations", "trend_observation_key", False),
+    "rapid_trend_trigger": (
+        "actp_market_rapid_trend_triggers", "trigger_id", False,
+    ),
+    "rapid_trend_trigger_event": (
+        "actp_market_rapid_trend_trigger_events", "event_id", False,
+    ),
     "run": ("actp_market_collection_runs", "run_id", True),
     "receipt": ("actp_market_source_receipts", "receipt_key", False),
     "source_health": ("actp_market_source_health", "source_id", True),
@@ -145,6 +151,8 @@ ENTITY_SYNC_ORDER = (
     "genome",
     "membership",
     "trend_observation",
+    "rapid_trend_trigger",
+    "rapid_trend_trigger_event",
     "prediction",
     "receipt",
     "source_health",
@@ -236,6 +244,14 @@ def _required_parent_entities(
         "genome": (("video", "video_id"),),
         "membership": (("trend", "trend_id"), ("video", "video_id")),
         "trend_observation": (("trend", "trend_id"),),
+        "rapid_trend_trigger": (
+            ("trend", "trend_id"),
+            ("trend_observation", "baseline_trend_observation_key"),
+            ("trend_observation", "trigger_trend_observation_key"),
+        ),
+        "rapid_trend_trigger_event": (
+            ("rapid_trend_trigger", "trigger_id"),
+        ),
         "receipt": (("run", "run_id"),),
     }
     for parent_type, field in rules.get(entity_type, ()):

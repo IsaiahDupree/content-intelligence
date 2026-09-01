@@ -8,11 +8,10 @@ import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .config import MarketTapeConfig
 from .models import (
-    MarketContent,
     ProviderBatch,
     QueryAttempt,
     SourceReceipt,
@@ -28,6 +27,7 @@ from .sources.local_research import LocalResearchSource
 from .sinks import SupabaseSink
 from .store import CounterRegressionError, MarketTapeStore
 from .predictor import load_active_model
+from .rapid_trend import RapidTrendTriggerService
 
 
 AUTONOMOUS_QUERY_NOISE = {
@@ -46,6 +46,7 @@ class MarketTapeCollector:
     ):
         self.config = config or MarketTapeConfig.from_environment()
         self.store = store or MarketTapeStore(self.config)
+        self.rapid_trends = RapidTrendTriggerService(self.config, self.store)
         self.source_builder = source_builder
         self._last_discovery_topics: Dict[str, Any] = {
             "mode": "configured",
@@ -64,6 +65,7 @@ class MarketTapeCollector:
         error_detail = ""
         prediction_evaluation: Dict[str, Any] = {"state": "not_started"}
         validation_forecast: Dict[str, Any] = {"state": "not_started"}
+        rapid_trend_evaluation: Dict[str, Any] = {"state": "not_started"}
         deferred_terminal_noop: Optional[Dict[str, Any]] = None
         try:
             prediction_evaluation = self.store.evaluate_predictions()
@@ -138,6 +140,8 @@ class MarketTapeCollector:
                 phase_sequence.append("scheduled_rechecks")
             trend_observations = self.store.aggregate_trends(run_id=run_id)
             phase_sequence.append("aggregate_trends")
+            rapid_trend_evaluation = self._evaluate_rapid_trends(run_id=run_id)
+            phase_sequence.append("evaluate_rapid_trends")
             baseline_predictions = self.store.create_predictions(run_id)
             phase_sequence.append("transparent_baselines")
             if (
@@ -170,6 +174,11 @@ class MarketTapeCollector:
             predictions = 0
             baseline_predictions = 0
             active_predictions = 0
+            rapid_trend_evaluation = {
+                "state": "failed",
+                "error": "collection_cycle_failed_before_or_during_evaluation",
+                "provider_calls_made": 0,
+            }
         finally:
             self.store.finish_run(run_id, state=state, error_detail=error_detail)
         outbox_records = self.store.enqueue_run_for_sync(run_id)
@@ -190,6 +199,7 @@ class MarketTapeCollector:
             "active_predictions_added": active_predictions,
             "prediction_evaluation": prediction_evaluation,
             "validation_forecast": validation_forecast,
+            "rapid_trend_evaluation": rapid_trend_evaluation,
             "phase_sequence": phase_sequence,
             "receipts": receipts,
             "outbox_records": outbox_records,
@@ -231,6 +241,7 @@ class MarketTapeCollector:
         state = "completed"
         error_detail = ""
         trend_observations = 0
+        rapid_trend_evaluation: Dict[str, Any] = {"state": "not_started"}
         try:
             source = next(
                 (
@@ -260,6 +271,9 @@ class MarketTapeCollector:
                     )
                 else:
                     trend_observations = self.store.aggregate_trends(run_id=run_id)
+                    rapid_trend_evaluation = self._evaluate_rapid_trends(
+                        run_id=run_id
+                    )
         except Exception as error:
             state = "failed"
             error_detail = f"{type(error).__name__}: {sanitize(str(error))[:300]}"
@@ -274,6 +288,7 @@ class MarketTapeCollector:
             "state": state,
             "error_detail": error_detail,
             "trend_observations_added": trend_observations,
+            "rapid_trend_evaluation": rapid_trend_evaluation,
             "predictions_added": 0,
             "phase_sequence": ["topic_performance_discovery"],
             "receipts": receipts,
@@ -376,6 +391,7 @@ class MarketTapeCollector:
                 self._persist_batch(batch, run_id)
                 receipts.append(batch.receipt.to_dict())
             trend_observations = self.store.aggregate_trends(run_id=run_id)
+            rapid_trend_evaluation = self._evaluate_rapid_trends(run_id=run_id)
             predictions = self.store.create_predictions(run_id)
         except Exception as error:
             state = "failed"
@@ -399,6 +415,7 @@ class MarketTapeCollector:
             "error_detail": error_detail,
             "trend_observations_added": trend_observations,
             "predictions_added": predictions,
+            "rapid_trend_evaluation": rapid_trend_evaluation,
             "receipts": receipts,
             "outbox_records": outbox_records,
             "central_sync": sync_result,
@@ -425,6 +442,7 @@ class MarketTapeCollector:
         }
         state = "completed"
         error_detail = ""
+        rapid_trend_evaluation: Dict[str, Any] = {"state": "not_started"}
         local_config = replace(self.config, local_research_trigger_enabled=False)
         sources = [
             LocalResearchSource(
@@ -500,6 +518,10 @@ class MarketTapeCollector:
                 trend_observations = self.store.aggregate_trends(
                     trend_ids=affected_trend_ids,
                 )
+                rapid_trend_evaluation = self._evaluate_rapid_trends(
+                    run_id=run_id,
+                    trend_ids=affected_trend_ids,
+                )
             if youtube_failures:
                 state = "degraded"
                 error_detail = youtube_receipt.error_detail
@@ -528,6 +550,7 @@ class MarketTapeCollector:
             "attempts_inserted": imported,
             "context_trend_backfill": context_trend_backfill,
             "trend_observations_added": trend_observations,
+            "rapid_trend_evaluation": rapid_trend_evaluation,
             "missing_outbox_records": missing_outbox_records,
             "receipts": receipts,
             "outbox_records": outbox_records,
@@ -548,8 +571,10 @@ class MarketTapeCollector:
             "state": "not_started",
             "predictions_added": 0,
         }
+        rapid_trend_evaluation: Dict[str, Any] = {"state": "not_started"}
         try:
             trend_observations = self.store.aggregate_trends()
+            rapid_trend_evaluation = self._evaluate_rapid_trends(run_id=run_id)
             baseline_forecast = self.store.forecast_baseline_trends(
                 limit=min(100000, max(1, int(forecast_limit))),
                 run_id=run_id,
@@ -573,12 +598,41 @@ class MarketTapeCollector:
             "provider_calls_made": 0,
             "trend_observations_added": trend_observations,
             "baseline_forecast": baseline_forecast,
+            "rapid_trend_evaluation": rapid_trend_evaluation,
             "outbox_records": outbox_records,
             "central_sync": sync_result,
             "status": self.store.status(),
         }
         self._write_heartbeat(result)
         return result
+
+    def _evaluate_rapid_trends(
+        self,
+        *,
+        run_id: str,
+        trend_ids: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Keep trend detection isolated from the collection transaction.
+
+        A trigger-side defect must be visible, but it must not discard already
+        accepted observations or turn a completed provider collection into a
+        failed run. This path performs no provider, AI, render, or publish call.
+        """
+
+        try:
+            return self.rapid_trends.evaluate(
+                source_run_id=run_id,
+                trend_ids=trend_ids,
+            )
+        except Exception as error:  # fail closed without losing the tape
+            return {
+                "status": "error",
+                "contract": "market_tape_rapid_trend_evaluation_v1",
+                "state": "failed",
+                "provider_calls_made": 0,
+                "error_code": type(error).__name__,
+                "error_detail": sanitize(str(error))[:300],
+            }
 
     def _youtube_manifest_query_attempts(self, run_id: str) -> List[QueryAttempt]:
         attempts: List[QueryAttempt] = []

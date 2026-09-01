@@ -282,6 +282,54 @@ class MarketTapeConfig:
     upwork_prediction_min_snapshots: int = field(default_factory=lambda: _int(
         "MARKET_TAPE_UPWORK_PREDICTION_MIN_SNAPSHOTS", 3
     ))
+    rapid_trend_trigger_enabled: bool = field(default_factory=lambda: _bool(
+        "MARKET_TAPE_RAPID_TREND_TRIGGER_ENABLED", True
+    ))
+    rapid_trend_max_observation_age_seconds: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MAX_OBSERVATION_AGE_SECONDS", 3600
+    ))
+    rapid_trend_max_crossing_window_seconds: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MAX_CROSSING_WINDOW_SECONDS", 7200
+    ))
+    rapid_trend_generation_ttl_seconds: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_GENERATION_TTL_SECONDS", 21600
+    ))
+    rapid_trend_min_videos: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MIN_VIDEOS", 3
+    ))
+    rapid_trend_min_measured_videos: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MIN_MEASURED_VIDEOS", 3
+    ))
+    rapid_trend_min_activity_coverage: float = field(default_factory=lambda: _float(
+        "MARKET_TAPE_RAPID_TREND_MIN_ACTIVITY_COVERAGE", 0.5
+    ))
+    rapid_trend_min_views_new_1h: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MIN_VIEWS_NEW_1H", 1000
+    ))
+    rapid_trend_max_saturation: float = field(default_factory=lambda: _float(
+        "MARKET_TAPE_RAPID_TREND_MAX_SATURATION", 0.75
+    ))
+    rapid_trend_max_per_cycle: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MAX_PER_CYCLE", 3
+    ))
+    rapid_trend_max_per_day: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_MAX_PER_DAY", 10
+    ))
+    rapid_trend_demand_verified_transcripts: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_DEMAND_VERIFIED_TRANSCRIPTS", 5
+    ))
+    rapid_trend_demand_distinct_creators: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_DEMAND_DISTINCT_CREATORS", 3
+    ))
+    rapid_trend_demand_observed_views: int = field(default_factory=lambda: _int(
+        "MARKET_TAPE_RAPID_TREND_DEMAND_OBSERVED_VIEWS", 100000
+    ))
+    rapid_trend_audience: str = field(default_factory=lambda: os.getenv(
+        "MARKET_TAPE_RAPID_TREND_AUDIENCE", "software founders"
+    ).strip() or "software founders")
+    rapid_trend_objective: str = field(default_factory=lambda: os.getenv(
+        "MARKET_TAPE_RAPID_TREND_OBJECTIVE", "qualified attention"
+    ).strip() or "qualified attention")
 
     @classmethod
     def from_environment(cls) -> "MarketTapeConfig":

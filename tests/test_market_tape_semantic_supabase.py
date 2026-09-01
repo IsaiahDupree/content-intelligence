@@ -11,7 +11,7 @@ from services.market_tape.config import MarketTapeConfig
 from services.market_tape.migration import (
     APPEND_ONLY_TABLES,
     MARKET_TAPE_TABLES,
-    MIGRATION_PATH,
+    MIGRATION_PATHS,
     REQUIRED_INDEXES,
     migration_sql,
     validate_migration,
@@ -172,6 +172,26 @@ EXPECTED_ADVISOR_INDEXES = {
         "actp_upwork_semantic_links",
         "signal_id,graph_version_id",
     ),
+    "actp_market_rapid_triggers_detected_idx": (
+        "actp_market_rapid_trend_triggers",
+        "detected_atdesc,trigger_id",
+    ),
+    "actp_market_rapid_triggers_trend_idx": (
+        "actp_market_rapid_trend_triggers",
+        "trend_id,detected_atdesc,trigger_id",
+    ),
+    "actp_market_rapid_triggers_expiry_idx": (
+        "actp_market_rapid_trend_triggers",
+        "expires_at,trigger_id",
+    ),
+    "actp_market_rapid_events_trigger_time_idx": (
+        "actp_market_rapid_trend_trigger_events",
+        "trigger_id,created_at,event_id",
+    ),
+    "actp_market_rapid_events_type_time_idx": (
+        "actp_market_rapid_trend_trigger_events",
+        "event_type,created_atdesc,trigger_id",
+    ),
 }
 
 
@@ -191,7 +211,7 @@ def test_semantic_migration_and_sink_registry_cover_the_same_control_plane():
 
 
 def test_upwork_remote_snapshot_schema_uses_explicit_usd_metric_fields():
-    source = MIGRATION_PATH.read_text(encoding="utf-8")
+    source = MIGRATION_PATHS[-2].read_text(encoding="utf-8")
 
     assert "public.actp_upwork_market_jobs" in source
     assert "create table if not exists public.actp_upwork_jobs" not in source
@@ -210,7 +230,7 @@ def test_semantic_advisor_indexes_are_checked_and_cover_expected_columns():
         index_name: table
         for index_name, (table, _columns) in EXPECTED_ADVISOR_INDEXES.items()
     }
-    assert len(REQUIRED_INDEXES) == 29
+    assert len(REQUIRED_INDEXES) == 34
     for index_name, (table, columns) in EXPECTED_ADVISOR_INDEXES.items():
         expected = (
             f"createindexifnotexists{index_name}"
