@@ -27,9 +27,24 @@ from .script_quality import (
 )
 
 
-REQUEST_CONTRACT = "reference_marketing_script_request_v1"
-PACKAGE_CONTRACT = "reference_marketing_script_package_v1"
-COMPILER_VERSION = "reference_marketing_script_compiler_v5"
+LEGACY_REQUEST_CONTRACT = "reference_marketing_script_request_v1"
+REQUEST_CONTRACT = "reference_marketing_script_request_v2"
+LEGACY_PACKAGE_CONTRACT = "reference_marketing_script_package_v1"
+PACKAGE_CONTRACT = "reference_marketing_script_package_v2"
+LEGACY_COMPILER_VERSION = "reference_marketing_script_compiler_v5"
+COMPILER_VERSION = "reference_marketing_script_compiler_v6"
+SUPPORTED_REQUEST_CONTRACTS = (
+    LEGACY_REQUEST_CONTRACT,
+    REQUEST_CONTRACT,
+)
+PACKAGE_CONTRACT_BY_REQUEST = {
+    LEGACY_REQUEST_CONTRACT: LEGACY_PACKAGE_CONTRACT,
+    REQUEST_CONTRACT: PACKAGE_CONTRACT,
+}
+COMPILER_VERSION_BY_REQUEST = {
+    LEGACY_REQUEST_CONTRACT: LEGACY_COMPILER_VERSION,
+    REQUEST_CONTRACT: COMPILER_VERSION,
+}
 CONTENT_ROLE_POLICY_VERSION = "content-role-policy-v1.0.0"
 SPOKEN_WORDS_PER_SECOND = 2.35
 
@@ -127,15 +142,21 @@ def _finish_sentence(value: str) -> str:
 def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("script request must be an object")
-    supplied_contract = str(payload.get("contract") or REQUEST_CONTRACT).strip()
-    if supplied_contract != REQUEST_CONTRACT:
-        raise ValueError(f"contract must be {REQUEST_CONTRACT}")
+    supplied_contract = str(
+        payload.get("contract") or LEGACY_REQUEST_CONTRACT
+    ).strip()
+    if supplied_contract not in SUPPORTED_REQUEST_CONTRACTS:
+        allowed = " or ".join(SUPPORTED_REQUEST_CONTRACTS)
+        raise ValueError(f"contract must be {allowed}")
+    requires_explicit_intent = supplied_contract == REQUEST_CONTRACT
 
     objective = str(payload.get("objective") or "educate").strip().lower()
     if objective not in OBJECTIVES:
         raise ValueError("objective must be awareness, educate, engage, or convert")
     expected_content_role = OBJECTIVE_CONTENT_ROLE[objective]
     supplied_content_role = str(payload.get("content_role") or "").strip().upper()
+    if requires_explicit_intent and not supplied_content_role:
+        raise ValueError(f"{REQUEST_CONTRACT} requires content_role")
     if supplied_content_role and supplied_content_role not in CONTENT_ROLES:
         raise ValueError("content_role must be ENTERTAIN, EDUCATE, or SELL")
     if supplied_content_role and supplied_content_role != expected_content_role:
@@ -146,6 +167,10 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
     content_role = supplied_content_role or expected_content_role
     distance_bounds = TOPIC_DISTANCE_BY_ROLE[content_role]
     raw_distance = payload.get("topic_distance_from_offer")
+    if requires_explicit_intent and raw_distance is None:
+        raise ValueError(
+            f"{REQUEST_CONTRACT} requires topic_distance_from_offer"
+        )
     if raw_distance is None:
         topic_distance = int(distance_bounds["default"])
     else:
@@ -263,7 +288,7 @@ def _normalize_request(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("SELL content requires offer.offer_id or offer.name")
 
     return {
-        "contract": REQUEST_CONTRACT,
+        "contract": supplied_contract,
         "corpus_id": _text(payload.get("corpus_id"), "corpus_id", maximum=240),
         "title": _text(payload.get("title"), "title", maximum=240),
         "topic": _text(payload.get("topic"), "topic", maximum=500),
@@ -502,6 +527,9 @@ class MarketingScriptCompiler:
 
     def compile(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = _normalize_request(payload)
+        request_contract = request["contract"]
+        package_contract = PACKAGE_CONTRACT_BY_REQUEST[request_contract]
+        compiler_version = COMPILER_VERSION_BY_REQUEST[request_contract]
         proof_request = request["narrative"]["proof"]
         proof_first_person = bool(
             {
@@ -547,7 +575,7 @@ class MarketingScriptCompiler:
             corpus_id=request["corpus_id"], query=query, evidence_limit=8
         )
         script_id = stable_id(
-            "refscript_", request_sha, context["context_id"], COMPILER_VERSION
+            "refscript_", request_sha, context["context_id"], compiler_version
         )
         existing = self.corpus.get_script_package(script_id)
         if existing is not None:
@@ -648,11 +676,11 @@ class MarketingScriptCompiler:
         created_at = utc_now()
         package = {
             "status": "approved" if approved else "revise",
-            "contract": PACKAGE_CONTRACT,
+            "contract": package_contract,
             "script_id": script_id,
             "corpus_id": request["corpus_id"],
             "context_id": context["context_id"],
-            "request_contract": REQUEST_CONTRACT,
+            "request_contract": request_contract,
             "request_sha256": request_sha,
             "request": request,
             "marketing_logic": {
@@ -736,7 +764,7 @@ class MarketingScriptCompiler:
                 "source_proof_text_modified": proof_text not in transcript,
             },
             "lineage": {
-                "compiler": COMPILER_VERSION,
+                "compiler": compiler_version,
                 "content_role_policy_version": CONTENT_ROLE_POLICY_VERSION,
                 "content_role": request["content_role"],
                 "topic_distance_from_offer": request[
@@ -756,14 +784,14 @@ class MarketingScriptCompiler:
         if approved and self.script_experiments is not None:
             brief_id = stable_id("refbrief_", request_sha)
             workflow_id = stable_id(
-                "refworkflow_", script_id, audit["audit_id"], COMPILER_VERSION
+                "refworkflow_", script_id, audit["audit_id"], compiler_version
             )
             registration = self.script_experiments.register_experiment({
                 "brief_id": brief_id,
                 "script_id": script_id,
                 "script_text": transcript,
                 "workflow_id": workflow_id,
-                "generation_contract": COMPILER_VERSION,
+                "generation_contract": compiler_version,
                 "metadata": {
                     "registration_source": "reference_marketing_compiler",
                     "corpus_id": request["corpus_id"],

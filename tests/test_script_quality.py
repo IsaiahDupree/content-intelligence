@@ -5,6 +5,7 @@ from services.content_quality.script_intelligence import (
     is_retryable_quality_failure,
 )
 from services.content_quality.script_quality import (
+    OWNER_QUALITY_ALGORITHM,
     OWNER_QUALITY_CONTRACT,
     arrange_role_components,
     audit_owner_calibrated_quality,
@@ -50,6 +51,7 @@ def test_owner_judge_allows_first_person_and_reports_five_judgments() -> None:
     report = audit_owner_calibrated_quality(text)
 
     assert report["contract"] == OWNER_QUALITY_CONTRACT
+    assert report["algorithm_version"] == OWNER_QUALITY_ALGORITHM
     assert report["decision"] == "PASS"
     assert report["judgments"]["spoken_naturalness"][
         "perspective_authorization_evaluated"
@@ -89,6 +91,91 @@ def test_tension_payoff_requires_both_sides_in_order() -> None:
     ):
         assert report["judgments"]["tension_payoff"]["passed"] is False
         assert "OWNER_TENSION_PAYOFF" in report["failure_codes"]
+
+
+def test_natural_topic_anchored_tension_and_audience_question_pass() -> None:
+    text = (
+        "Isaiah untangling automation found a supposedly simple JSON document "
+        "felt like decoding a jumble. The ideas piled up, and the day became "
+        "proof that work happened, not proof that anything moved. I stopped "
+        "treating the entire workflow as one crisis and built one small "
+        "transformation at a time. The result was a tool turning unstructured "
+        "text into structured automation input, then focused tools from that "
+        "pattern. That is the trap: activity and progress are different "
+        "measurements. The better test is simple: can you name what changed, "
+        "instead of naming busy things nobody will miss? What changed because "
+        "of your work today?"
+    )
+
+    report = audit_owner_calibrated_quality(text)
+    judgment = report["judgments"]["tension_payoff"]
+
+    assert report["algorithm_version"] == "owner_calibrated_script_quality_v2"
+    assert report["decision"] == "PASS"
+    assert judgment["passed"] is True
+    assert judgment["ordered_semantic_turn"] is True
+    assert judgment["ordered_question_turn"] is True
+    assert judgment["semantic_turn_supported"] is True
+    assert judgment["final_literal_audience_question"] == (
+        "What changed because of your work today?"
+    )
+    assert {"jumble", "piled", "crisis", "trap"} <= set(
+        judgment["tension_terms"]
+    )
+
+
+def test_inflected_tension_can_resolve_with_final_audience_question() -> None:
+    text = (
+        "Automation requests kept piling into one crowded document while the "
+        "review grew louder. I separated customer fields from delivery rules "
+        "and traced each transformation through the application. Which part "
+        "of your automation would you untangle first?"
+    )
+
+    judgment = audit_owner_calibrated_quality(text)["judgments"][
+        "tension_payoff"
+    ]
+
+    assert judgment["passed"] is True
+    assert {"piling", "louder"} <= set(judgment["tension_terms"])
+    assert judgment["ordered_lexical_turn"] is False
+    assert judgment["ordered_question_turn"] is True
+    assert judgment["semantic_turn_supported"] is True
+
+
+def test_final_question_and_result_do_not_invent_missing_tension() -> None:
+    text = (
+        "Isaiah mapped an automation document into customer fields and delivery "
+        "rules. I built each transformation and checked the structured result "
+        "inside the application. Which part of your automation would you test "
+        "first?"
+    )
+
+    report = audit_owner_calibrated_quality(text)
+    judgment = report["judgments"]["tension_payoff"]
+
+    assert judgment["passed"] is False
+    assert judgment["tension_terms"] == []
+    assert judgment["ordered_question_turn"] is False
+    assert judgment["semantic_turn_supported"] is False
+    assert "OWNER_TENSION_PAYOFF" in report["failure_codes"]
+
+
+def test_tension_inside_final_question_is_not_an_ordered_payoff() -> None:
+    text = (
+        "Isaiah mapped an automation document into customer fields and delivery "
+        "rules. I built each transformation and checked the structured result "
+        "inside the application. Which part of your automation still feels "
+        "stuck?"
+    )
+
+    judgment = audit_owner_calibrated_quality(text)["judgments"][
+        "tension_payoff"
+    ]
+
+    assert judgment["tension_terms"] == ["stuck"]
+    assert judgment["ordered_question_turn"] is False
+    assert judgment["passed"] is False
 
 
 def test_topic_specific_science_turn_passes_without_keyword_filler() -> None:

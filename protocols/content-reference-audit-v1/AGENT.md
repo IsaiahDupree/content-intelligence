@@ -9,6 +9,8 @@
 - API definition: `openapi.yaml`
 - Corpus schema: `content-reference-corpus.schema.json`
 - Audit schema: `content-creation-audit.schema.json`
+- Current script request schema: `reference-marketing-script-request-v2.schema.json`
+- Current script package schema: `reference-marketing-script-package-v2.schema.json`
 - Canonical first corpus: `instagram-personalbrandlaunch-reference-v1`
 
 ## Required Call Order
@@ -22,10 +24,37 @@
 
 Do not assume a creator's popularity proves a tactic. The corpus provides observed examples, not causal proof. Separate observed clip choices from claimed performance reasons.
 
+## Audit Timeline Transport
+
+`POST /api/reference-corpus/audit` accepts an optional `timeline`. New callers
+that already have a semantic beat map should send it so owner-calibrated quality
+v2 can judge the ordered problem/stakes-to-payoff turn instead of relying only
+on lexical cues. A supplied timeline must be a non-empty array; every row must
+contain non-empty `text` and identify its semantic role with `block` or `beat`.
+The ordered row text must project exactly to `script` for semantic-role credit.
+
+Legacy script-only callers may omit `timeline` and remain valid. Do not send an
+empty array as an omission surrogate: an explicitly supplied empty or malformed
+timeline is an invalid request. A projection mismatch is retained as an owner
+quality finding rather than silently granting semantic-role credit.
+
 ## Marketing Script Intent Contract
 
-Every new marketing script request must state both `content_role` and
+Every new marketing script request must use
+`reference_marketing_script_request_v2` and state both `content_role` and
 `topic_distance_from_offer`. These are separate controls:
+
+Both fields are required by the v2 request schema and by the runtime. Agents
+must supply them explicitly and must not depend on compatibility defaults in a
+caller or compiler.
+
+The immutable v1 request and package contracts remain accepted only as a
+backwards-compatible migration path. A v1 request may omit either field; the
+compiler infers `content_role` from `objective` and uses that role's documented
+default distance, then returns a v1 package. A v2 request never receives those
+defaults: omission is a typed error, and a valid v2 request returns a v2
+package. Omitting `contract` selects legacy v1 behavior so pre-contract callers
+do not change meaning. Do not use v1 or an omitted contract for new work.
 
 | Role | Job | Viewer thought | Allowed distance |
 |---|---|---|---:|

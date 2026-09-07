@@ -332,6 +332,427 @@ class ScriptIntelligenceService:
             "forecast_probabilities_admitted": False,
         }
 
+    @staticmethod
+    def _exact_timeline(payload: dict[str, Any], script_text: str) -> list[dict[str, Any]]:
+        raw_timeline = payload.get("timeline") or []
+        if not isinstance(raw_timeline, list) or not raw_timeline:
+            raise ValueError("timeline is required")
+        timeline: list[dict[str, Any]] = []
+        for raw in raw_timeline:
+            if not isinstance(raw, dict):
+                raise ValueError("timeline entries must be objects")
+            start = raw.get("start", raw.get("start_seconds"))
+            end = raw.get("end", raw.get("end_seconds"))
+            text = " ".join(str(raw.get("text") or "").split())
+            beat = str(raw.get("beat") or "").strip()
+            if start is None or end is None or not text or not beat:
+                raise ValueError("timeline entries require start, end, beat, and text")
+            timeline.append({
+                "start": float(start),
+                "end": float(end),
+                "beat": beat,
+                "text": text,
+                "purpose": str(raw.get("purpose") or "").strip() or None,
+            })
+        projected = " ".join(item["text"] for item in timeline)
+        if projected != " ".join(script_text.split()):
+            raise ValueError("timeline text must be the exact ordered script projection")
+        if timeline[0]["start"] != 0 or any(
+            item["end"] <= item["start"]
+            or (index and item["start"] < timeline[index - 1]["end"] - 0.05)
+            for index, item in enumerate(timeline)
+        ):
+            raise ValueError("timeline must be ordered, non-overlapping, and start at zero")
+
+        # A semantic beat may be longer than the hook window even when the spoken
+        # opening itself contains an immediate stop. Split only its timing/text;
+        # never rewrite the immutable approved script.
+        first = timeline[0]
+        if first["end"] > 3.5:
+            tokens = first["text"].split()
+            ratio = 3.0 / max(first["end"] - first["start"], 0.1)
+            cut = max(1, min(len(tokens) - 1, round(len(tokens) * ratio)))
+            if len(tokens) > 1:
+                timeline = [
+                    {**first, "end": 3.0, "text": " ".join(tokens[:cut])},
+                    {
+                        **first,
+                        "start": 3.0,
+                        "text": " ".join(tokens[cut:]),
+                        "purpose": first.get("purpose") or "opening continuation",
+                    },
+                    *timeline[1:],
+                ]
+        return timeline
+
+    @staticmethod
+    def _exact_attention_audit(
+        *, timeline: list[dict[str, Any]], evidence_route: str
+    ) -> tuple[str, float, dict[str, Any]]:
+        durations = [item["end"] - item["start"] for item in timeline]
+        beats = [str(item["beat"]) for item in timeline]
+        total = timeline[-1]["end"]
+        proof_start = min(
+            (item["start"] for item in timeline if item["beat"] == "proof"),
+            default=float("inf"),
+        )
+        action_start = min(
+            (
+                item["start"]
+                for item in timeline
+                if item["beat"] in {"method", "proof", "demonstration"}
+            ),
+            default=float("inf"),
+        )
+        cta_index = next(
+            (index for index, item in enumerate(timeline) if item["beat"] == "cta"),
+            -1,
+        )
+        route_check = (
+            proof_start <= 20
+            if evidence_route == "owned_performance_replication"
+            else action_start <= 30
+        )
+        route_check_name = (
+            "proof_by_20_seconds"
+            if evidence_route == "owned_performance_replication"
+            else "concrete_action_by_30_seconds"
+        )
+        checks = {
+            "exact_timeline_ordered": True,
+            "hook_by_3_seconds": timeline[0]["start"] == 0 and timeline[0]["end"] <= 3.5,
+            route_check_name: route_check,
+            "no_dead_beat_over_10_seconds": max(durations) <= 10,
+            "at_least_five_semantic_beats": len(timeline) >= 5,
+            "payoff_present": "payoff" in beats,
+            "cta_after_payoff": (
+                cta_index > beats.index("payoff") if "payoff" in beats and cta_index >= 0 else False
+            ),
+            "cta_in_final_third": (
+                cta_index >= 0 and timeline[cta_index]["start"] >= total * 0.66
+            ),
+        }
+        score = 100.0 * sum(checks.values()) / len(checks)
+        decision = "PASS" if all(checks.values()) else "REVISE_ATTENTION"
+        return decision, score, {
+            "contract": "exact_approved_script_attention_v1",
+            "evidence_route": evidence_route,
+            "checks": checks,
+            "failures": [name for name, passed in checks.items() if not passed],
+            "threshold": 100,
+        }
+
+    def certify_exact_approved_script(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Certify immutable upstream script bytes against exact source videos.
+
+        This path never writes or revises copy. It re-audits already acquired
+        local artifacts for the supplied topic, creates a hash-bound cohort, and
+        persists Foundry-compatible relatability and attention receipts.
+        """
+
+        from .transcript_bank import (
+            Candidate,
+            TranscriptBank,
+            canonical_sha256,
+            file_sha256,
+            topic_terms,
+        )
+
+        script_id = str(payload.get("script_id") or "").strip()
+        script_text = " ".join(str(payload.get("text") or "").split())
+        topic = str(payload.get("topic") or "").strip()
+        audience = str(payload.get("audience") or "").strip()
+        objective = str(payload.get("objective") or "").strip()
+        source_topic = str(payload.get("source_topic") or topic).strip()
+        evidence_route = str(payload.get("evidence_route") or "human_recognition").strip()
+        source_external_ids = list(dict.fromkeys(
+            str(value).strip()
+            for value in payload.get("source_external_ids") or []
+            if str(value).strip()
+        ))
+        source_receipt_ids = list(dict.fromkeys(
+            str(value).strip()
+            for value in payload.get("source_receipt_ids") or []
+            if str(value).strip()
+        ))
+        if not all((script_id, script_text, topic, audience, objective, source_topic)):
+            raise ValueError("script_id, text, topic, audience, objective, and source_topic are required")
+        if evidence_route not in {"human_recognition", "owned_performance_replication"}:
+            raise ValueError("evidence_route is unsupported")
+        if source_external_ids and source_receipt_ids:
+            raise ValueError(
+                "provide source_external_ids or source_receipt_ids, not both"
+            )
+        if max(len(source_external_ids), len(source_receipt_ids)) < 5:
+            raise ValueError(
+                "at least five exact source_external_ids or source_receipt_ids are required"
+            )
+
+        timeline = self._exact_timeline(payload, script_text)
+        bank = TranscriptBank(self.tape.path, self.transcript_storage_root)
+        receipt_bound_artifacts: dict[str, dict[str, Any]] = {}
+        receipt_bound_payloads: dict[str, dict[str, Any]] = {}
+        if source_receipt_ids:
+            receipt_rows = self.store.receipts(source_receipt_ids)
+            receipt_by_id = {
+                str(item["receipt_id"]): item for item in receipt_rows
+            }
+            missing_receipts = sorted(set(source_receipt_ids) - set(receipt_by_id))
+            if missing_receipts:
+                return {
+                    "status": "not_ready",
+                    "code": "EXACT_SOURCE_RECEIPT_NOT_FOUND",
+                    "missing_source_receipt_ids": missing_receipts,
+                }
+            receipts = [receipt_by_id[receipt_id] for receipt_id in source_receipt_ids]
+            candidates = []
+            source_terms = tuple(topic_terms(source_topic))
+            for receipt_id in source_receipt_ids:
+                receipt = receipt_by_id[receipt_id]
+                receipt_payload = dict(receipt.get("payload") or {})
+                transcript_id = str(receipt_payload.get("transcript_id") or "")
+                with closing(bank.connect()) as connection:
+                    row = connection.execute(
+                        """SELECT artifact.*, snapshot.payload_json,
+                                  snapshot.transcript_sha256 AS snapshot_sha256
+                             FROM mt_transcript_artifacts artifact
+                             JOIN mt_transcript_payload_snapshots snapshot
+                               ON snapshot.transcript_id=artifact.transcript_id
+                            WHERE artifact.transcript_id=?""",
+                        (transcript_id,),
+                    ).fetchone()
+                if row is None:
+                    return {
+                        "status": "not_ready",
+                        "code": "EXACT_SOURCE_RECEIPT_ARTIFACT_NOT_FOUND",
+                        "source_receipt_id": receipt_id,
+                        "transcript_id": transcript_id,
+                    }
+                artifact = bank._artifact_row(row)
+                try:
+                    transcript_payload = json.loads(str(row["payload_json"] or ""))
+                except json.JSONDecodeError:
+                    transcript_payload = None
+                if (
+                    str(receipt.get("source_id") or "") != artifact["external_id"]
+                    or str(receipt.get("source_url") or "") != artifact["source_url"]
+                    or str(receipt_payload.get("transcript_sha256") or "")
+                    != artifact["transcript_sha256"]
+                    or not isinstance(transcript_payload, dict)
+                    or str(row["snapshot_sha256"] or "")
+                    != artifact["transcript_sha256"]
+                    or canonical_sha256(transcript_payload)
+                    != artifact["transcript_sha256"]
+                ):
+                    return {
+                        "status": "not_ready",
+                        "code": "EXACT_SOURCE_RECEIPT_ARTIFACT_BINDING_FAILED",
+                        "source_receipt_id": receipt_id,
+                    }
+                metrics = dict(artifact.get("source_metrics") or {})
+                pattern = dict(receipt_payload.get("pattern") or {})
+                candidate = Candidate(
+                    video_id=str(artifact["video_id"]),
+                    platform=str(artifact["platform"]),
+                    external_id=str(artifact["external_id"]),
+                    creator_id=str(receipt_payload.get("creator_id") or ""),
+                    title=str(receipt_payload.get("title") or ""),
+                    caption="",
+                    description=str(receipt_payload.get("topic") or ""),
+                    source_url=str(artifact["source_url"]),
+                    duration_seconds=float(
+                        artifact.get("duration_seconds")
+                        or pattern.get("duration_seconds") or 0
+                    ),
+                    observation_key=str(artifact["observation_key"]),
+                    observed_at=str(metrics.get("observed_at") or ""),
+                    views=int(metrics.get("views") or 0),
+                    likes=int(metrics.get("likes") or 0),
+                    comments=int(metrics.get("comments") or 0),
+                    shares=int(metrics.get("shares") or 0),
+                    saves=int(metrics.get("saves") or 0),
+                    relative_strength=float(metrics.get("relative_strength") or 0),
+                    topic_terms=source_terms,
+                    topic_matches=source_terms,
+                )
+                candidates.append(candidate)
+                receipt_bound_artifacts[candidate.video_id] = artifact
+                receipt_bound_payloads[candidate.video_id] = transcript_payload
+        else:
+            candidates = bank.select_candidates(
+                topic=source_topic,
+                limit=len(source_external_ids),
+                external_ids=source_external_ids,
+                platforms=[str(payload.get("source_platform") or "youtube")],
+                minimum_topic_matches=1,
+            )
+            found_ids = {candidate.external_id for candidate in candidates}
+            missing = sorted(set(source_external_ids) - found_ids)
+            if missing:
+                return {
+                    "status": "not_ready",
+                    "code": "EXACT_SOURCE_NOT_ELIGIBLE",
+                    "missing_source_external_ids": missing,
+                }
+            receipts = []
+
+        artifacts = []
+        artifact_failures = []
+        for candidate in candidates:
+            exact_artifact = receipt_bound_artifacts.get(candidate.video_id)
+            if exact_artifact is None and bank.latest_artifact(
+                candidate.video_id,
+                str(payload.get("whisper_model") or "base"),
+            ) is None:
+                artifact_failures.append({
+                    "source_external_id": candidate.external_id,
+                    "reason": "local_whisper_artifact_missing",
+                })
+                continue
+            if exact_artifact is not None:
+                artifact = dict(exact_artifact)
+                transcript_payload = receipt_bound_payloads[candidate.video_id]
+                artifact["audit"] = bank._transcript_audit(
+                    candidate=candidate,
+                    transcript_text=str(transcript_payload.get("text") or ""),
+                    segments=list(transcript_payload.get("segments") or []),
+                    audio_hash=str(artifact["audio_sha256"]),
+                    transcript_hash=str(artifact["transcript_sha256"]),
+                )
+            else:
+                artifact = bank.transcribe(
+                    candidate,
+                    model=None,
+                    model_name=str(payload.get("whisper_model") or "base"),
+                    force=False,
+                )
+            if (artifact.get("audit") or {}).get("decision") != "PASS":
+                artifact_failures.append({
+                    "source_external_id": candidate.external_id,
+                    "reason": "transcript_artifact_audit_failed",
+                    "checks": dict((artifact.get("audit") or {}).get("checks") or {}),
+                })
+            else:
+                artifacts.append(artifact)
+        if artifact_failures:
+            return {
+                "status": "not_ready",
+                "code": "EXACT_SOURCE_ARTIFACTS_NOT_CERTIFIED",
+                "failures": artifact_failures,
+            }
+
+        if not source_receipt_ids:
+            discovery = self.viral.discover_for_videos(
+                source_topic,
+                [candidate.video_id for candidate in candidates],
+                limit=len(candidates),
+            )
+            receipts = list(discovery.get("receipts") or [])
+            if len(receipts) != len(source_external_ids):
+                return {
+                    "status": "not_ready",
+                    "code": "EXACT_SOURCE_RECEIPTS_INCOMPLETE",
+                    "receipt_count": len(receipts),
+                    "source_count": len(source_external_ids),
+                    "failures": list(discovery.get("failures") or []),
+                }
+
+        cohort = bank.build_cohort(topic=source_topic, artifacts=artifacts)
+        if cohort.get("decision") != "PASS":
+            return {
+                "status": "not_ready",
+                "code": "EXACT_SOURCE_COHORT_NOT_CERTIFIED",
+                "cohort": cohort,
+            }
+        manifest_path = Path(str(cohort["manifest_path"]))
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_canonical_sha256 = canonical_sha256(manifest_payload)
+
+        owned_evidence = payload.get("owned_performance_evidence") or None
+        script = {
+            "script_id": script_id,
+            "topic": topic,
+            "audience": audience,
+            "objective": objective,
+            "status": "approved",
+            "source_receipt_ids": [str(item["receipt_id"]) for item in receipts],
+            "evidence_summary": {
+                "contract": "exact_approved_script_evidence_v1",
+                "cohort_id": cohort["cohort_id"],
+                "member_count": cohort["aggregate_metrics"]["member_count"],
+                "creator_count": cohort["aggregate_metrics"]["creator_count"],
+                "total_views": cohort["aggregate_metrics"]["total_views"],
+                "evidence_route": evidence_route,
+            },
+            "timeline": timeline,
+            "text": script_text,
+            "evidence_route": evidence_route,
+            "owned_performance_evidence": owned_evidence,
+            "created_at": utc_now(),
+        }
+        stored_script = self.store.put_script(script)
+        cohort_audit = bank.audit_script_against_cohort(
+            script_id=script_id,
+            script_text=script_text,
+            cohort_manifest_path=manifest_path,
+            expected_cohort_id=str(cohort["cohort_id"]),
+            expected_cohort_manifest_sha256=manifest_canonical_sha256,
+            evidence_route=evidence_route,
+            owned_performance_evidence=owned_evidence,
+        )
+        cohort_pass = cohort_audit.get("decision") == "PASS_PREDICTED_RELATABILITY"
+        evidence_path = Path(str(cohort_audit["receipt_path"]))
+        findings = {
+            **dict(cohort_audit.get("findings") or {}),
+            "cohort_manifest_path": str(manifest_path),
+            "cohort_manifest_sha256": file_sha256(manifest_path),
+            "evidence_receipt_path": str(evidence_path),
+            "evidence_receipt_sha256": file_sha256(evidence_path),
+            "input_binding": {
+                "contract": "stored_script_audit_binding_v1",
+                "stored_script_bound": True,
+                "script_id": script_id,
+                "script_sha256": self.store.script_audit_sha256(stored_script),
+            },
+        }
+        relatability = self.store.put_audit(
+            "relatability_script",
+            script_id,
+            "PASS" if cohort_pass else "REJECT_NOT_RELATABLE",
+            float(cohort_audit.get("score") or 0.0),
+            findings,
+        )
+        attention_decision, attention_score, attention_findings = self._exact_attention_audit(
+            timeline=timeline,
+            evidence_route=evidence_route,
+        )
+        attention_findings["input_binding"] = {
+            "contract": "stored_script_audit_binding_v1",
+            "stored_script_bound": True,
+            "script_id": script_id,
+            "script_sha256": self.store.script_audit_sha256(stored_script),
+        }
+        attention = self.store.put_audit(
+            "attention_script", script_id, attention_decision, attention_score,
+            attention_findings,
+        )
+        ready = cohort_pass and attention_decision == "PASS"
+        return {
+            "status": "certified" if ready else "not_ready",
+            "contract": "exact_approved_script_certification_v1",
+            "script": stored_script,
+            "cohort": {
+                "cohort_id": cohort["cohort_id"],
+                "manifest_path": str(manifest_path),
+                "member_count": cohort["aggregate_metrics"]["member_count"],
+                "creator_count": cohort["aggregate_metrics"]["creator_count"],
+                "total_views": cohort["aggregate_metrics"]["total_views"],
+            },
+            "relatability_audit": relatability,
+            "attention_audit": attention,
+            "ready_for_foundry_import": ready,
+        }
+
     def _trend_groups(self, topic: str, limit: int = 20) -> list[dict[str, Any]]:
         with closing(self.tape.connect()) as connection:
             rows = connection.execute(

@@ -1,0 +1,167 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:reference-marketing-script-package:v2",
+  "title": "Reference Marketing Script Package v2",
+  "type": "object",
+  "required": [
+    "status",
+    "contract",
+    "script_id",
+    "corpus_id",
+    "context_id",
+    "request_contract",
+    "request_sha256",
+    "request",
+    "marketing_logic",
+    "script",
+    "quality",
+    "corpus_audit",
+    "reference_context",
+    "rights",
+    "lineage",
+    "created_at",
+    "result_sha256"
+  ],
+  "properties": {
+    "status": {"enum": ["approved", "revise"]},
+    "contract": {"const": "reference_marketing_script_package_v2"},
+    "script_id": {"type": "string", "minLength": 1},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "context_id": {"type": "string", "minLength": 1},
+    "request_contract": {"const": "reference_marketing_script_request_v2"},
+    "request_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "request": {
+      "$ref": "./reference-marketing-script-request-v2.schema.json"
+    },
+    "marketing_logic": {
+      "type": "object",
+      "required": [
+        "objective",
+        "content_role",
+        "content_role_policy_version",
+        "topic_distance_from_offer",
+        "topic_distance_label",
+        "topic_distance_range",
+        "topic_ladder_id",
+        "topic_formula",
+        "funnel_job",
+        "primary_metrics",
+        "angle",
+        "audience",
+        "value_sequence"
+      ],
+      "properties": {
+        "content_role": {
+          "enum": ["ENTERTAIN", "EDUCATE", "SELL"]
+        },
+        "content_role_policy_version": {
+          "const": "content-role-policy-v1.0.0"
+        },
+        "topic_distance_from_offer": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "topic_distance_label": {
+          "enum": [
+            "universal_human_topic",
+            "business_or_technology_adjacent",
+            "ai_or_software_problem",
+            "specific_use_case",
+            "product_category",
+            "actual_product_or_offer"
+          ]
+        },
+        "topic_distance_range": {
+          "type": "object",
+          "required": ["minimum", "maximum", "default"],
+          "properties": {
+            "minimum": {"type": "integer", "minimum": 0, "maximum": 5},
+            "maximum": {"type": "integer", "minimum": 0, "maximum": 5},
+            "default": {"type": "integer", "minimum": 0, "maximum": 5}
+          },
+          "additionalProperties": false
+        },
+        "topic_ladder_id": {"type": "string", "maxLength": 160},
+        "topic_formula": {
+          "type": "array",
+          "minItems": 3,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "funnel_job": {"type": "string", "minLength": 1},
+        "primary_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "script": {
+      "type": "object",
+      "required": [
+        "title",
+        "target_seconds",
+        "word_count",
+        "estimated_seconds_at_reference_pace",
+        "required_words_per_second",
+        "transcript",
+        "beats"
+      ],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "target_seconds": {"type": "integer", "minimum": 15, "maximum": 1800},
+        "word_count": {"type": "integer", "minimum": 1},
+        "estimated_seconds_at_reference_pace": {"type": "number", "minimum": 0},
+        "required_words_per_second": {"type": "number", "minimum": 0},
+        "transcript": {"type": "string", "minLength": 1},
+        "beats": {
+          "type": "array",
+          "minItems": 8,
+          "items": {
+            "type": "object",
+            "required": [
+              "node_id",
+              "block",
+              "purpose",
+              "text",
+              "start_seconds",
+              "end_seconds",
+              "word_count"
+            ]
+          }
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["status", "score", "checks", "failed_checks"]
+    },
+    "corpus_audit": {
+      "$ref": "./content-creation-audit.schema.json"
+    },
+    "reference_context": {"type": "object"},
+    "rights": {
+      "type": "object",
+      "required": [
+        "state",
+        "source_clips_used",
+        "direct_use_allowed",
+        "identity_imitation_allowed",
+        "voice_imitation_allowed",
+        "exact_draft_copy_gate_passed"
+      ],
+      "properties": {
+        "state": {"const": "public_reference_analysis_only"},
+        "source_clips_used": {"const": false},
+        "direct_use_allowed": {"const": false},
+        "identity_imitation_allowed": {"const": false},
+        "voice_imitation_allowed": {"const": false},
+        "exact_draft_copy_gate_passed": {"type": "boolean"}
+      }
+    },
+    "lineage": {"type": "object"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "result_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  },
+  "additionalProperties": true
+}

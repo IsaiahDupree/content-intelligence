@@ -314,6 +314,10 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
 
     assert health.status_code == 200
     assert health.get_json()["item_count"] == 1
+    assert health.get_json()["audit_request_contract"] == (
+        "reference_corpus_audit_request_v2"
+    )
+    assert health.get_json()["semantic_timeline_supported"] is True
     assert denied.status_code == 401
     assert status.status_code == 200
     assert status.get_json()["counts"]["items"] == 1
@@ -330,7 +334,144 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
         "optional"
     ]
     assert "audit_against_reference_corpus" in names
+    assert "timeline" in names["audit_against_reference_corpus"]["optional"]
+    assert names["audit_against_reference_corpus"]["timeline_policy"] == {
+        "when_supplied": "non_empty_semantic_timeline",
+        "role_field": "block_or_beat",
+        "text_binding": "exact_ordered_script_projection_evaluated",
+    }
     assert names["extract_reference_items"]["bounds"]["limit"] == [1, 3]
+
+
+def test_reference_audit_transports_optional_timeline_to_owner_v2(tmp_path):
+    reference_root = tmp_path / "reference"
+    seed_service(reference_root)
+    app = create_content_quality_app({
+        "TESTING": False,
+        "NARRATIVE_COHERENCE_LLM": "off",
+        "RELATABILITY_JUDGE": "off",
+        "MARKET_TAPE_DB": tmp_path / "tape.sqlite3",
+        "CONTENT_QUALITY_DB": tmp_path / "quality.sqlite3",
+        "CONTENT_REFERENCE_ROOT": reference_root,
+        "CONTENT_QUALITY_CONTROL_TOKEN": CONTROL_TOKEN,
+        "REFERENCE_SOURCE_READER": False,
+    })
+    client = app.test_client()
+    headers = {"Authorization": f"Bearer {CONTROL_TOKEN}"}
+    timeline = [
+        {
+            "block": "hook",
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "text": "A delayed handoff can hide inside a busy team.",
+        },
+        {
+            "block": "problem",
+            "start_seconds": 3.0,
+            "end_seconds": 8.0,
+            "text": "Customer requests wait while staff copy details between inboxes.",
+        },
+        {
+            "block": "stakes",
+            "start_seconds": 8.0,
+            "end_seconds": 13.0,
+            "text": "That delay costs attention and creates repeated mistakes.",
+        },
+        {
+            "block": "reframe",
+            "start_seconds": 13.0,
+            "end_seconds": 19.0,
+            "text": "The useful fix is a visible handoff, not another dashboard.",
+        },
+        {
+            "block": "takeaway",
+            "start_seconds": 19.0,
+            "end_seconds": 25.0,
+            "text": "Record each request, route its owner, and check the receipt.",
+        },
+        {
+            "block": "call_to_action",
+            "start_seconds": 25.0,
+            "end_seconds": 30.0,
+            "text": "Choose one delayed handoff to measure today.",
+        },
+    ]
+    script = " ".join(item["text"] for item in timeline)
+    payload = {
+        "corpus_id": CORPUS_ID,
+        "title": "Measure the handoff",
+        "script": script,
+        "objective": "teach workflow diagnosis",
+        "target_viewer": "operations teams",
+        "target_seconds": 30,
+        "provenance": build_script_only_provenance(script),
+    }
+
+    with_timeline = client.post(
+        "/api/reference-corpus/audit",
+        headers=headers,
+        json={**payload, "timeline": timeline},
+    )
+    legacy_without_timeline = client.post(
+        "/api/reference-corpus/audit",
+        headers=headers,
+        json=payload,
+    )
+
+    assert with_timeline.status_code == 200
+    owner_v2 = with_timeline.get_json()["quality_judgments"]
+    role_judgment = owner_v2["judgments"]["tension_payoff"]
+    assert owner_v2["algorithm_version"] == "owner_calibrated_script_quality_v2"
+    assert role_judgment["timeline_binding"] == {
+        "contract": "exact_script_timeline_binding_v1",
+        "exact_ordered_projection": True,
+        "row_count": len(timeline),
+        "failure_codes": [],
+    }
+    assert role_judgment["ordered_role_turn"] is True
+    assert role_judgment["role_turn_supported"] is True
+
+    assert legacy_without_timeline.status_code == 200
+    legacy_owner_v2 = legacy_without_timeline.get_json()["quality_judgments"]
+    legacy_binding = legacy_owner_v2["judgments"]["tension_payoff"][
+        "timeline_binding"
+    ]
+    assert legacy_owner_v2["algorithm_version"] == (
+        "owner_calibrated_script_quality_v2"
+    )
+    assert legacy_binding["row_count"] == 0
+    assert legacy_binding["failure_codes"] == ["timeline_missing"]
+
+
+def test_reference_audit_rejects_supplied_empty_timeline(tmp_path):
+    reference_root = tmp_path / "reference"
+    seed_service(reference_root)
+    app = create_content_quality_app({
+        "TESTING": False,
+        "NARRATIVE_COHERENCE_LLM": "off",
+        "RELATABILITY_JUDGE": "off",
+        "MARKET_TAPE_DB": tmp_path / "tape.sqlite3",
+        "CONTENT_QUALITY_DB": tmp_path / "quality.sqlite3",
+        "CONTENT_REFERENCE_ROOT": reference_root,
+        "CONTENT_QUALITY_CONTROL_TOKEN": CONTROL_TOKEN,
+        "REFERENCE_SOURCE_READER": False,
+    })
+    script = "A delayed handoff creates a visible wait."
+    response = app.test_client().post(
+        "/api/reference-corpus/audit",
+        headers={"Authorization": f"Bearer {CONTROL_TOKEN}"},
+        json={
+            "corpus_id": CORPUS_ID,
+            "script": script,
+            "provenance": build_script_only_provenance(script),
+            "timeline": [],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == (
+        "timeline must be a non-empty semantic timeline when supplied"
+    )
 
 
 def test_snapshot_is_consistent_and_hash_verified(tmp_path):

@@ -80,6 +80,51 @@
               "type": "array",
               "uniqueItems": true,
               "items": {"type": "string", "minLength": 1}
+            },
+            "independent_verification_receipts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "contract",
+                  "receipt_id",
+                  "claim",
+                  "claim_sha256",
+                  "source_url",
+                  "source_kind",
+                  "source_sha256",
+                  "verified_at",
+                  "receipt_sha256"
+                ],
+                "properties": {
+                  "contract": {"const": "independent_claim_verification_v1"},
+                  "receipt_id": {"type": "string", "minLength": 1},
+                  "claim": {"type": "string", "minLength": 1},
+                  "claim_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "source_url": {"type": "string", "format": "uri"},
+                  "source_kind": {
+                    "enum": [
+                      "official_source",
+                      "owner_first_party_measurement",
+                      "peer_reviewed_source",
+                      "primary_source"
+                    ]
+                  },
+                  "source_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "verified_at": {"type": "string", "format": "date-time"},
+                  "receipt_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "additionalProperties": false
+              }
             }
           },
           "additionalProperties": false

@@ -17,11 +17,24 @@ from services.content_quality.transcript_bank import (
     classify_acquisition_failure,
     file_sha256,
     file_sha256_bounded,
+    transcript_topic_concept_matches,
     transcribe_cohort,
 )
 from services.market_tape.config import MarketTapeConfig
 from services.market_tape.models import MarketContent, MetricCounters
 from services.market_tape.store import SCHEMA_VERSION, MarketTapeStore
+
+
+def test_transcript_topic_concepts_match_focus_language_without_admitting_music_only():
+    topic = ("lofi", "music", "focus")
+    relevant = (
+        "Listening to music can help some people concentrate while studying, "
+        "although learning complex material may work better in silence."
+    )
+    unrelated = "This music video repeats the same melody and song chorus."
+
+    assert transcript_topic_concept_matches(topic, relevant) == ["focus", "music"]
+    assert transcript_topic_concept_matches(topic, unrelated) == ["music"]
 
 
 def _single_video_bank(
@@ -528,6 +541,113 @@ def test_real_files_are_hash_bound_and_bad_script_claim_fails_closed(tmp_path):
         "fresh_removable_volume_rehash_performed"
     ] is False
     assert accepted["findings"]["artifact_integrity_failures"] == []
+
+    recognizable_routine = bank.audit_script_against_cohort(
+        script_id="recognizable-everyday-routine",
+        script_text=(
+            "Ever sit down to make one creative post and spend the whole session "
+            "choosing? Creator pressure can make content harder. Take one real break "
+            "and make one small piece before adding another demand."
+        ),
+        cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
+    )
+    assert recognizable_routine["decision"] == "PASS_PREDICTED_RELATABILITY"
+    assert recognizable_routine["findings"][
+        "recognizable_human_opening_patterns"
+    ] == ["ever_sit_down"]
+
+    owned_receipt = {
+        "contract": "owned_winner_daily_control_loop_v1",
+        "source_winner": {"platform_post_id": "owned-winner-1"},
+        "analytics_refresh": {
+            "owned_retention": {
+                "provider_read_verified": True,
+                "analytics_receipt_id": "retention-owned-winner-1",
+                "metrics": {"views": 12_400, "average_view_percentage": 118.0},
+                "point_count": 100,
+                "final_position": {"audience_watch_ratio": 0.81},
+                "provider_writes_performed": False,
+            },
+            "provider_writes_performed": False,
+        },
+        "certification": {
+            "passed": True,
+            "certificate_manifest_matches": True,
+        },
+        "source_verification": {
+            "passed": True,
+            "provider_write_performed": False,
+            "episode_results": [{"episode_id": "episode-1", "passed": True}],
+        },
+    }
+    owned_receipt["receipt_sha256"] = canonical_sha256(owned_receipt)
+    owned_receipt_path = tmp_path / "owned-winner-receipt.json"
+    owned_receipt_path.write_text(
+        json.dumps(owned_receipt, sort_keys=True), encoding="utf-8"
+    )
+    owned_evidence = {
+        "receipt_path": str(owned_receipt_path),
+        "receipt_sha256": owned_receipt["receipt_sha256"],
+        "platform_post_id": "owned-winner-1",
+        "analytics_receipt_id": "retention-owned-winner-1",
+        "episode_id": "episode-1",
+    }
+    nonhuman_opening_script = (
+        "Creative publishing becomes an endless cycle. Audience demand expands while "
+        "creator energy shrinks. A real break can restore the next idea and make content "
+        "possible again."
+    )
+    human_route_rejection = bank.audit_script_against_cohort(
+        script_id="nonhuman-opening-human-route",
+        script_text=nonhuman_opening_script,
+        cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
+    )
+    assert human_route_rejection["decision"] == "REJECT_NOT_RELATABLE"
+    assert human_route_rejection["findings"]["checks"][
+        "opening_human_experience_backed"
+    ] is False
+
+    owned_route_acceptance = bank.audit_script_against_cohort(
+        script_id="nonhuman-opening-owned-route",
+        script_text=nonhuman_opening_script,
+        cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
+        evidence_route="owned_performance_replication",
+        owned_performance_evidence=owned_evidence,
+    )
+    assert owned_route_acceptance["decision"] == "PASS_PREDICTED_RELATABILITY"
+    owned_validation = owned_route_acceptance["findings"][
+        "owned_performance_evidence_validation"
+    ]
+    assert owned_validation["valid"] is True
+    assert owned_validation["checks"]["receipt_self_hash_valid"] is True
+
+    tampered_owned_receipt = dict(owned_receipt)
+    tampered_owned_receipt["source_winner"] = {"platform_post_id": "changed"}
+    owned_receipt_path.write_text(
+        json.dumps(tampered_owned_receipt, sort_keys=True), encoding="utf-8"
+    )
+    tampered_owned_route = bank.audit_script_against_cohort(
+        script_id="tampered-owned-route",
+        script_text=nonhuman_opening_script,
+        cohort_manifest_path=cohort["manifest_path"],
+        expected_cohort_id=cohort["cohort_id"],
+        expected_cohort_manifest_sha256=cohort_manifest_sha256,
+        evidence_route="owned_performance_replication",
+        owned_performance_evidence=owned_evidence,
+    )
+    assert tampered_owned_route["decision"] == "REJECT_NOT_RELATABLE"
+    assert tampered_owned_route["findings"]["checks"][
+        "opening_owned_performance_backed"
+    ] is False
+    assert tampered_owned_route["findings"][
+        "owned_performance_evidence_validation"
+    ]["checks"]["receipt_self_hash_valid"] is False
 
     tampered_text = transcript_text.replace("Creator", "Viewer", 1)
     assert len(tampered_text.split()) == len(transcript_text.split())

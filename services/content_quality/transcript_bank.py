@@ -54,6 +54,58 @@ STOP_WORDS = {
     "want", "what", "when", "where", "which", "while", "with", "would", "your",
 }
 
+# Transcript qualification is still deterministic, but related everyday words
+# must resolve to the same concept. Literal-only matching incorrectly rejected
+# phrases such as "concentrate while learning" for a measured "focus" topic.
+# The groups are deliberately narrow; a music transcript still needs a second
+# focus/study concept and cannot pass on the word "music" alone.
+TOPIC_CONCEPT_GROUPS = {
+    "focus": {
+        "attention", "concentrate", "concentrated", "concentrating",
+        "concentration", "focus", "focused", "focusing", "flow",
+    },
+    "study": {
+        "learn", "learning", "memory", "retention", "study", "studied",
+        "studies", "studying",
+    },
+    "music": {
+        "beat", "beats", "instrumental", "instrumentals", "lofi", "lowfi",
+        "melody", "music", "playlist", "playlists", "song", "songs",
+    },
+}
+RECOGNIZABLE_HUMAN_OPENING_PATTERNS = {
+    "ever_sit_down": r"\bever\s+sit\s+down\b",
+    "ever_put_on": r"\bever\s+put\s+on\b",
+    "ever_open": r"\bever\s+open\b",
+    "ever_try": r"\bever\s+tr(?:y|ied)\b",
+    "do_you": r"\bdo\s+you\b",
+    "have_you": r"\bhave\s+you\b",
+    "you_know_that_moment": r"\byou\s+know\s+that\s+moment\b",
+}
+
+
+def transcript_topic_concept_matches(
+    topic_values: Sequence[str], transcript_text: str
+) -> list[str]:
+    """Return distinct target concepts whose language appears in text."""
+
+    vocabulary = {token.lower().replace("-", "") for token in words(transcript_text)}
+    matches: list[str] = []
+    for raw_term in topic_values:
+        term = raw_term.lower().replace("-", "")
+        concept = next(
+            (
+                (name, members)
+                for name, members in TOPIC_CONCEPT_GROUPS.items()
+                if term == name or term in members
+            ),
+            (term, {term}),
+        )
+        concept_name, group = concept
+        if vocabulary & group:
+            matches.append(concept_name)
+    return sorted(dict.fromkeys(matches))
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -75,6 +127,141 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_owned_performance_evidence(
+    evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Verify one owned-winner receipt without trusting caller assertions.
+
+    This evidence route is intentionally narrow. It proves that the exact
+    owned source post retained viewers, that the cited episode passed the
+    source-verification certificate, and that the receipt has not changed.
+    It does not claim that the new script has already performed.
+    """
+
+    required = {
+        "receipt_path", "receipt_sha256", "platform_post_id",
+        "analytics_receipt_id", "episode_id",
+    }
+    supplied = dict(evidence or {})
+    missing = sorted(required - {key for key, value in supplied.items() if value})
+    checks: dict[str, bool] = {
+        "required_fields_present": not missing,
+        "receipt_payload_is_object": False,
+        "receipt_contract_supported": False,
+        "receipt_self_hash_valid": False,
+        "expected_receipt_hash_matches": False,
+        "platform_post_id_matches": False,
+        "owned_retention_provider_read_verified": False,
+        "analytics_receipt_id_matches": False,
+        "owned_retention_has_views": False,
+        "owned_retention_has_average_percentage_viewed": False,
+        "owned_retention_curve_is_material": False,
+        "owned_retention_final_position_present": False,
+        "series_certification_passed": False,
+        "certificate_manifest_matches": False,
+        "source_verification_passed": False,
+        "episode_source_verification_passed": False,
+        "provider_writes_not_performed": False,
+    }
+    observed: dict[str, Any] = {}
+    load_error: str | None = None
+    receipt_path = Path(str(supplied.get("receipt_path") or "")).expanduser()
+    receipt: dict[str, Any] = {}
+    if not missing:
+        try:
+            loaded = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                receipt = loaded
+                checks["receipt_payload_is_object"] = True
+            else:
+                load_error = "receipt payload is not an object"
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            load_error = f"{type(exc).__name__}: {exc}"
+
+    if receipt:
+        stored_hash = str(receipt.get("receipt_sha256") or "").lower()
+        hash_material = dict(receipt)
+        hash_material.pop("receipt_sha256", None)
+        actual_self_hash = canonical_sha256(hash_material)
+        expected_hash = str(supplied.get("receipt_sha256") or "").lower()
+        source_winner = dict(receipt.get("source_winner") or {})
+        analytics_refresh = dict(receipt.get("analytics_refresh") or {})
+        retention = dict(analytics_refresh.get("owned_retention") or {})
+        metrics = dict(retention.get("metrics") or {})
+        final_position = dict(retention.get("final_position") or {})
+        certification = dict(receipt.get("certification") or {})
+        source_verification = dict(receipt.get("source_verification") or {})
+        episode_id = str(supplied.get("episode_id") or "")
+        episode = next(
+            (
+                dict(item)
+                for item in source_verification.get("episode_results") or []
+                if str((item or {}).get("episode_id") or "") == episode_id
+            ),
+            {},
+        )
+        checks.update({
+            "receipt_contract_supported": (
+                receipt.get("contract") == "owned_winner_daily_control_loop_v1"
+            ),
+            "receipt_self_hash_valid": bool(stored_hash) and actual_self_hash == stored_hash,
+            "expected_receipt_hash_matches": bool(expected_hash) and expected_hash == stored_hash,
+            "platform_post_id_matches": (
+                str(source_winner.get("platform_post_id") or "")
+                == str(supplied.get("platform_post_id") or "")
+            ),
+            "owned_retention_provider_read_verified": (
+                retention.get("provider_read_verified") is True
+            ),
+            "analytics_receipt_id_matches": (
+                str(retention.get("analytics_receipt_id") or "")
+                == str(supplied.get("analytics_receipt_id") or "")
+            ),
+            "owned_retention_has_views": float(metrics.get("views") or 0) > 0,
+            "owned_retention_has_average_percentage_viewed": (
+                float(metrics.get("average_view_percentage") or 0) > 0
+            ),
+            "owned_retention_curve_is_material": int(retention.get("point_count") or 0) >= 20,
+            "owned_retention_final_position_present": (
+                float(final_position.get("audience_watch_ratio") or 0) > 0
+            ),
+            "series_certification_passed": certification.get("passed") is True,
+            "certificate_manifest_matches": (
+                certification.get("certificate_manifest_matches") is True
+            ),
+            "source_verification_passed": source_verification.get("passed") is True,
+            "episode_source_verification_passed": episode.get("passed") is True,
+            "provider_writes_not_performed": (
+                analytics_refresh.get("provider_writes_performed") is False
+                and retention.get("provider_writes_performed") is False
+                and source_verification.get("provider_write_performed") is False
+            ),
+        })
+        observed = {
+            "receipt_contract": receipt.get("contract"),
+            "receipt_self_sha256": stored_hash,
+            "actual_receipt_self_sha256": actual_self_hash,
+            "platform_post_id": source_winner.get("platform_post_id"),
+            "analytics_receipt_id": retention.get("analytics_receipt_id"),
+            "episode_id": episode.get("episode_id"),
+            "views": metrics.get("views"),
+            "average_view_percentage": metrics.get("average_view_percentage"),
+            "retention_point_count": retention.get("point_count"),
+            "final_audience_watch_ratio": final_position.get("audience_watch_ratio"),
+        }
+
+    return {
+        "contract": "owned_performance_evidence_validation_v1",
+        "valid": all(checks.values()),
+        "checks": checks,
+        "failures": [name for name, passed in checks.items() if not passed],
+        "missing_fields": missing,
+        "receipt_path": str(receipt_path),
+        "load_error": load_error,
+        "observed": observed,
+    }
 
 
 def file_sha256_bounded(
@@ -2209,9 +2396,8 @@ class TranscriptBank:
         transcript_hash: str,
     ) -> dict[str, Any]:
         policy = DEFAULT_POLICIES[candidate.platform]
-        transcript_vocabulary = {token.lower() for token in words(transcript_text)}
-        transcript_matches = sorted(
-            term for term in candidate.topic_terms if term in transcript_vocabulary
+        transcript_matches = transcript_topic_concept_matches(
+            candidate.topic_terms, transcript_text
         )
         checks = {
             "audio_file_exists": True,
@@ -2235,6 +2421,7 @@ class TranscriptBank:
             "policy": asdict(policy),
             "metadata_topic_matches": list(candidate.topic_matches),
             "transcript_topic_matches": transcript_matches,
+            "transcript_topic_match_basis": "narrow_semantic_concept_groups_v1",
             "minimum_transcript_topic_matches": 2,
             "metrics_sha256": canonical_sha256(candidate.source_metrics),
             "transcript_payload_sha256": transcript_hash,
@@ -2768,6 +2955,8 @@ class TranscriptBank:
         cohort_manifest_path: str | Path,
         expected_cohort_id: str,
         expected_cohort_manifest_sha256: str,
+        evidence_route: str = "human_recognition",
+        owned_performance_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Predict script relatability from verified high-performing transcripts.
 
@@ -2777,6 +2966,13 @@ class TranscriptBank:
 
         if not script_id.strip() or not script_text.strip():
             raise ValueError("script_id and script_text are required")
+        if evidence_route not in {
+            "human_recognition", "owned_performance_replication",
+        }:
+            raise ValueError("evidence_route is unsupported")
+        owned_evidence_validation = validate_owned_performance_evidence(
+            owned_performance_evidence
+        ) if evidence_route == "owned_performance_replication" else None
         manifest_path = Path(cohort_manifest_path).expanduser().resolve()
         manifest_load_error: str | None = None
         try:
@@ -2907,6 +3103,12 @@ class TranscriptBank:
             token for token in opening_tokens
             if token in HUMAN_EXPERIENCE_WORDS and recurrence.get(token, 0) >= 2
         )
+        normalized_opening = " ".join(words(script_text)[:45]).lower()
+        recognizable_opening_patterns = sorted(
+            name
+            for name, pattern in RECOGNIZABLE_HUMAN_OPENING_PATTERNS.items()
+            if re.search(pattern, normalized_opening)
+        )
         lowered_script = script_text.lower()
         pipeline_meta_phrases = (
             "attention gate", "content factory", "human-relatability", "source receipt",
@@ -2941,7 +3143,17 @@ class TranscriptBank:
             "script_vocabulary_supported": script_overlap >= 0.18,
             "supported_by_three_transcripts": supported_sources >= 3,
             "opening_uses_recurring_human_language": len(recurring_opening_terms) >= 2,
-            "opening_human_experience_backed": bool(recurring_human_opening_terms),
+            "opening_human_experience_backed": (
+                bool(
+                    recurring_human_opening_terms
+                    or recognizable_opening_patterns
+                )
+                if evidence_route == "human_recognition" else True
+            ),
+            "opening_owned_performance_backed": (
+                bool((owned_evidence_validation or {}).get("valid"))
+                if evidence_route == "owned_performance_replication" else True
+            ),
             "audience_facing_not_pipeline_meta": not pipeline_meta_matches,
         }
         weights = {
@@ -2957,13 +3169,23 @@ class TranscriptBank:
             "script_vocabulary_supported": 10,
             "supported_by_three_transcripts": 10,
             "opening_uses_recurring_human_language": 5,
-            "opening_human_experience_backed": 10,
+            "opening_human_experience_backed": (
+                10 if evidence_route == "human_recognition" else 0
+            ),
+            "opening_owned_performance_backed": (
+                10 if evidence_route == "owned_performance_replication" else 0
+            ),
             "audience_facing_not_pipeline_meta": 10,
         }
         raw_score = sum(weights[name] for name, passed in checks.items() if passed)
         # Transcript precedent can only predict relatability. A score above 85 is
         # reserved for audited retention/comment evidence from this exact script.
         score = min(85.0, float(raw_score))
+        opening_requirement = (
+            "opening_owned_performance_backed"
+            if evidence_route == "owned_performance_replication"
+            else "opening_human_experience_backed"
+        )
         hard_requirements = (
             "cohort_manifest_binding_valid",
             "cohort_decision_pass",
@@ -2971,7 +3193,7 @@ class TranscriptBank:
             "stated_source_claim_matches_cohort",
             "supported_by_three_transcripts",
             "opening_uses_recurring_human_language",
-            "opening_human_experience_backed",
+            opening_requirement,
             "audience_facing_not_pipeline_meta",
         )
         hard_requirements_pass = all(checks[name] for name in hard_requirements)
@@ -2996,6 +3218,7 @@ class TranscriptBank:
         }
         findings = {
             "contract": "performance_transcript_script_audit_v3",
+            "evidence_route": evidence_route,
             "measurement_kind": "prediction_from_source_transcripts",
             "actual_audience_relatability_measured": False,
             "score_cap_without_post_publication_outcomes": 85,
@@ -3016,7 +3239,9 @@ class TranscriptBank:
             "minimum_source_tfidf_cosine": MIN_SOURCE_TFIDF_COSINE,
             "recurring_opening_terms": recurring_opening_terms,
             "recurring_human_experience_opening_terms": recurring_human_opening_terms,
+            "recognizable_human_opening_patterns": recognizable_opening_patterns,
             "pipeline_meta_phrases_in_script": pipeline_meta_matches,
+            "owned_performance_evidence_validation": owned_evidence_validation,
             "artifact_integrity_failures": integrity_failures,
             "artifact_integrity_basis": (
                 "acquisition-time audio/transcript hashes plus a canonical "

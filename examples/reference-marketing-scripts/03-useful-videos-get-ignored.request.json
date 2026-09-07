@@ -1,10 +1,12 @@
 {
-  "contract": "reference_marketing_script_request_v1",
+  "contract": "reference_marketing_script_request_v2",
   "corpus_id": "instagram-personalbrandlaunch-reference-v1",
   "title": "Why Useful Videos Still Get Ignored",
   "topic": "How experts can make educational social videos easier to understand and worth watching",
   "audience": "founders and experts who teach through short social videos",
   "objective": "engage",
+  "content_role": "ENTERTAIN",
+  "topic_distance_from_offer": 3,
   "angle": "how_to",
   "target_seconds": 60,
   "narrative": {

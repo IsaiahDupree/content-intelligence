@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ACTP Content Reference Audit
-  version: 1.0.0
+  version: 1.1.0
   description: Typed access to source-grounded clip evidence and script audits.
 paths:
   /api/reference-corpus/health:
@@ -111,6 +111,30 @@ paths:
                 objective: {type: string}
                 target_viewer: {type: string}
                 target_seconds: {type: integer, minimum: 5, maximum: 3600}
+                timeline:
+                  description: >-
+                    Optional semantic timeline used by owner-calibrated quality
+                    v2. When supplied it must be non-empty, each row must name a
+                    semantic block or beat and contain spoken text, and the
+                    evaluator checks that the ordered row text projects exactly
+                    to script. Omit the property for legacy script-only audits.
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [text]
+                    properties:
+                      block: {type: string, minLength: 1}
+                      beat: {type: string, minLength: 1}
+                      text: {type: string, minLength: 1}
+                      start: {type: number, minimum: 0}
+                      end: {type: number, exclusiveMinimum: 0}
+                      start_seconds: {type: number, minimum: 0}
+                      end_seconds: {type: number, exclusiveMinimum: 0}
+                    anyOf:
+                      - required: [block]
+                      - required: [beat]
+                    additionalProperties: true
                 provenance:
                   type: object
                   required:
@@ -209,14 +233,21 @@ paths:
         content:
           application/json:
             schema:
-              $ref: ./reference-marketing-script-request.schema.json
+              description: >-
+                Use v2 for new work. V1 remains accepted only for legacy callers
+                and may infer marketing intent when those fields are absent.
+              oneOf:
+                - $ref: ./reference-marketing-script-request-v2.schema.json
+                - $ref: ./reference-marketing-script-request.schema.json
       responses:
         "200":
           description: Immutable script package with quality and copy audits.
           content:
             application/json:
               schema:
-                $ref: ./reference-marketing-script-package.schema.json
+                oneOf:
+                  - $ref: ./reference-marketing-script-package-v2.schema.json
+                  - $ref: ./reference-marketing-script-package.schema.json
         "400": {description: Typed brief or claim evidence is invalid.}
         "404": {description: Reference corpus does not exist.}
   /api/reference-corpus/scripts/{script_id}:
@@ -234,7 +265,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: ./reference-marketing-script-package.schema.json
+                oneOf:
+                  - $ref: ./reference-marketing-script-package-v2.schema.json
+                  - $ref: ./reference-marketing-script-package.schema.json
         "404": {description: Script package does not exist.}
   /api/reference-corpus/acquire:
     post:

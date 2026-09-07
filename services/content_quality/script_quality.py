@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence
 
 
 OWNER_QUALITY_CONTRACT = "owner_calibrated_script_quality_v1"
+OWNER_QUALITY_ALGORITHM = "owner_calibrated_script_quality_v2"
 RHETORICAL_STRUCTURE_CONTRACT = "evidence_safe_rhetorical_structure_v1"
 DELIVERY_VISUAL_PLAN_CONTRACT = "delivery_visual_plan_v1"
 MAX_QUALITY_REWRITE_ATTEMPTS = 3
@@ -76,16 +77,21 @@ CONCRETE_NOUNS = {
     "video", "week", "workday",
 }
 TENSION_TERMS = {
-    "bottleneck", "burned", "burnout", "cold", "cost", "delay", "exhausted",
-    "fail", "failed", "failing", "friction", "hard", "harder", "ignored",
-    "interrupt", "interrupted", "interrupting", "mistake", "mistakes", "missing",
-    "overwhelmed", "pressure", "problem", "risk", "stuck", "stop", "stops",
-    "wait", "waiting", "waits", "worse", "wrong",
+    "awkward", "bottleneck", "burned", "burnout", "cold", "cost", "crisis",
+    "delay", "exhausted", "fail", "failed", "failing", "forget", "forgot",
+    "forgotten", "friction", "hard", "harder", "ignored", "interrupt",
+    "interrupted", "interrupting", "jumble", "late", "lose", "lost", "loud",
+    "louder", "loudest", "mistake", "mistakes", "missing", "overwhelmed",
+    "pile", "pressure", "problem", "quiet", "quietly", "risk", "stuck", "stop",
+    "stops", "surprise", "surprised", "trap", "wait", "waiting", "waits",
+    "worse", "wrong",
 }
 PAYOFF_TERMS = {
-    "answer", "booked", "clear", "complete", "completed", "easier", "finish",
-    "finished", "fix", "fixed", "proof", "reduce", "removes", "resolve",
-    "result", "save", "saved", "sent", "works",
+    "answer", "booked", "care", "change", "changed", "check", "choose", "clear",
+    "complete", "completed", "easier", "finally", "finish", "finished", "fix",
+    "fixed", "learn", "learned", "proof", "reduce", "removes", "reply", "resolve",
+    "result", "save", "saved", "send", "sent", "start", "try", "turn", "turned",
+    "works", "write",
 }
 CONTRAST_TERMS = {"but", "except", "instead", "least", "more", "without", "yet"}
 GRAM_STOP_WORDS = {
@@ -322,21 +328,64 @@ def _remove_protected(text: str, protected_phrases: Iterable[str]) -> str:
     return result
 
 
-def _token_positions(tokens: Sequence[str], vocabulary: set[str]) -> list[int]:
-    return [index for index, token in enumerate(tokens) if token in vocabulary]
+def _word_forms(token: str) -> set[str]:
+    forms = {token}
+    if token.endswith("ing") and len(token) > 5:
+        stem = token[:-3]
+        forms.update((stem, stem + "e"))
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            forms.add(stem[:-1])
+    if token.endswith("ed") and len(token) > 4:
+        stem = token[:-2]
+        forms.update((stem, token[:-1]))
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            forms.add(stem[:-1])
+    if token.endswith("est") and len(token) > 5:
+        forms.add(token[:-3])
+    if token.endswith("er") and len(token) > 4:
+        forms.add(token[:-2])
+    if token.endswith("s") and len(token) > 3:
+        forms.add(token[:-1])
+    return forms
+
+
+def _semantic_token_hits(
+    tokens: Sequence[str], vocabulary: set[str],
+) -> list[tuple[int, str]]:
+    return [
+        (index, token)
+        for index, token in enumerate(tokens)
+        if _word_forms(token) & vocabulary
+    ]
+
+
+def _final_literal_audience_question(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean.endswith("?"):
+        return ""
+    boundary = max(
+        clean.rfind(".", 0, -1),
+        clean.rfind("!", 0, -1),
+        clean.rfind("?", 0, -1),
+    )
+    question = clean[boundary + 1:].strip()
+    question_tokens = words(question)
+    if not question_tokens:
+        return ""
+    audience_words = {"you", "your", "yours"}
+    question_leads = {
+        "are", "can", "could", "did", "do", "does", "has", "have", "how",
+        "is", "what", "when", "where", "which", "who", "why", "will", "would",
+    }
+    if set(question_tokens) & audience_words or question_tokens[0] in question_leads:
+        return question
+    return ""
 
 
 def _action_hits(tokens: Sequence[str]) -> list[str]:
     hits: list[str] = []
     for token in tokens:
-        forms = {token}
-        if token.endswith("ing") and len(token) > 5:
-            forms.update((token[:-3], token[:-3] + "e"))
-        if token.endswith("ed") and len(token) > 4:
-            forms.update((token[:-2], token[:-1]))
-        if token.endswith("s") and len(token) > 3:
-            forms.add(token[:-1])
-        if forms & CONCRETE_ACTION_VERBS:
+        if _word_forms(token) & CONCRETE_ACTION_VERBS:
             hits.append(token)
     return hits
 
@@ -449,13 +498,34 @@ def audit_owner_calibrated_quality(
         )
     ) and not generic_bridge_hits
 
-    tension_positions = _token_positions(tokens, TENSION_TERMS)
-    payoff_positions = _token_positions(tokens, PAYOFF_TERMS)
+    tension_hits = _semantic_token_hits(tokens, TENSION_TERMS)
+    payoff_hits = _semantic_token_hits(tokens, PAYOFF_TERMS)
+    tension_positions = [position for position, _token in tension_hits]
+    lexical_payoff_positions = [position for position, _token in payoff_hits]
+    final_audience_question = _final_literal_audience_question(clean)
+    audience_question_position = (
+        len(tokens) - len(words(final_audience_question))
+        if final_audience_question else None
+    )
+    payoff_positions = [
+        *lexical_payoff_positions,
+        *(
+            [audience_question_position]
+            if audience_question_position is not None
+            else []
+        ),
+    ]
     ordered_lexical_turn = bool(
         tension_positions
-        and payoff_positions
-        and tension_positions[0] < payoff_positions[-1]
+        and lexical_payoff_positions
+        and tension_positions[0] < lexical_payoff_positions[-1]
     )
+    ordered_question_turn = bool(
+        tension_positions
+        and audience_question_position is not None
+        and tension_positions[0] < audience_question_position
+    )
+    ordered_semantic_turn = ordered_lexical_turn or ordered_question_turn
     timeline_rows = [dict(item) for item in (timeline or ())]
     timeline_binding = _timeline_binding(clean, timeline_rows)
     roles = [
@@ -483,25 +553,35 @@ def audit_owner_calibrated_quality(
     )
     role_topic_anchors = _topic_anchor_hits(words(role_turn_text))
     role_turn_supported = ordered_role_turn and len(role_topic_anchors) >= 5
+    semantic_turn_topic_anchors = _topic_anchor_hits(tokens)
+    semantic_turn_supported = bool(
+        ordered_semantic_turn and len(semantic_turn_topic_anchors) >= 5
+    )
     contrast_hits = sorted(set(tokens) & CONTRAST_TERMS)
+    observed_tension_terms = sorted({token for _position, token in tension_hits})
+    observed_payoff_terms = sorted({token for _position, token in payoff_hits})
+    payoff_evidence_count = len(observed_payoff_terms) + bool(final_audience_question)
     lexical_tension_score = min(
         100.0,
-        (35.0 if ordered_lexical_turn or ordered_role_turn else 0.0)
-        + min(3, len(set(tokens) & TENSION_TERMS)) * 10.0
-        + min(3, len(set(tokens) & PAYOFF_TERMS)) * 8.0
+        (35.0 if ordered_semantic_turn or ordered_role_turn else 0.0)
+        + min(3, len(observed_tension_terms)) * 10.0
+        + min(3, payoff_evidence_count) * 8.0
         + min(2, len(contrast_hits)) * 5.5,
     )
     tension_score = max(
         lexical_tension_score,
+        min(100.0, 75.0 + len(contrast_hits) * 5.0)
+        if semantic_turn_supported else 0.0,
         min(100.0, 75.0 + len(contrast_hits) * 5.0)
         if role_turn_supported else 0.0,
     )
     tension_pass = (
         (
             bool(tension_positions and payoff_positions)
-            and ordered_lexical_turn
+            and ordered_semantic_turn
             and lexical_tension_score >= 70.0
         )
+        or semantic_turn_supported
         or role_turn_supported
     )
 
@@ -579,10 +659,15 @@ def audit_owner_calibrated_quality(
         "tension_payoff": {
             "passed": tension_pass,
             "score": round(tension_score, 3),
-            "tension_terms": sorted(set(tokens) & TENSION_TERMS),
-            "payoff_terms": sorted(set(tokens) & PAYOFF_TERMS),
+            "tension_terms": observed_tension_terms,
+            "payoff_terms": observed_payoff_terms,
             "contrast_terms": contrast_hits,
             "ordered_lexical_turn": ordered_lexical_turn,
+            "ordered_question_turn": ordered_question_turn,
+            "ordered_semantic_turn": ordered_semantic_turn,
+            "final_literal_audience_question": final_audience_question,
+            "semantic_turn_supported": semantic_turn_supported,
+            "semantic_turn_topic_anchors": semantic_turn_topic_anchors,
             "ordered_role_turn": ordered_role_turn,
             "role_turn_supported": role_turn_supported,
             "role_topic_anchors": role_topic_anchors,
@@ -624,6 +709,7 @@ def audit_owner_calibrated_quality(
     )
     return {
         "contract": OWNER_QUALITY_CONTRACT,
+        "algorithm_version": OWNER_QUALITY_ALGORITHM,
         "decision": decision,
         "score": score,
         "threshold": OWNER_QUALITY_PASS_SCORE,
@@ -845,6 +931,7 @@ __all__ = [
     "ANGLE_STRUCTURE",
     "DELIVERY_VISUAL_PLAN_CONTRACT",
     "MAX_QUALITY_REWRITE_ATTEMPTS",
+    "OWNER_QUALITY_ALGORITHM",
     "OWNER_QUALITY_CONTRACT",
     "RHETORICAL_STRUCTURE_CONTRACT",
     "arrange_role_components",

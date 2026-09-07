@@ -44,6 +44,13 @@ reordered text, duplicated text, and fabricated text fail
 `exact_script_timeline_binding_v1`; their role labels cannot lift the
 tension/payoff score.
 
+The authenticated `POST /api/reference-corpus/audit` route transports an
+optional semantic timeline into this evaluator. When present, it must contain
+at least one row, every row must provide non-empty spoken `text`, and every row
+must name its role with `block` or `beat`. Existing script-only callers remain
+compatible by omitting `timeline`; an explicitly empty timeline is rejected so
+transport mistakes cannot silently masquerade as legacy behavior.
+
 ## Evidence and perspective
 
 Public creator text is analysis-only. It is never treated as owner proof and

@@ -1,10 +1,12 @@
 {
-  "contract": "reference_marketing_script_request_v1",
+  "contract": "reference_marketing_script_request_v2",
   "corpus_id": "instagram-personalbrandlaunch-reference-v1",
   "title": "Automate the Bottleneck, Not the Demo",
   "topic": "How a software founder should choose the first workflow to automate",
   "audience": "software founders deciding where AI automation can create useful business value",
   "objective": "educate",
+  "content_role": "EDUCATE",
+  "topic_distance_from_offer": 2,
   "angle": "contrast",
   "target_seconds": 60,
   "narrative": {

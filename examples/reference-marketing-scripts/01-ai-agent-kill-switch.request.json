@@ -1,10 +1,12 @@
 {
-  "contract": "reference_marketing_script_request_v1",
+  "contract": "reference_marketing_script_request_v2",
   "corpus_id": "instagram-personalbrandlaunch-reference-v1",
   "title": "Your AI Agent Needs a Kill Switch",
   "topic": "How software founders can control AI agents before granting write access",
   "audience": "software founders adding AI agents to real business workflows",
   "objective": "convert",
+  "content_role": "SELL",
+  "topic_distance_from_offer": 1,
   "angle": "problem_first",
   "target_seconds": 60,
   "narrative": {

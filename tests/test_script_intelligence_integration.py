@@ -1182,6 +1182,85 @@ def test_public_first_person_source_is_attributed_not_adopted(tmp_path):
     assert gate["template_first_person_inferred_from_source"] is False
 
 
+def test_authenticated_exact_approved_script_certification_persists_quality_receipts(
+    tmp_path,
+):
+    token = "exact-approved-certification-token"
+    app, engine = app_and_engine(
+        tmp_path, CONTENT_QUALITY_CONTROL_TOKEN=token
+    )
+    client = app.test_client()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Agent-Principal": "exact-approved-script-integration-test",
+    }
+    timeline = [
+        {
+            "start": 0, "end": 3, "beat": "hook",
+            "text": "You feel tired and stuck when content pressure keeps growing.",
+        },
+        {
+            "start": 3, "end": 8, "beat": "problem",
+            "text": "More automation can turn one task into another system to watch.",
+        },
+        {
+            "start": 8, "end": 14, "beat": "method",
+            "text": "Name the pressure first and choose one small next step.",
+        },
+        {
+            "start": 14, "end": 20, "beat": "payoff",
+            "text": "That makes the work feel possible again.",
+        },
+        {
+            "start": 20, "end": 24, "beat": "cta",
+            "text": "Try it before adding another tool.",
+        },
+    ]
+    script_text = " ".join(item["text"] for item in timeline)
+    payload = {
+        "script_id": "approved-exact-script-v1",
+        "text": script_text,
+        "topic": "creator automation pressure",
+        "source_topic": "AI automation",
+        "audience": "software founders",
+        "objective": "qualified attention",
+        "source_external_ids": [f"script-source-{index}" for index in range(5)],
+        "source_platform": "youtube",
+        "timeline": timeline,
+    }
+
+    assert client.post(
+        "/api/script-intelligence/certify-exact-approved", json=payload
+    ).status_code == 401
+    response = client.post(
+        "/api/script-intelligence/certify-exact-approved",
+        json=payload,
+        headers=headers,
+    )
+    assert response.status_code == 200, response.get_json()
+    result = response.get_json()
+    assert result["status"] == "certified"
+    assert result["script"]["text"] == script_text
+    assert result["ready_for_foundry_import"] is True
+    assert result["cohort"]["member_count"] == 5
+    assert result["relatability_audit"]["decision"] == "PASS"
+    assert result["attention_audit"]["decision"] == "PASS"
+    assert engine.store.script("approved-exact-script-v1")["text"] == script_text
+
+    receipt_bound_payload = dict(payload)
+    receipt_bound_payload.pop("source_external_ids")
+    receipt_bound_payload["source_receipt_ids"] = result["script"][
+        "source_receipt_ids"
+    ]
+    receipt_bound = client.post(
+        "/api/script-intelligence/certify-exact-approved",
+        json=receipt_bound_payload,
+        headers=headers,
+    )
+    assert receipt_bound.status_code == 200, receipt_bound.get_json()
+    assert receipt_bound.get_json()["status"] == "certified"
+
+
 def test_variant_selector_rejects_invalid_or_unavailable_indexes_with_audit(
     tmp_path,
 ):

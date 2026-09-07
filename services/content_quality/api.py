@@ -545,6 +545,26 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         started = time.monotonic()
         payload = json_body()
         try:
+            timeline = None
+            if "timeline" in payload:
+                supplied_timeline = payload.get("timeline")
+                if not isinstance(supplied_timeline, list) or not supplied_timeline:
+                    raise ValueError(
+                        "timeline must be a non-empty semantic timeline when supplied"
+                    )
+                timeline = []
+                for index, item in enumerate(supplied_timeline):
+                    if not isinstance(item, dict):
+                        raise ValueError(f"timeline[{index}] must be an object")
+                    if not str(item.get("text") or "").strip():
+                        raise ValueError(
+                            f"timeline[{index}].text must be a non-empty string"
+                        )
+                    if not str(item.get("block") or item.get("beat") or "").strip():
+                        raise ValueError(
+                            f"timeline[{index}] must identify a semantic block or beat"
+                        )
+                    timeline.append(dict(item))
             result = reference_corpus.audit_content(
                 corpus_id=str(payload.get("corpus_id") or ""),
                 title=str(payload.get("title") or ""),
@@ -557,6 +577,7 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     if isinstance(payload.get("provenance"), dict)
                     else None
                 ),
+                timeline=timeline,
             )
         except ValueError as error:
             return reference_invalid_request(
@@ -896,6 +917,22 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "path": "/api/script-intelligence/generate-and-audit",
                     "required": ["brief_id"],
                 },
+                "certify_exact_approved_script": {
+                    "method": "POST",
+                    "path": "/api/script-intelligence/certify-exact-approved",
+                    "required": [
+                        "script_id", "text", "topic", "audience", "objective",
+                        "timeline",
+                    ],
+                    "required_one_of": [
+                        ["source_external_ids"], ["source_receipt_ids"],
+                    ],
+                    "effect": (
+                        "preserve immutable approved script bytes, re-audit exact "
+                        "local source artifacts, bind a transcript cohort, and "
+                        "persist Foundry-compatible quality receipts"
+                    ),
+                },
                 "run_trend_to_script": {
                     "method": "POST",
                     "path": "/api/script-intelligence/run",
@@ -1162,18 +1199,31 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                     "required": ["corpus_id", "script"],
                     "optional": [
                         "title", "objective", "content_role", "target_viewer",
-                        "target_seconds",
+                        "target_seconds", "timeline",
                     ],
+                    "timeline_policy": {
+                        "when_supplied": "non_empty_semantic_timeline",
+                        "role_field": "block_or_beat",
+                        "text_binding": "exact_ordered_script_projection_evaluated",
+                    },
                     "rights_gate": "patterns_only_no_copy_or_identity_imitation",
                 },
                 "write_reference_marketing_script": {
                     "method": "POST",
                     "path": "/api/reference-corpus/write-script",
-                    "contract": "reference_marketing_script_request_v1",
+                    "contract": "reference_marketing_script_request_v2",
+                    "accepted_contracts": [
+                        "reference_marketing_script_request_v2",
+                        "reference_marketing_script_request_v1",
+                    ],
+                    "legacy_contract_behavior": (
+                        "v1 remains accepted and infers content role and topic "
+                        "distance when absent; v2 requires both explicitly"
+                    ),
                     "required": [
-                        "corpus_id", "title", "topic", "audience",
+                        "contract", "corpus_id", "title", "topic", "audience",
                         "objective", "content_role",
-                        "topic_distance_from_offer", "target_seconds",
+                        "topic_distance_from_offer", "angle", "target_seconds",
                         "narrative",
                     ],
                     "optional": ["topic_ladder_id", "offer"],
@@ -1569,6 +1619,24 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
         status_code = 200 if result.get("status") in {"approved", "revise"} else 422
         return audited_agent_response(
             "generate_and_audit", payload, result, status_code, started
+        )
+
+    @app.post("/api/script-intelligence/certify-exact-approved")
+    def certify_exact_approved_script():
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        payload = json_body()
+        try:
+            result = engine.script_intelligence.certify_exact_approved_script(payload)
+        except ValueError as error:
+            return audited_invalid_request(
+                "certify_exact_approved_script", payload, error, started
+            )
+        status_code = 200 if result.get("status") == "certified" else 409
+        return audited_agent_response(
+            "certify_exact_approved_script", payload, result, status_code, started
         )
 
     @app.post("/api/script-intelligence/run")

@@ -6,9 +6,14 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, FormatChecker
 
 from services.content_quality.api import create_content_quality_app
 from services.content_quality.marketing_scripts import (
+    COMPILER_VERSION,
+    LEGACY_COMPILER_VERSION,
+    LEGACY_PACKAGE_CONTRACT,
+    LEGACY_REQUEST_CONTRACT,
     MarketingScriptCompiler,
     PACKAGE_CONTRACT,
     REQUEST_CONTRACT,
@@ -112,6 +117,7 @@ def request_payload() -> dict:
         "topic": "How a software founder should choose the first workflow to automate",
         "audience": "software founders evaluating AI automation",
         "objective": "educate",
+        "content_role": "EDUCATE",
         "topic_distance_from_offer": 2,
         "topic_ladder_id": "automate-the-bottleneck-ladder",
         "angle": "contrast",
@@ -170,6 +176,9 @@ def test_compiler_persists_an_approved_idempotent_package(tmp_path: Path) -> Non
     assert first == second
     assert first["status"] == "approved"
     assert first["contract"] == PACKAGE_CONTRACT
+    assert first["request_contract"] == REQUEST_CONTRACT
+    assert first["request"]["contract"] == REQUEST_CONTRACT
+    assert first["lineage"]["compiler"] == COMPILER_VERSION
     assert first["request"]["content_role"] == "EDUCATE"
     assert first["request"]["topic_distance_from_offer"] == 2
     assert first["marketing_logic"]["content_role"] == "EDUCATE"
@@ -228,6 +237,48 @@ def test_content_role_must_match_the_script_objective(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="conflicts with objective educate"):
         MarketingScriptCompiler(store).compile(payload)
+
+
+@pytest.mark.parametrize(
+    "required_field",
+    ("content_role", "topic_distance_from_offer"),
+)
+def test_v2_runtime_requires_explicit_marketing_intent(
+    tmp_path: Path,
+    required_field: str,
+) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload.pop(required_field)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{REQUEST_CONTRACT} requires {required_field}",
+    ):
+        MarketingScriptCompiler(store).compile(payload)
+
+
+@pytest.mark.parametrize("omit_contract", (False, True))
+def test_legacy_v1_request_keeps_deterministic_intent_defaults(
+    tmp_path: Path,
+    omit_contract: bool,
+) -> None:
+    store = seed_corpus(tmp_path / "reference")
+    payload = request_payload()
+    payload["contract"] = LEGACY_REQUEST_CONTRACT
+    payload.pop("content_role")
+    payload.pop("topic_distance_from_offer")
+    if omit_contract:
+        payload.pop("contract")
+
+    package = MarketingScriptCompiler(store).compile(payload)
+
+    assert package["contract"] == LEGACY_PACKAGE_CONTRACT
+    assert package["request_contract"] == LEGACY_REQUEST_CONTRACT
+    assert package["request"]["contract"] == LEGACY_REQUEST_CONTRACT
+    assert package["request"]["content_role"] == "EDUCATE"
+    assert package["request"]["topic_distance_from_offer"] == 3
+    assert package["lineage"]["compiler"] == LEGACY_COMPILER_VERSION
 
 
 def test_topic_distance_must_match_the_content_role(tmp_path: Path) -> None:
@@ -448,6 +499,14 @@ def test_authenticated_http_compiles_and_retrieves_package(tmp_path: Path) -> No
     ).hexdigest()
     assert fetched.status_code == 200
     assert json.loads(fetched.data)["result_sha256"] == package["result_sha256"]
+    operation = catalog["operations"]["write_reference_marketing_script"]
+    assert operation["contract"] == REQUEST_CONTRACT
+    assert operation["accepted_contracts"] == [
+        REQUEST_CONTRACT,
+        LEGACY_REQUEST_CONTRACT,
+    ]
+    assert "contract" in operation["required"]
+    assert "angle" in operation["required"]
 
 
 def test_contract_schemas_are_valid_json() -> None:
@@ -456,6 +515,135 @@ def test_contract_schemas_are_valid_json() -> None:
     for name in (
         "reference-marketing-script-request.schema.json",
         "reference-marketing-script-package.schema.json",
+        "reference-marketing-script-request-v2.schema.json",
+        "reference-marketing-script-package-v2.schema.json",
     ):
         parsed = json.loads((protocol / name).read_text(encoding="utf-8"))
         assert parsed["$schema"].endswith("2020-12/schema")
+        Draft202012Validator.check_schema(parsed)
+
+    request_v2 = json.loads(
+        (protocol / "reference-marketing-script-request-v2.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    package_v2 = json.loads(
+        (protocol / "reference-marketing-script-package-v2.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert request_v2["$id"] == "urn:actp:reference-marketing-script-request:v2"
+    assert request_v2["properties"]["contract"]["const"] == REQUEST_CONTRACT
+    assert package_v2["$id"] == "urn:actp:reference-marketing-script-package:v2"
+    assert package_v2["properties"]["contract"]["const"] == PACKAGE_CONTRACT
+    assert package_v2["properties"]["request_contract"]["const"] == (
+        REQUEST_CONTRACT
+    )
+    assert package_v2["properties"]["request"]["$ref"].endswith(
+        "reference-marketing-script-request-v2.schema.json"
+    )
+
+
+def test_current_example_requests_validate_against_v2_schema() -> None:
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads(
+        (
+            root
+            / "protocols"
+            / "content-reference-audit-v1"
+            / "reference-marketing-script-request-v2.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+
+    for request_path in sorted(
+        (root / "examples" / "reference-marketing-scripts").glob("*.request.json")
+    ):
+        errors = list(
+            validator.iter_errors(json.loads(request_path.read_text(encoding="utf-8")))
+        )
+        assert errors == [], request_path
+
+
+@pytest.mark.parametrize(
+    "required_field",
+    ("content_role", "topic_distance_from_offer"),
+)
+def test_request_schema_requires_explicit_marketing_intent(
+    required_field: str,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads(
+        (
+            root
+            / "protocols"
+            / "content-reference-audit-v1"
+            / "reference-marketing-script-request-v2.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    candidate = request_payload()
+    candidate.pop(required_field)
+
+    errors = list(Draft202012Validator(schema).iter_errors(candidate))
+
+    assert any(
+        error.validator == "required" and required_field in error.message
+        for error in errors
+    )
+
+
+def test_legacy_v1_request_schema_keeps_intent_fields_optional() -> None:
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads(
+        (
+            root
+            / "protocols"
+            / "content-reference-audit-v1"
+            / "reference-marketing-script-request.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    candidate = request_payload()
+    candidate["contract"] = LEGACY_REQUEST_CONTRACT
+    candidate.pop("content_role")
+    candidate.pop("topic_distance_from_offer")
+
+    errors = list(Draft202012Validator(schema).iter_errors(candidate))
+
+    assert errors == []
+
+
+def test_request_schema_accepts_exact_independent_verification_receipt() -> None:
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads(
+        (
+            root
+            / "protocols"
+            / "content-reference-audit-v1"
+            / "reference-marketing-script-request-v2.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    candidate = request_payload()
+    claim = "A primary source records one verified result for this workflow"
+    verification = build_independent_verification_receipt(
+        receipt_id="primary-source-verification-1",
+        claim=claim,
+        source_url="https://example.com/primary-source",
+        source_kind="primary_source",
+        source_sha256=hashlib.sha256(b"captured primary source bytes").hexdigest(),
+        verified_at="2026-08-28T12:00:00Z",
+    )
+    candidate["narrative"]["proof"] = {
+        "statement": claim,
+        "evidence_type": "sourced_fact",
+        "source_receipt_ids": [verification["receipt_id"]],
+        "independent_verification_receipts": [verification],
+    }
+
+    errors = list(
+        Draft202012Validator(
+            schema,
+            format_checker=FormatChecker(),
+        ).iter_errors(candidate)
+    )
+
+    assert errors == []

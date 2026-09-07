@@ -35,6 +35,7 @@ from .copy_policy import audit_substantive_copy
 CORPUS_CONTRACT = "content_reference_corpus_v1"
 ITEM_CONTRACT = "content_reference_item_v1"
 AUDIT_CONTRACT = "content_creation_audit_v1"
+AUDIT_REQUEST_CONTRACT = "reference_corpus_audit_request_v2"
 ACQUISITION_CONTRACT = "instagram_reference_acquisition_v1"
 EXTRACTION_CONTRACT = "reference_item_extraction_v1"
 SOURCE_RIGHTS_STATE = "public_reference_analysis_only"
@@ -2168,6 +2169,8 @@ class ReferenceCorpusService:
         return {
             "status": "ok",
             "contract": "content_reference_corpus_health_v1",
+            "audit_request_contract": AUDIT_REQUEST_CONTRACT,
+            "semantic_timeline_supported": True,
             "root": str(self.root),
             "database": str(self.db_path),
             "corpus_count": corpus_count,

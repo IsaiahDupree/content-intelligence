@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:reference-marketing-script-request:v2",
+  "title": "Reference Marketing Script Request v2",
+  "type": "object",
+  "required": [
+    "contract",
+    "corpus_id",
+    "title",
+    "topic",
+    "audience",
+    "objective",
+    "content_role",
+    "topic_distance_from_offer",
+    "angle",
+    "target_seconds",
+    "narrative"
+  ],
+  "properties": {
+    "contract": {"const": "reference_marketing_script_request_v2"},
+    "corpus_id": {"type": "string", "minLength": 1, "maxLength": 240},
+    "title": {"type": "string", "minLength": 1, "maxLength": 240},
+    "topic": {"type": "string", "minLength": 1, "maxLength": 500},
+    "audience": {"type": "string", "minLength": 1, "maxLength": 500},
+    "objective": {
+      "enum": ["awareness", "educate", "engage", "convert"]
+    },
+    "content_role": {
+      "enum": ["ENTERTAIN", "EDUCATE", "SELL"]
+    },
+    "topic_distance_from_offer": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 5
+    },
+    "topic_ladder_id": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "angle": {
+      "enum": ["contrast", "problem_first", "how_to", "myth"]
+    },
+    "target_seconds": {"type": "integer", "minimum": 15, "maximum": 1800},
+    "narrative": {
+      "type": "object",
+      "required": [
+        "hook",
+        "problem",
+        "stakes",
+        "reframe",
+        "steps",
+        "proof",
+        "takeaway",
+        "cta"
+      ],
+      "properties": {
+        "hook": {"type": "string", "minLength": 1, "maxLength": 400},
+        "problem": {"type": "string", "minLength": 1, "maxLength": 700},
+        "stakes": {"type": "string", "minLength": 1, "maxLength": 700},
+        "reframe": {"type": "string", "minLength": 1, "maxLength": 700},
+        "steps": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "items": {"type": "string", "minLength": 1, "maxLength": 500}
+        },
+        "proof": {
+          "type": "object",
+          "required": ["statement", "evidence_type"],
+          "properties": {
+            "statement": {"type": "string", "minLength": 1, "maxLength": 1200},
+            "evidence_type": {
+              "enum": [
+                "worked_example",
+                "experience",
+                "owned_measurement",
+                "sourced_fact",
+                "hypothesis"
+              ]
+            },
+            "source_receipt_ids": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1}
+            },
+            "independent_verification_receipts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "contract",
+                  "receipt_id",
+                  "claim",
+                  "claim_sha256",
+                  "source_url",
+                  "source_kind",
+                  "source_sha256",
+                  "verified_at",
+                  "receipt_sha256"
+                ],
+                "properties": {
+                  "contract": {"const": "independent_claim_verification_v1"},
+                  "receipt_id": {"type": "string", "minLength": 1},
+                  "claim": {"type": "string", "minLength": 1},
+                  "claim_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "source_url": {"type": "string", "format": "uri"},
+                  "source_kind": {
+                    "enum": [
+                      "official_source",
+                      "owner_first_party_measurement",
+                      "peer_reviewed_source",
+                      "primary_source"
+                    ]
+                  },
+                  "source_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "verified_at": {"type": "string", "format": "date-time"},
+                  "receipt_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "takeaway": {"type": "string", "minLength": 1, "maxLength": 700},
+        "cta": {
+          "type": "object",
+          "required": ["text", "action"],
+          "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 400},
+            "action": {"type": "string", "minLength": 1, "maxLength": 80},
+            "destination": {"type": "string", "maxLength": 500}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "offer": {
+      "type": "object",
+      "properties": {
+        "offer_id": {"type": "string", "maxLength": 160},
+        "name": {"type": "string", "maxLength": 240}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
