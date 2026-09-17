@@ -98,4 +98,5 @@ id_ed25519*
 .netrc
 .npmrc
 .pypirc
-/.env.production  # secret-looking filename, untracked (2026-09-07)
+# secret-looking filename, untracked (2026-09-07)
+/.env.production
