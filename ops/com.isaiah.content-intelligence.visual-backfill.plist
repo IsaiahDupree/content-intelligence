@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.isaiah.content-intelligence.visual-backfill</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/isaiahdupree/Library/Application Support/ContentQuality/runtime/scripts/extract_visual_cohort.py</string>
+    <string>--limit</string>
+    <string>10</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/isaiahdupree/Library/Application Support/ContentQuality/runtime</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>TMPDIR</key>
+    <string>/Volumes/My Passport/MarketTape/transcript-bank/_tmp</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/content-intelligence-visual-backfill.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/content-intelligence-visual-backfill.error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+{
+  "totalSessions": 19,
+  "successfulSessions": 19,
+  "failedSessions": 0,
+  "totalTokens": 758146,
+  "totalCostUsd": 0,
+  "rateLimitHits": 0,
+  "authErrors": 0,
+  "consecutiveErrors": 0,
+  "lastSessionTime": "2026-04-17T18:23:44.318Z",
+  "featuresCompletedThisRun": 0,
+  "startingFeatures": 0,
+  "avgSessionDuration": 0
+}

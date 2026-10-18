@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:actp:content-reference-agent-context:v1",
+  "title": "Content Reference Agent Context",
+  "type": "object",
+  "required": [
+    "contract",
+    "context_id",
+    "corpus_id",
+    "query",
+    "coverage",
+    "numeric_profile",
+    "observed_patterns",
+    "descriptive_associations",
+    "evidence",
+    "rights",
+    "usage_rules",
+    "generated_at",
+    "result_sha256"
+  ],
+  "properties": {
+    "contract": {"const": "content_reference_agent_context_v1"},
+    "context_id": {"type": "string", "minLength": 1},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "query": {"type": "string", "minLength": 1},
+    "coverage": {"type": "object"},
+    "numeric_profile": {"type": "object"},
+    "observed_patterns": {"type": "object"},
+    "descriptive_associations": {"type": "object"},
+    "evidence": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["item_id", "source_url", "match_score"],
+        "properties": {
+          "item_id": {"type": "string"},
+          "source_url": {"type": "string", "format": "uri"},
+          "match_score": {"type": "number", "minimum": 0, "maximum": 100}
+        },
+        "additionalProperties": true
+      }
+    },
+    "rights": {"type": "object"},
+    "usage_rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string"}
+    },
+    "generated_at": {"type": "string", "format": "date-time"},
+    "result_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  },
+  "additionalProperties": true
+}

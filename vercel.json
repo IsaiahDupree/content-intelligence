@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "env": {
+    "PORT": {
+      "default": "6006"
+    },
+    "SUPABASE_URL": {
+      "default": ""
+    },
+    "SUPABASE_SERVICE_KEY": {
+      "default": ""
+    },
+    "OPENAI_API_KEY": {
+      "default": ""
+    },
+    "GROQ_API_KEY": {
+      "default": ""
+    },
+    "ANTHROPIC_API_KEY": {
+      "default": ""
+    }
+  },
+  "buildCommand": "pip install -r requirements.txt",
+  "outputDirectory": ".",
+  "functions": {
+    "app.py": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  }
+}

@@ -1,0 +1,275 @@
+=== Content Intelligence Operating System (CIOS) — Session Log ===
+
+Project: content-intelligence-os
+Version: 1.0.0
+Target Path: /Users/isaiahdupree/Documents/Software/media-vault
+Date: 2026-04-13
+Initializer: Claude Haiku 4.5
+
+## Initialization Status
+
+### CIOS Architecture
+- **API Service**: FastAPI orchestration on port 5570 (media-vault/backend)
+- **Dashboard**: Next.js frontend on port 5571+ (media-vault/frontend)
+- **Database**: Supabase project ivhfuhxorppptyuofbgq (4 new tables)
+- **Real-time**: Supabase Realtime channel 'cios-events' for live updates
+- **Integration Points**: 6 major subsystems (AIL, TikTok, Media Vault, Blotato, CRMLite, Content-Intelligence)
+
+### Total Features: 25
+
+**Tier 1 - Critical (5)**
+  CIOS-01: Supabase Schema (4 tables + indexes)
+  CIOS-02: Orchestration API (port 5570)
+  CIOS-03: Content Brief Steps 1-3 (parallel retrieval)
+  CIOS-04: Content Brief Step 4 (GPT-4o generation)
+  CIOS-18: Launch script (harness/launch-cios.sh)
+
+**Tier 2 - High Priority (11)**
+  CIOS-05: GEO optimization (TikTok)
+  CIOS-06: Performance sync pipeline
+  CIOS-07: Weekly digest pipeline
+  CIOS-08: Goal alignment scan
+  CIOS-09: Supabase Realtime event bus
+  CIOS-10: Dashboard command center
+  CIOS-11: Content brief library
+  CIOS-19: Auto-insight for viral events
+  CIOS-21: Content brief status workflow
+  CIOS-22: Cross-subsystem search
+
+**Tier 3 - Medium Priority (7)**
+  CIOS-12: Intelligence insight log
+  CIOS-13: Cross-platform performance analytics
+  CIOS-14: Distribution queue UI
+  CIOS-15: AIL memory browser
+  CIOS-16: Autonomous morning cycle
+  CIOS-17: Autonomous evening cycle
+  CIOS-23: Prospect brief + CRMLite integration
+  CIOS-24: Distribution queue auto-scheduler
+  CIOS-20: Pipeline history and replay
+
+**Tier 4 - Low Priority (1)**
+  CIOS-25: ACD MCP tool integration
+
+## Development Dependencies
+
+### Services That Must Be Running
+1. Supabase (ivhfuhxorppptyuofbgq) — database, auth, realtime
+2. Content Intelligence API (port 6006) — analysis/generation
+3. AIL (port 5666) — semantic search and document ingestion
+4. TikTok Analytics (port 5681) — performance data
+5. Media Vault (port 5563/5564) — video library and B-roll search
+6. CRMLite (Vercel) — contact enrichment
+7. Blotato (https://backend.blotato.com/v2) — publishing
+
+### Required Environment Variables
+```
+# Supabase
+SUPABASE_URL=https://ivhfuhxorppptyuofbgq.supabase.co
+SUPABASE_SERVICE_KEY={from 1Password}
+
+# AI APIs
+OPENAI_API_KEY={from 1Password}
+GROQ_API_KEY={from 1Password}
+ANTHROPIC_API_KEY={optional}
+
+# Publishing
+BLOTATO_API_KEY={from 1Password}
+
+# Internal Services
+AIL_URL=http://localhost:5666
+TIKTOK_ANALYTICS_URL=http://localhost:5681
+MEDIA_VAULT_URL=http://localhost:5563
+CRMLITE_URL=https://crmlite-isaiahduprees-projects.vercel.app
+```
+
+## Key Integration Points
+
+### Content Brief Pipeline
+```
+INPUT: { topic, platform, geo_optimize?, geo_location? }
+
+STEP 1 (Parallel): AIL semantic query → fetch topic context
+  Timeout: 600ms | Fallback: empty context
+
+STEP 2 (Parallel): TikTok analytics → fetch platform+niche performance
+  Timeout: 300ms | Fallback: empty performance data
+
+STEP 3 (Parallel): Media Vault → search B-roll for topic
+  Timeout: 500ms | Fallback: empty B-roll suggestions
+
+STEP 4 (Sequential): GPT-4o brief generation
+  Uses: context + performance + B-roll suggestions
+  Output: Full ContentBrief JSON with hook, script, captions, etc.
+
+STEP 5 (Optional): GEO optimization (if geo_optimize=true)
+  Calls: tiktok-geo /api/geo/generate-brief
+  Non-blocking: failure doesn't fail pipeline
+
+OUTPUT: { brief_id, content_brief, geoOptimized?, error? }
+```
+
+### Performance Sync Pipeline
+```
+INPUT: (runs on schedule or manual trigger)
+
+STEP 1 (Parallel): Media Vault performance checkback
+STEP 2 (Parallel): TikTok analytics batch check
+
+FOR EACH item with tier change:
+  - Call AIL /api/ingest/social to re-embed updated data
+  - Create cios_insight_log entry (type=viral_pattern|tier_upgrade)
+  - Broadcast PERFORMANCE_UPDATED event via Realtime
+
+OUTPUT: { items_synced, tier_changes, insights_generated }
+```
+
+### Event Bus (Supabase Realtime)
+
+**Channel**: cios-events
+
+**Events Published**:
+- PIPELINE_STARTED: { pipeline_type, run_id, started_at }
+- PIPELINE_STEP_COMPLETED: { run_id, step_name, duration_ms }
+- PIPELINE_COMPLETED: { run_id, status, total_duration_ms, output? }
+- PERFORMANCE_UPDATED: { post_ids, tier_changes, insights_created }
+- INSIGHT_GENERATED: { insight_id, type, priority, content }
+- BRIEF_CREATED: { brief_id, platform, topic, status }
+
+## Testing Strategy
+
+### Unit Tests
+- Parser/normalizer functions for inputs
+- Event schema validation
+- Database migration verification
+
+### Integration Tests (Real Supabase + Services)
+- Pipeline execution with real data
+- Event bus message delivery
+- Graceful degradation when subsystem fails
+- Timeout behavior and fallbacks
+- Dashboard real-time updates
+
+### End-to-End Tests
+- Full content brief pipeline: topic → brief in < 20s
+- Performance sync: detects tier changes and creates insights
+- Autonomous cycles: morning 8am, evening 6pm
+- Dashboard loads with live data
+
+## Deployment Checklist
+
+- [ ] Supabase migrations applied (CIOS-01)
+- [ ] FastAPI service starts on :5570 with health check (CIOS-02)
+- [ ] All subsystem status shown on dashboard (CIOS-02)
+- [ ] Content brief endpoint returns valid JSON (CIOS-04)
+- [ ] Event bus broadcasts working (CIOS-09)
+- [ ] Dashboard loads in < 2 seconds (CIOS-10)
+- [ ] All 6 subsystems accessible and green on dashboard
+- [ ] Launch script harness/launch-cios.sh works (CIOS-18)
+- [ ] Zero mock code in production source (rule: no mocks)
+- [ ] All integration tests pass against real services
+
+## Success Metrics
+
+**Quality**:
+- 25/25 features passing
+- 0 mock code in production
+- 100% integration test coverage (no unit mocks)
+- All endpoints documented with curl examples
+
+**Performance**:
+- Content brief pipeline < 15 seconds
+- Performance sync < 10 seconds
+- Dashboard loads < 2 seconds
+- Real-time event delivery < 500ms
+
+**Reliability**:
+- No hard failures when subsystem down (graceful fallbacks)
+- All services expose /api/health
+- Dashboard shows individual subsystem health
+- Autonomous cycles run without manual intervention
+
+## File Structure (Being Created)
+
+```
+content-intelligence/
+├── CIOS-INITIALIZATION.md        ✅ Created
+├── CAPABILITIES.md                (will add CIOS endpoints)
+├── services/
+│   ├── cios/                       (CIOS-specific services)
+│   └── ...existing services
+
+media-vault/
+├── backend/
+│   ├── cios_api.py                 (CIOS-02: Main API)
+│   ├── migrations/
+│   │   └── cios_schema.sql         (CIOS-01: 4 tables)
+│   ├── handlers/
+│   │   ├── content_brief.py        (CIOS-03, 04, 05)
+│   │   ├── performance_sync.py     (CIOS-06)
+│   │   ├── weekly_digest.py        (CIOS-07)
+│   │   ├── goal_align.py           (CIOS-08)
+│   │   └── ...more pipelines
+│   ├── services/
+│   │   ├── ail_client.py           (AIL integration)
+│   │   ├── tiktok_client.py        (TikTok analytics)
+│   │   ├── vault_client.py         (Media vault integration)
+│   │   ├── blotato_client.py       (Publishing)
+│   │   ├── crmlite_client.py       (CRM enrichment)
+│   │   └── event_bus.py            (Supabase Realtime)
+│   ├── tests/
+│   │   ├── test_cios_api.py        (Integration tests)
+│   │   ├── test_pipelines.py
+│   │   └── fixtures/               (Real test data)
+│   └── harness/
+│       └── launch-cios.sh          (CIOS-18: Startup script)
+
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx                (CIOS-10: Command center)
+│   │   ├── briefs/page.tsx         (CIOS-11: Brief library)
+│   │   ├── intelligence/page.tsx   (CIOS-12: Insights)
+│   │   ├── performance/page.tsx    (CIOS-13: Analytics)
+│   │   ├── queue/page.tsx          (CIOS-14: Distribution)
+│   │   ├── memory/page.tsx         (CIOS-15: AIL browser)
+│   │   └── components/
+│   │       ├── HealthDots.tsx      (Subsystem status)
+│   │       ├── PipelineMonitor.tsx (Live run updates)
+│   │       └── ...more components
+│   ├── lib/
+│   │   ├── realtime.ts             (Supabase subscriptions)
+│   │   └── api.ts                  (CIOS API client)
+│   └── tests/
+│       └── e2e/                    (Dashboard E2E tests)
+```
+
+## Next Steps for Autonomous Agents
+
+### Session 1 (Current — Initialization)
+✅ Document CIOS architecture
+✅ Create feature_list.json with 25 features
+✅ Initialize claude-progress-cios.txt
+→ **Goal**: Environment ready for development
+
+### Session 2 (CIOS-01 + CIOS-02)
+- Apply Supabase migrations for 4 tables
+- Scaffold FastAPI app on :5570
+- Implement /api/cios/health endpoint
+- Write integration tests for schema
+
+### Session 3 (CIOS-03 + CIOS-04)
+- Implement content brief pipeline steps 1-3 (parallel retrieval)
+- Implement step 4 (GPT-4o generation)
+- Wire up AIL, TikTok, media-vault clients
+- Integration test end-to-end
+
+### Session 4+ (Remaining features)
+- Event bus and real-time updates
+- Dashboard pages
+- Advanced pipelines
+- Autonomous cycles
+
+---
+
+**Status**: 🟢 INITIALIZER SESSION COMPLETE
+**Passed**: 0/25 (initialization phase)
+**Ready For**: Autonomous Development

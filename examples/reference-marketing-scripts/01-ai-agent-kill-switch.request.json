@@ -1,0 +1,36 @@
+{
+  "contract": "reference_marketing_script_request_v1",
+  "corpus_id": "instagram-personalbrandlaunch-reference-v1",
+  "title": "Your AI Agent Needs a Kill Switch",
+  "topic": "How software founders can control AI agents before granting write access",
+  "audience": "software founders adding AI agents to real business workflows",
+  "objective": "convert",
+  "angle": "problem_first",
+  "target_seconds": 60,
+  "narrative": {
+    "hook": "Your AI agent does not need more freedom. It needs a clear way to stop",
+    "problem": "Teams connect agents to email, customer data, or production tools, then judge them by a successful demo",
+    "stakes": "But the real test is a vague instruction, bad data, or an action that costs money",
+    "reframe": "So before you add another ability, give the workflow three simple controls",
+    "steps": [
+      "define what it may read, what it may change, and how much it may spend",
+      "require a person to approve actions that reach a customer, move money, or delete data",
+      "keep a receipt showing the input, decision, action, result, and person who approved it"
+    ],
+    "proof": {
+      "statement": "run one bad-input test. If the agent pauses, explains the problem, and leaves a useful receipt, your controls are working",
+      "evidence_type": "worked_example",
+      "source_receipt_ids": []
+    },
+    "takeaway": "A trustworthy agent is not one that never fails. It is one that fails visibly and can be stopped",
+    "cta": {
+      "text": "Book an AI Automation Audit to map one risky workflow before you use it with write access",
+      "action": "book an audit",
+      "destination": "https://isaiahdupree.com/audit"
+    }
+  },
+  "offer": {
+    "offer_id": "ai-automation-audit-build",
+    "name": "AI Automation Audit"
+  }
+}

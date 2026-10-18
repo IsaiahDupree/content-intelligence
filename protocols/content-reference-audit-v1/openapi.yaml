@@ -1,0 +1,317 @@
+openapi: 3.1.0
+info:
+  title: ACTP Content Reference Audit
+  version: 1.0.0
+  description: Typed access to source-grounded clip evidence and script audits.
+paths:
+  /api/reference-corpus/health:
+    get:
+      security: []
+      responses:
+        "200":
+          description: Service and store status.
+  /api/reference-corpus/status:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: corpus_id
+          required: true
+          schema: {type: string}
+      responses:
+        "200": {description: Corpus counts and extraction coverage.}
+        "401": {description: Agent authentication failed.}
+        "404": {description: Corpus does not exist.}
+  /api/reference-corpus/items:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: corpus_id
+          required: true
+          schema: {type: string}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 100, default: 25}
+        - in: query
+          name: offset
+          schema: {type: integer, minimum: 0, default: 0}
+        - in: query
+          name: include_transcript
+          schema: {type: boolean, default: false}
+      responses:
+        "200": {description: Bounded item list with lineage and rights fields.}
+  /api/reference-corpus/find:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [corpus_id, query]
+              properties:
+                corpus_id: {type: string}
+                query: {type: string, minLength: 1}
+                limit: {type: integer, minimum: 1, maximum: 20, default: 8}
+      responses:
+        "200": {description: Ranked source links and abstract evidence.}
+  /api/reference-corpus/context:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [corpus_id, query]
+              properties:
+                corpus_id: {type: string}
+                query: {type: string, minLength: 1}
+                evidence_limit: {type: integer, minimum: 1, maximum: 20, default: 8}
+      responses:
+        "200":
+          description: Agent-ready patterns, associations, rights, and source evidence.
+          content:
+            application/json:
+              schema:
+                $ref: ./content-reference-context.schema.json
+  /api/reference-corpus/summary:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: corpus_id
+          required: true
+          schema: {type: string}
+      responses:
+        "200": {description: Corpus-wide pattern and coverage summary.}
+  /api/reference-corpus/audit:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [corpus_id, script, provenance]
+              properties:
+                corpus_id: {type: string}
+                title: {type: string}
+                script: {type: string, minLength: 1}
+                objective: {type: string}
+                target_viewer: {type: string}
+                target_seconds: {type: integer, minimum: 5, maximum: 3600}
+                provenance:
+                  type: object
+                  required:
+                    - contract
+                    - candidate_sha256
+                    - source_material_usage
+                    - creator_identity_used
+                    - creator_likeness_used
+                    - creator_voice_used
+                    - source_clips_used
+                    - reference_item_ids
+                    - creator_identity_input_ids
+                    - creator_likeness_input_ids
+                    - creator_voice_input_ids
+                    - source_clip_ids
+                    - independent_verification_receipts
+                    - provenance_sha256
+                  properties:
+                    contract: {const: content_copy_provenance_v1}
+                    candidate_sha256:
+                      {type: string, pattern: '^[0-9a-f]{64}$'}
+                    source_material_usage:
+                      enum:
+                        - none
+                        - abstract_patterns_only
+                        - facts_or_general_ideas_only
+                    creator_identity_used: {const: false}
+                    creator_likeness_used: {const: false}
+                    creator_voice_used: {const: false}
+                    source_clips_used: {const: false}
+                    reference_item_ids:
+                      type: array
+                      uniqueItems: true
+                      items: {type: string, minLength: 1}
+                    creator_identity_input_ids:
+                      type: array
+                      maxItems: 0
+                    creator_likeness_input_ids:
+                      type: array
+                      maxItems: 0
+                    creator_voice_input_ids:
+                      type: array
+                      maxItems: 0
+                    source_clip_ids:
+                      type: array
+                      maxItems: 0
+                    independent_verification_receipts:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - contract
+                          - receipt_id
+                          - claim
+                          - claim_sha256
+                          - source_url
+                          - source_kind
+                          - source_sha256
+                          - verified_at
+                          - receipt_sha256
+                        properties:
+                          contract: {const: independent_claim_verification_v1}
+                          receipt_id: {type: string, minLength: 1}
+                          claim: {type: string, minLength: 1}
+                          claim_sha256:
+                            {type: string, pattern: '^[0-9a-f]{64}$'}
+                          source_url: {type: string, format: uri}
+                          source_kind:
+                            enum:
+                              - official_source
+                              - owner_first_party_measurement
+                              - peer_reviewed_source
+                              - primary_source
+                          source_sha256:
+                            {type: string, pattern: '^[0-9a-f]{64}$'}
+                          verified_at: {type: string, format: date-time}
+                          receipt_sha256:
+                            {type: string, pattern: '^[0-9a-f]{64}$'}
+                        additionalProperties: false
+                    provenance_sha256:
+                      {type: string, pattern: '^[0-9a-f]{64}$'}
+                  additionalProperties: false
+      responses:
+        "200":
+          description: Durable scorecard with source links and copy gate.
+          content:
+            application/json:
+              schema:
+                $ref: ./content-creation-audit.schema.json
+  /api/reference-corpus/audits/{audit_id}:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: audit_id
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 160
+            pattern: '^[A-Za-z0-9_.:-]+$'
+      responses:
+        "200":
+          description: Hash-verified immutable copy and rights audit receipt.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: ./content-creation-audit.schema.json
+                  - type: object
+                    required: [request_sha256, result_sha256, integrity]
+                    properties:
+                      request_sha256:
+                        {type: string, pattern: '^[0-9a-f]{64}$'}
+                      result_sha256:
+                        {type: string, pattern: '^[0-9a-f]{64}$'}
+                      integrity:
+                        type: object
+                        required: [verified, algorithm]
+                        properties:
+                          verified: {const: true}
+                          algorithm: {const: sha256_canonical_json_v1}
+        "401": {description: Agent authentication failed.}
+        "404": {description: Audit receipt does not exist.}
+        "409": {description: Stored audit bytes failed integrity verification.}
+  /api/reference-corpus/write-script:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: ./reference-marketing-script-request.schema.json
+      responses:
+        "200":
+          description: Immutable script package with quality and copy audits.
+          content:
+            application/json:
+              schema:
+                $ref: ./reference-marketing-script-package.schema.json
+        "400": {description: Typed brief or claim evidence is invalid.}
+        "404": {description: Reference corpus does not exist.}
+  /api/reference-corpus/scripts/{script_id}:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: script_id
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Previously compiled immutable script package.
+          content:
+            application/json:
+              schema:
+                $ref: ./reference-marketing-script-package.schema.json
+        "404": {description: Script package does not exist.}
+  /api/reference-corpus/acquire:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: {type: string, minLength: 1}
+                limit: {type: integer, minimum: 1, maximum: 240, default: 75}
+                corpus_id: {type: string}
+      responses:
+        "201": {description: Immutable source receipts and item rows were stored.}
+        "503": {description: Source connector is not configured or is down.}
+  /api/reference-corpus/extract:
+    post:
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [corpus_id]
+              properties:
+                corpus_id: {type: string}
+                limit: {type: integer, minimum: 1, maximum: 3, default: 1}
+                transcript_model: {type: string, default: base.en}
+                semantic_ai: {type: boolean, default: false}
+                semantic_model: {type: string, default: gpt-5-nano}
+      responses:
+        "200": {description: Bounded typed extraction receipt.}
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer

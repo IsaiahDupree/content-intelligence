@@ -1,0 +1,36 @@
+{
+  "contract": "reference_marketing_script_request_v1",
+  "corpus_id": "instagram-personalbrandlaunch-reference-v1",
+  "title": "Why Useful Videos Still Get Ignored",
+  "topic": "How experts can make educational social videos easier to understand and worth watching",
+  "audience": "founders and experts who teach through short social videos",
+  "objective": "engage",
+  "angle": "how_to",
+  "target_seconds": 60,
+  "narrative": {
+    "hook": "If your useful videos are getting ignored, the lesson may be arriving before the reason to care",
+    "problem": "A lot of experts open with background, definitions, and context because they want every sentence to be accurate",
+    "stakes": "But the viewer has not felt the problem yet, so every correct sentence starts to sound like homework",
+    "reframe": "Start with a moment they recognize from their own day, then teach the fix",
+    "steps": [
+      "name the frustrating moment in plain language",
+      "show the difference between the weak version and the stronger version",
+      "give one small action the viewer can try today"
+    ],
+    "proof": {
+      "statement": "do not open with three principles of follow-up. Open with: your lead did not disappear; your follow-up gave them nothing easy to answer. Then show the better message",
+      "evidence_type": "worked_example",
+      "source_receipt_ids": []
+    },
+    "takeaway": "The value is still the lesson. The hook simply gives the viewer a reason to stay long enough to receive it",
+    "cta": {
+      "text": "Use this structure on your next script, then save the result beside the old version and compare them",
+      "action": "rewrite one script",
+      "destination": ""
+    }
+  },
+  "offer": {
+    "offer_id": "social-growth-system",
+    "name": "Social Growth System"
+  }
+}

@@ -1,0 +1,427 @@
+{
+  "contract": "external_content_repo_benchmark_v1",
+  "exclusion": {
+    "task_root": "/Users/isaiahdupree/Documents/Software/social-script-repo-lab",
+    "repositories": [
+      "johannships/reels-engine",
+      "ChaosClubCo/tiktok-story-ai",
+      "vyralcontent/content-skills",
+      "jasondeberardinis/script-generator",
+      "GRROio/script-generator",
+      "filnik/social-me\u0064ia-manager-AI",
+      "Muzammil-Elahi/ReelScribe-and-ReelWrite",
+      "Rag-hubk/codex-reels-viral"
+    ],
+    "policy": "Read-only exclusion set; never clone, install, patch, or run these checkouts in this benchmark."
+  },
+  "profiles": [
+    {
+      "profile_id": "content_gen",
+      "label": "Intelligent Iterations content-gen",
+      "repo_full_name": "intelligent-iterations/content-gen",
+      "repo_url": "https://github.com/intelligent-iterations/content-gen",
+      "checkout_dir": "intelligent-iterations__content-gen",
+      "source_commit": "9424c4de6d4e29ffaa9172e20884a554bcc8262f",
+      "license_spdx": "NOASSERTION",
+      "reuse_policy": "evaluation_only_no_license",
+      "native_status": "working",
+      "adapter_mode": "profile_adapted",
+      "role": "closed_loop_factory",
+      "capabilities": [
+        "Tool-guided topic discovery and claim synthesis.",
+        "Real carousel and script-plan generation with cross-platform packaging.",
+        "Manual result records separated by topic, hook, length, and format."
+      ],
+      "generation_principles": [
+        "Choose one concrete claim before choosing the format.",
+        "Use a compact four-part beat sequence with one job per beat.",
+        "Treat topic, hook, length, and result as separate experiment fields.",
+        "Rotate tired hook angles instead of repeating one winning label."
+      ],
+      "limitations": [
+        "License text is absent despite an MIT declaration in project text.",
+        "Outcome records are manual and there is no native source-video transcript step.",
+        "The isolated install reported unresolved dependency advisories."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "TECHNICAL_PAPER.md",
+        "../../audits/intel_lane/intelligent-iterations__content-gen.md"
+      ]
+    },
+    {
+      "profile_id": "ai_video_factory",
+      "label": "AI Video Factory",
+      "repo_full_name": "AndreySukhanov/ai-video-factory",
+      "repo_url": "https://github.com/AndreySukhanov/ai-video-factory",
+      "checkout_dir": "andreysukhanov__ai-video-factory",
+      "source_commit": "ee0c354a50722fa67128165e2e104e3423cd54fc",
+      "license_spdx": "LicenseRef-Source-Available-Restricted",
+      "reuse_policy": "evaluation_only_no_license",
+      "native_status": "partial",
+      "adapter_mode": "profile_adapted",
+      "role": "viral_intelligence",
+      "capabilities": [
+        "Trend intake and result normalization against channel size.",
+        "Transcript plus frame analysis into hooks, story beats, pacing, CTA, and on-screen text.",
+        "Multi-step script, storyboard, and visual QA flow."
+      ],
+      "generation_principles": [
+        "Start from a result normalized to its local baseline.",
+        "Extract a reusable hook and story pattern before writing a new topic.",
+        "Keep hook type, story beats, pacing, and CTA explicit.",
+        "Judge the script and scene plan before expensive generation."
+      ],
+      "limitations": [
+        "The custom license bars product or system use without written permission.",
+        "Silent fake-provider fallbacks conflict with workspace implementation rules.",
+        "The audience feedback loop and automatic hook tests remain roadmap items."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "LICENSE",
+        "TODO.md",
+        "../../audits/intel_lane/andreysukhanov__ai-video-factory.md"
+      ]
+    },
+    {
+      "profile_id": "head_of_content",
+      "label": "Head of Content",
+      "repo_full_name": "bradautomates/head-of-content",
+      "repo_url": "https://github.com/bradautomates/head-of-content",
+      "checkout_dir": "bradautomates__head-of-content",
+      "source_commit": "d841dcff2e4d74a4c31cb3ed2de6c2184de3a970",
+      "license_spdx": "MIT",
+      "reuse_policy": "permissive_clean_room",
+      "native_status": "partial",
+      "adapter_mode": "profile_adapted",
+      "role": "intelligence_layer",
+      "capabilities": [
+        "Platform-specific outlier scores and recency weighting.",
+        "Hook, structure, pacing, retention, and CTA analysis.",
+        "Content-plan output built from observed outliers."
+      ],
+      "generation_principles": [
+        "Find a local outlier before deciding which pattern matters.",
+        "Separate the hook, structure, pacing, retention device, and CTA.",
+        "Turn the pattern into a fresh formula tied to the new topic.",
+        "Keep discovery separate from script production."
+      ],
+      "limitations": [
+        "There is no executable full-script generator or owned-result loop.",
+        "One analyzer path ignores its transcript input and needs wiring fixes.",
+        "Source acquisition was not invoked during the isolated audit."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "video-content-analyzer.skill",
+        "../../audits/intel_lane/bradautomates__head-of-content.md"
+      ]
+    },
+    {
+      "profile_id": "viral_ops",
+      "label": "viral-ops",
+      "repo_full_name": "tabato/viral-ops",
+      "repo_url": "https://github.com/tabato/viral-ops",
+      "checkout_dir": "tabato__viral-ops",
+      "source_commit": "373c900d80cfb2b57bd17fa5be6d4ce4fb07455c",
+      "license_spdx": "MIT",
+      "reuse_policy": "permissive_clean_room",
+      "native_status": "working",
+      "adapter_mode": "profile_adapted",
+      "role": "viral_intelligence",
+      "capabilities": [
+        "Channel-baseline virality ratios with short and long video separation.",
+        "Outlier collection, angle generation, swipe-file output, and blueprint synthesis.",
+        "A tested command-line package with deterministic scoring math."
+      ],
+      "generation_principles": [
+        "Judge a result relative to the channel's normal result.",
+        "Explain the hook device and emotional trigger behind an outlier.",
+        "Generate several fresh adaptation angles before selecting one.",
+        "Synthesize repeated patterns into one production blueprint."
+      ],
+      "limitations": [
+        "The native package analyzes metadata rather than transcripts or scenes.",
+        "It has no full script generator, owned-post analytics, or feedback loop.",
+        "Reported scan totals do not include a committed raw corpus."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "blueprint.md",
+        "../../audits/intel_lane/tabato__viral-ops.md"
+      ]
+    },
+    {
+      "profile_id": "social_factory_suite",
+      "label": "Social Me\u0064ia Automation Suite",
+      "repo_full_name": "Rushant-123/social-me\u0064ia-automation-suite",
+      "repo_url": "https://github.com/Rushant-123/social-me\u0064ia-automation-suite",
+      "checkout_dir": "rushant-123__social-me\u0064ia-automation-suite",
+      "source_commit": "a79f6cf5bec573f962c8100efde2045810c62c35",
+      "license_spdx": "NOASSERTION",
+      "reuse_policy": "quarantined_security_review",
+      "native_status": "quarantined",
+      "adapter_mode": "profile_adapted",
+      "role": "content_factory",
+      "capabilities": [
+        "Seven independent engines with queue, transform, publish, and analytics code.",
+        "Text, speech, audio, screenshot, and dynamic-visual transformations.",
+        "Distinct structures for motivation, fitness, travel, poetry, ASMR, and forum stories."
+      ],
+      "generation_principles": [
+        "Choose a format family before deciding the script tone.",
+        "Keep ingestion, transformation, speech, publishing, and analytics separate.",
+        "Match the opening and pacing to the source format.",
+        "Design the script so one engine can produce it repeatedly."
+      ],
+      "limitations": [
+        "A tracked configuration file appears to contain a live platform credential and account data.",
+        "The checkout was quarantined and no project code was run.",
+        "There is no general transcription step or owned-result learning loop."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "../../audits/factory_lane/rushant.md",
+        "../../audits/factory_lane/README.md"
+      ]
+    },
+    {
+      "profile_id": "socheli",
+      "label": "Socheli",
+      "repo_full_name": "Socheli/socheli",
+      "repo_url": "https://github.com/Socheli/socheli",
+      "checkout_dir": "socheli__socheli",
+      "source_commit": "8cd7cc136bce43fbc95e30dc1bb4c5adfe4067ae",
+      "license_spdx": "AGPL-3.0-only",
+      "reuse_policy": "copyleft_isolated",
+      "native_status": "working",
+      "adapter_mode": "profile_adapted",
+      "role": "closed_loop_factory",
+      "capabilities": [
+        "Trend intake, scored concepts, hook, script, story plan, fact check, and QA council.",
+        "Speech, captions, music, B-roll, edit, packaging, and publish tools.",
+        "Instagram and TikTok analytics with style-pattern extraction."
+      ],
+      "generation_principles": [
+        "Score the concept before writing the hook.",
+        "Lock the hook, script, and scene plan as distinct stages.",
+        "Run fact and quality checks before production.",
+        "Feed owned results back into a style-pattern record."
+      ],
+      "limitations": [
+        "AGPL core requires isolation and license review before proprietary integration.",
+        "One speech environment is undocumented and not provisioned.",
+        "TikTok result collection has a publish-ID mapping gap."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "AGENTS.md",
+        "../../audits/factory_lane/socheli.md"
+      ]
+    },
+    {
+      "profile_id": "faceless_youtube_agents",
+      "label": "Faceless YouTube Agents",
+      "repo_full_name": "yashaiguy-dev/faceless-youtube-agents",
+      "repo_url": "https://github.com/yashaiguy-dev/faceless-youtube-agents",
+      "checkout_dir": "yashaiguy-dev__faceless-youtube-agents",
+      "source_commit": "e92c84537996217dd6fff60da9acc87198022b0b",
+      "license_spdx": "NOASSERTION",
+      "reuse_policy": "evaluation_only_no_license",
+      "native_status": "partial",
+      "adapter_mode": "profile_adapted",
+      "role": "production_layer",
+      "capabilities": [
+        "Top-video transcript pattern extraction described as hook, rhythm, structure, and retention loops.",
+        "Staged file checkpoints for script, images, speech, assembly, and private upload.",
+        "Real local FFmpeg assembly helpers."
+      ],
+      "generation_principles": [
+        "Study several strong items before naming a repeated pattern.",
+        "Extract structure and rhythm rather than copying lines.",
+        "Apply the pattern to a new topic with original wording.",
+        "Save each production stage as a checked artifact."
+      ],
+      "limitations": [
+        "No license is present, so code reuse is blocked.",
+        "An agent performs writing steps that the code itself does not implement.",
+        "Upload and file-path safeguards need fixes before any live use."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "pipeline.py",
+        "../../audits/production_lane/faceless-youtube-agents.md"
+      ]
+    },
+    {
+      "profile_id": "tiktok_viral_factory",
+      "label": "TikTok Viral Factory",
+      "repo_full_name": "Vanszs/tiktok-viral-factory",
+      "repo_url": "https://github.com/Vanszs/tiktok-viral-factory",
+      "checkout_dir": "vanszs__tiktok-viral-factory",
+      "source_commit": "14762edc1cfd9dad7ace201d8d591539b99cba2f",
+      "license_spdx": "NOASSERTION",
+      "reuse_policy": "evaluation_only_no_license",
+      "native_status": "roadmap_only",
+      "adapter_mode": "profile_adapted",
+      "role": "content_factory",
+      "capabilities": [
+        "Declared supervisor, discovery, strategy, script, SEO, producer, publisher, and analytics roles.",
+        "A declared 30-second hook, problem, product, proof, and CTA sequence.",
+        "Working settings, schema, and model-helper foundations only."
+      ],
+      "generation_principles": [
+        "Give each stage one clear responsibility.",
+        "Use a timed hook, problem, proof, and CTA sequence.",
+        "Write platform copy and script as separate outputs.",
+        "Reserve analytics as the input to the next strategy cycle."
+      ],
+      "limitations": [
+        "Advertised agents, workflows, tools, and analytics modules are absent.",
+        "The repository has no license file despite a project-text claim.",
+        "This is a roadmap profile, not a native transcript generator."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "plan.md",
+        "../../audits/factory_lane/vanszs.md"
+      ]
+    },
+    {
+      "profile_id": "ai_content_factory",
+      "label": "AI Content Factory",
+      "repo_full_name": "coleam00/ai-content-factory",
+      "repo_url": "https://github.com/coleam00/ai-content-factory",
+      "checkout_dir": "coleam00__ai-content-factory",
+      "source_commit": "3c6edf6d73f1d54f636c55f07b8f2a7d12e47afb",
+      "license_spdx": "MIT",
+      "reuse_policy": "permissive_clean_room",
+      "native_status": "production_only",
+      "adapter_mode": "profile_adapted",
+      "role": "content_factory",
+      "capabilities": [
+        "Cheap candidate generation followed by vision scoring and human approval.",
+        "Atomic concept claims with an approval queue before expensive rendering.",
+        "Working product, concept, approval, and render-state checks."
+      ],
+      "generation_principles": [
+        "Explore many cheap claims before spending on final production.",
+        "Keep one central claim per candidate.",
+        "Judge candidates on explicit dimensions before human approval.",
+        "Render only the candidates that pass the tournament."
+      ],
+      "limitations": [
+        "The shipped writing path relies on a small set of fixed UGC lines and fallbacks.",
+        "There is no transcription or audience-result loop.",
+        "Several external dependency versions are not pinned."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "../../audits/factory_lane/coleam.md"
+      ]
+    },
+    {
+      "profile_id": "openmontage",
+      "label": "OpenMontage",
+      "repo_full_name": "calesthio/OpenMontage",
+      "repo_url": "https://github.com/calesthio/OpenMontage",
+      "checkout_dir": "calesthio__OpenMontage",
+      "source_commit": "cd9f3c1f03368be87b140af494914b8ee4e3c7a4",
+      "license_spdx": "AGPL-3.0-only",
+      "reuse_policy": "copyleft_isolated",
+      "native_status": "working",
+      "adapter_mode": "profile_adapted",
+      "role": "production_layer",
+      "capabilities": [
+        "Proposal, script, scene plan, asset, edit, and compose stages with artifact gates.",
+        "Provider preflight, validation, timeline export, and publish abstractions.",
+        "Broad automated regression coverage and local export checks."
+      ],
+      "generation_principles": [
+        "Give each stage an explicit input and output artifact.",
+        "Lock the proposal before the script and the script before the scene plan.",
+        "Run provider preflight and self-review at quality gates.",
+        "Keep production mechanics separate from audience intelligence."
+      ],
+      "limitations": [
+        "AGPL terms require isolation and license review for proprietary integration.",
+        "Interactive launch paths were not run under the singleton policy.",
+        "Some setup dependencies and output-containment rules need tightening."
+      ],
+      "evidence_paths": [
+        "README.md",
+        "AGENT_GUIDE.md",
+        "../../audits/production_lane/OpenMontage.md"
+      ]
+    },
+    {
+      "profile_id": "moneyprinterturbo",
+      "label": "MoneyPrinterTurbo",
+      "repo_full_name": "harry0703/MoneyPrinterTurbo",
+      "repo_url": "https://github.com/harry0703/MoneyPrinterTurbo",
+      "checkout_dir": "harry0703__MoneyPrinterTurbo",
+      "source_commit": "6cd36b5a2c56b49b24621463038e4db3963f0a43",
+      "license_spdx": "MIT",
+      "reuse_policy": "permissive_clean_room",
+      "native_status": "working",
+      "adapter_mode": "profile_adapted",
+      "role": "production_layer",
+      "capabilities": [
+        "Topic, script, stock footage, voice, subtitles, music, and video rendering.",
+        "API and UI entry points with optional cross-post support.",
+        "Locked dependency install and extensive regression coverage."
+      ],
+      "generation_principles": [
+        "Turn one topic into a complete narration before collecting assets.",
+        "Keep script, footage, voice, subtitles, and render as replaceable stages.",
+        "Validate paths and task state at API boundaries.",
+        "Treat volume rendering as production, not proof of audience fit."
+      ],
+      "limitations": [
+        "The lock includes multiple packages with recorded security advisories.",
+        "Direct-run defaults need stronger auth and cross-origin limits.",
+        "Automatic posting and bundled audio rights require explicit safeguards."
+      ],
+      "evidence_paths": [
+        "README-en.md",
+        "pyproject.toml",
+        "../../audits/production_lane/MoneyPrinterTurbo.md"
+      ]
+    },
+    {
+      "profile_id": "actp_control",
+      "label": "ACTP owned control",
+      "repo_full_name": "IsaiahDupree/content-intelligence",
+      "repo_url": "https://github.com/IsaiahDupree/content-intelligence",
+      "checkout_dir": null,
+      "source_commit": null,
+      "license_spdx": "Proprietary-Owned",
+      "reuse_policy": "owned_control",
+      "native_status": "owned_control",
+      "adapter_mode": "owned_control_profile",
+      "role": "owned_control",
+      "capabilities": [
+        "Rights-bounded reference context with copy and originality audit receipts.",
+        "Deterministic owner-calibrated spoken, specificity, tension, plain-language, and repetition checks.",
+        "Immutable script experiments linked to later owned-result telemetry."
+      ],
+      "generation_principles": [
+        "Use structural patterns without copying language, identity, likeness, voice, or source assets.",
+        "Lock the central claim and evidence before writing the hook.",
+        "Run bounded audit-and-repair cycles before accepting a script.",
+        "Register accepted scripts so later owned results can update the method."
+      ],
+      "limitations": [
+        "This run uses the same model and briefs as every external profile.",
+        "Prepublication quality checks are not audience-outcome predictions.",
+        "The control has an integration advantage because the audit and experiment services are owned."
+      ],
+      "evidence_paths": [
+        "services/content_quality/reference_corpus.py",
+        "services/content_quality/script_quality.py",
+        "services/content_quality/script_experiments.py"
+      ]
+    }
+  ]
+}
