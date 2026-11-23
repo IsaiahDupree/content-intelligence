@@ -166,6 +166,33 @@ def test_corpus_status_find_summary_and_copy_gate_are_durable(tmp_path):
     assert (tmp_path / "derived" / CORPUS_ID / "corpus-summary.json").is_file()
 
 
+def test_reference_audit_receipt_lookup_verifies_immutable_result(tmp_path):
+    store = seed_service(tmp_path)
+    script = (
+        "Ever open six tools to publish one idea? The number of decisions is "
+        "the bottleneck. Choose one problem, one opinion, and one proof. "
+        "Publish today's version, then stop. Which step slows you down most?"
+    )
+    audit = store.audit_content(
+        corpus_id=CORPUS_ID,
+        title="The decision bottleneck",
+        script=script,
+        objective="help creators publish consistently",
+        target_viewer="content creators",
+        target_seconds=30,
+        provenance=build_script_only_provenance(script),
+    )
+
+    stored = store.get_audit_receipt(audit["audit_id"])
+
+    assert stored is not None
+    assert stored["audit_id"] == audit["audit_id"]
+    assert stored["request_sha256"] == audit["request_sha256"]
+    assert stored["result_sha256"] == audit["result_sha256"]
+    assert stored["integrity"]["verified"] is True
+    assert store.get_audit_receipt("refaudit_missing") is None
+
+
 def test_generic_pronouns_and_step_words_do_not_inflate_quality(tmp_path):
     store = seed_service(tmp_path)
 
@@ -231,6 +258,32 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
             "evidence_limit": 3,
         },
     )
+    audited_script = (
+        "Ever open six tools to publish one idea? Choose one problem, one "
+        "opinion, and one proof. Publish today's version, then stop."
+    )
+    audit = client.post(
+        "/api/reference-corpus/audit",
+        headers=headers,
+        json={
+            "corpus_id": CORPUS_ID,
+            "title": "Publish one version",
+            "script": audited_script,
+            "target_seconds": 20,
+            "provenance": build_script_only_provenance(audited_script),
+        },
+    ).get_json()
+    denied_audit = client.get(
+        f"/api/reference-corpus/audits/{audit['audit_id']}"
+    )
+    stored_audit = client.get(
+        f"/api/reference-corpus/audits/{audit['audit_id']}",
+        headers=headers,
+    )
+    missing_audit = client.get(
+        "/api/reference-corpus/audits/refaudit_missing",
+        headers=headers,
+    )
     catalog = client.get("/api/agent/catalog", headers=headers)
 
     assert health.status_code == 200
@@ -244,10 +297,15 @@ def test_agent_api_is_bounded_authenticated_and_cataloged(tmp_path):
     assert second_page.get_json()["next_offset"] is None
     assert context.status_code == 200
     assert context.get_json()["coverage"]["item_count"] == 1
+    assert denied_audit.status_code == 401
+    assert stored_audit.status_code == 200
+    assert stored_audit.get_json()["integrity"]["verified"] is True
+    assert missing_audit.status_code == 404
     names = catalog.get_json()["".join(("oper", "ations"))]
     assert "build_reference_context" in names
     assert names["acquire_reference_corpus"]["bounds"]["limit"] == [1, 240]
     assert "audit_against_reference_corpus" in names
+    assert "get_reference_audit_receipt" in names
     assert names["extract_reference_items"]["bounds"]["limit"] == [1, 3]
 
 

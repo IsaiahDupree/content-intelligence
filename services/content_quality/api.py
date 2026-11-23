@@ -566,6 +566,52 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
             "reference_corpus_audit", payload, result, started_at=started
         )
 
+    @app.get("/api/reference-corpus/audits/<audit_id>")
+    def reference_corpus_audit_receipt(audit_id: str):
+        denied = require_agent_auth()
+        if denied:
+            return denied
+        started = time.monotonic()
+        try:
+            result = reference_corpus.get_audit_receipt(audit_id)
+        except ValueError as error:
+            return reference_invalid_request(
+                "reference_corpus_audit_receipt",
+                {"audit_id": audit_id},
+                error,
+                started,
+            )
+        except RuntimeError as error:
+            return audited_agent_response(
+                "reference_corpus_audit_receipt",
+                {"audit_id": audit_id},
+                {
+                    "status": "error",
+                    "code": "REFERENCE_AUDIT_INTEGRITY_FAILED",
+                    "error": str(error),
+                },
+                409,
+                started,
+            )
+        if result is None:
+            return audited_agent_response(
+                "reference_corpus_audit_receipt",
+                {"audit_id": audit_id},
+                {
+                    "status": "error",
+                    "code": "REFERENCE_AUDIT_NOT_FOUND",
+                    "audit_id": audit_id,
+                },
+                404,
+                started,
+            )
+        return audited_agent_response(
+            "reference_corpus_audit_receipt",
+            {"audit_id": audit_id},
+            result,
+            started_at=started,
+        )
+
     @app.post("/api/reference-corpus/write-script")
     def reference_corpus_write_script():
         denied = require_agent_auth()
@@ -1149,6 +1195,14 @@ def create_content_quality_app(config: dict[str, Any] | None = None) -> Flask:
                         "target_seconds",
                     ],
                     "rights_gate": "patterns_only_no_copy_or_identity_imitation",
+                },
+                "get_reference_audit_receipt": {
+                    "method": "GET",
+                    "path": "/api/reference-corpus/audits/{audit_id}",
+                    "required": ["audit_id"],
+                    "effect": (
+                        "read and hash-verify one immutable copy and rights audit"
+                    ),
                 },
                 "write_reference_marketing_script": {
                     "method": "POST",

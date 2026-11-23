@@ -2416,3 +2416,35 @@ class ReferenceCorpusService:
         result["request_sha256"] = request_sha
         result["result_sha256"] = result_sha
         return result
+
+    def get_audit_receipt(self, audit_id: str) -> dict[str, Any] | None:
+        """Return one immutable audit receipt after verifying stored bytes."""
+        audit_id = str(audit_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", audit_id):
+            raise ValueError("audit_id contains unsupported characters")
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT audit_id, corpus_id, contract, request_sha256,
+                          result_json, result_sha256, created_at
+                     FROM reference_audit_receipts
+                    WHERE audit_id=?""",
+                (audit_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = json.loads(str(row["result_json"]))
+        expected_sha = str(row["result_sha256"])
+        actual_sha = canonical_sha256(result)
+        if actual_sha != expected_sha:
+            raise RuntimeError("reference audit receipt integrity check failed")
+        return {
+            **result,
+            "request_sha256": str(row["request_sha256"]),
+            "result_sha256": expected_sha,
+            "integrity": {
+                "verified": True,
+                "algorithm": "sha256_canonical_json_v1",
+                "stored_result_sha256": expected_sha,
+                "computed_result_sha256": actual_sha,
+            },
+        }

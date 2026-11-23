@@ -200,6 +200,43 @@ paths:
             application/json:
               schema:
                 $ref: ./content-creation-audit.schema.json
+  /api/reference-corpus/audits/{audit_id}:
+    get:
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: audit_id
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 160
+            pattern: '^[A-Za-z0-9_.:-]+$'
+      responses:
+        "200":
+          description: Hash-verified immutable copy and rights audit receipt.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: ./content-creation-audit.schema.json
+                  - type: object
+                    required: [request_sha256, result_sha256, integrity]
+                    properties:
+                      request_sha256:
+                        {type: string, pattern: '^[0-9a-f]{64}$'}
+                      result_sha256:
+                        {type: string, pattern: '^[0-9a-f]{64}$'}
+                      integrity:
+                        type: object
+                        required: [verified, algorithm]
+                        properties:
+                          verified: {const: true}
+                          algorithm: {const: sha256_canonical_json_v1}
+        "401": {description: Agent authentication failed.}
+        "404": {description: Audit receipt does not exist.}
+        "409": {description: Stored audit bytes failed integrity verification.}
   /api/reference-corpus/write-script:
     post:
       security:
